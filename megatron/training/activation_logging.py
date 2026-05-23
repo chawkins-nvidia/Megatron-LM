@@ -124,6 +124,85 @@ def _iter_tensors(value, prefix: str):
         for idx, item in enumerate(value):
             yield from _iter_tensors(item, f"{prefix}{idx}")
 
+
+def _rms(finite: torch.Tensor) -> torch.Tensor:
+    return torch.sqrt(torch.mean(finite * finite))
+
+
+def _abs_mean(finite: torch.Tensor) -> torch.Tensor:
+    return finite.abs().mean()
+
+
+def _std(finite: torch.Tensor) -> torch.Tensor:
+    return finite.std(unbiased=False) if finite.numel() > 1 else torch.tensor(0.0)
+
+
+def _abs_max(finite: torch.Tensor) -> torch.Tensor:
+    return finite.abs().max()
+
+
+def _abs_min(finite: torch.Tensor) -> torch.Tensor:
+    return finite.abs().min()
+
+
+_STAT_FNS = {
+    "rms": _rms,
+    "abs_mean": _abs_mean,
+    "std": _std,
+    "abs_max": _abs_max,
+    "abs_min": _abs_min,
+}
+
+
+def _resolve_stat_fn():
+    """Pick the per-tensor summary statistic.
+
+    Honors ``MEGATRON_RESIDUAL_LOG_STAT`` (default ``rms``). Supported
+    values: rms, abs_mean, std, abs_max, abs_min. The chosen statistic
+    is computed once at hook time and stored as a 0-d CPU tensor, so
+    the on-disk file format and any downstream postprocessor that calls
+    a ``rms()``-like helper on the saved tensor stay backward
+    compatible — ``rms()`` of a 0-d tensor returns ``|x|``, which is
+    the statistic value we stored.
+    """
+    name = os.environ.get("MEGATRON_RESIDUAL_LOG_STAT", "rms").strip().lower()
+    fn = _STAT_FNS.get(name)
+    if fn is None:
+        logger.warning(
+            "MEGATRON_RESIDUAL_LOG_STAT=%r is not recognized; supported: %s. Falling back to rms.",
+            name, ", ".join(sorted(_STAT_FNS)),
+        )
+        fn = _rms
+    return fn
+
+
+_STAT_FN = _resolve_stat_fn()
+
+
+def _rms_summary(tensor: torch.Tensor) -> torch.Tensor:
+    """Scalar summary statistic of *tensor* on its current device,
+    returned as a 0-d CPU tensor.
+
+    Replaces ``tensor.detach().cpu()`` in the activation hook to keep
+    saved-state files small. Saving full tensors produces multi-GB ``.pth``
+    files at every save interval (issue #10: 326 GB observed for a single
+    8-layer MoE rung at 30 iters / log-every-3); a 0-d scalar is
+    several orders of magnitude smaller and is the only statistic any of
+    our downstream analyses consume. The plotter
+    ``analysis/postprocess/visualize_norms.py`` is unchanged because its
+    ``rms()`` of a 0-d tensor returns ``|x|`` == the value stored here.
+
+    Name kept for backward compatibility with call sites; the actual
+    statistic is governed by ``MEGATRON_RESIDUAL_LOG_STAT`` (default
+    ``rms``).
+    """
+    flat = tensor.detach().float().reshape(-1)
+    finite = flat[torch.isfinite(flat)]
+    if finite.numel() == 0:
+        return torch.tensor(float("nan"))
+    return _STAT_FN(finite).cpu()
+
+
 def _parse_tpe_module_name(module_name: str) -> Tuple[str, int | None, int] | None:
     """Parse a TPE-eligible module name into ``(block, mtp_idx, layer)``.
 
@@ -204,17 +283,17 @@ class ActivationLogger:
         def hook(_, args, kwargs, output):
             input_tuple = args if isinstance(args, tuple) else (args,)
             for idx, inp in enumerate(input_tuple):
-                if inp is None:
+                if not isinstance(inp, torch.Tensor):
                     continue
                 key = f"{module_name}/input{idx}"
-                sd[model_chunk_name][key] = inp.detach().cpu() if isinstance(inp, torch.Tensor) else inp
+                sd[model_chunk_name][key] = _rms_summary(inp)
             output_tuple = output if isinstance(output, tuple) else (output,)
             for idx, output_value in enumerate(output_tuple):
                 for suffix, out in _iter_tensors(output_value, f"output{idx}"):
-                    sd[model_chunk_name][f"{module_name}/{suffix}"] = out.detach().cpu()
+                    sd[model_chunk_name][f"{module_name}/{suffix}"] = _rms_summary(out)
             for kwarg_key, kwarg_value in kwargs.items():
                 for suffix, tensor in _iter_tensors(kwarg_value, kwarg_key):
-                    sd[model_chunk_name][f"{module_name}/{suffix}"] = tensor.detach().cpu()
+                    sd[model_chunk_name][f"{module_name}/{suffix}"] = _rms_summary(tensor)
 
         return hook
 

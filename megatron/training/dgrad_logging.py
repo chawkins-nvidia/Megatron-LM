@@ -58,6 +58,12 @@ def _iter_tensors(value, prefix: str):
             yield from _iter_tensors(item, f"{prefix}{idx}")
 
 
+# Import the activation logger's summary callable to keep the two
+# hooks in sync. Configurable via MEGATRON_RESIDUAL_LOG_STAT
+# (see activation_logging._resolve_stat_fn).
+from megatron.training.activation_logging import _rms_summary  # noqa: E402, F401
+
+
 class DataGradLogger:
     """Captures and saves gradients from loggable module tensors.
     
@@ -72,7 +78,7 @@ class DataGradLogger:
     def _save_hook(self, model_chunk_name: str, key: str):
         def hook(grad):
             if grad is not None:
-                self._dgrads_state_dict[model_chunk_name][key] = grad.detach().cpu()
+                self._dgrads_state_dict[model_chunk_name][key] = _rms_summary(grad)
         return hook
 
     def _make_hook(self, model_chunk_name: str, module_name: str):
