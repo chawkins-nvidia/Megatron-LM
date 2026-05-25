@@ -393,6 +393,9 @@ class CheckpointConfig:
     save_dgrads_interval: int | None = None
     """Number of iterations between dgrad saves."""
 
+    save_dead_neuron_interval: int | None = None
+    """Number of iterations between per-neuron dead-neuron stat saves."""
+
     save_retain_interval: int | None = None
     """Number of iterations between retained checkpoints
     (other checkpoints except the last checkpoint are automatically deleted).

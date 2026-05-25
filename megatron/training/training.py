@@ -260,6 +260,11 @@ from .activation_logging import (
     save_tokens_per_expert,
 )
 from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
+from .dead_neuron_logging import (
+    enable_dead_neuron_logging,
+    disable_dead_neuron_logging,
+    save_dead_neuron_stats,
+)
 
 from . import ft_integration
 
@@ -1931,6 +1936,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
+    save_dead_neuron_in_this_iteration = (args.save_dead_neuron_interval is not None and
+                                          (iteration + 1) % args.save_dead_neuron_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -1974,6 +1981,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if save_dead_neuron_in_this_iteration:
+            enable_dead_neuron_logging(model, args.save)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1995,6 +2004,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
+        if save_dead_neuron_in_this_iteration:
+            save_dead_neuron_stats(iteration + 1)
+            disable_dead_neuron_logging()
 
         # Reset force_all_reduce field.
         for model_chunk in model:
