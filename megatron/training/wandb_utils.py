@@ -28,7 +28,9 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
 
     wandb_writer = get_wandb_writer()
 
-    if wandb_writer:
+    # # CHAWKINS-NOOP-WANDB: also reject the case where wandb_writer is truthy
+    # but wandb.run has already been cleared (e.g. after wandb.finish()).
+    if wandb_writer and getattr(wandb_writer, "run", None) is not None:
         metadata = {"iteration": iteration}
         artifact_name, artifact_version = _get_artifact_name_and_version(Path(save_dir), Path(checkpoint_path))
         artifact = wandb_writer.Artifact(artifact_name, type="model", metadata=metadata)

@@ -226,6 +226,18 @@ def _set_tensorboard_writer(args):
                   'no TensorBoard logs will be written.', flush=True)
 
 
+class _NoOpWandbWriter:  # CHAWKINS-NOOP-WANDB
+    """Drop-in for the wandb writer on non-init ranks.
+    Every attribute lookup returns another _NoOpWandbWriter, which is
+    both falsy and callable, so existing `if wandb_writer:` guards
+    short-circuit and chained accesses (e.g. wandb_writer.run.log_artifact)
+    silently no-op."""
+    def __getattr__(self, _name): return _NoOpWandbWriter()
+    def __call__(self, *args, **kwargs): return _NoOpWandbWriter()
+    def __bool__(self): return False
+    def __repr__(self): return "<_NoOpWandbWriter>"
+
+
 def _set_wandb_writer(args):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
@@ -256,6 +268,11 @@ def _set_wandb_writer(args):
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
+    else:  # CHAWKINS-NOOP-WANDB
+        # Non-init ranks (or runs without wandb_project) get a falsy stub
+        # so `if wandb_writer:` guards short-circuit and chained accesses
+        # like `wandb_writer.run.log_artifact(...)` no-op silently.
+        _GLOBAL_WANDB_WRITER = _NoOpWandbWriter()
 
 
 def _set_one_logger(args):
