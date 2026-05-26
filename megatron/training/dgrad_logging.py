@@ -108,7 +108,41 @@ class DataGradLogger:
         if not self._dgrads_state_dict:
             return
         save_grads(self._save_dir, self._dgrads_state_dict, iteration, "dgrads")
+        self._maybe_log_wandb(self._dgrads_state_dict, iteration, "dgrad")  # CHAWKINS-WANDB-PER-TENSOR
         self._dgrads_state_dict.clear()
+
+    # ------------------------------------------------------------------
+    # Live W&B push of per-tensor RMS scalars. # CHAWKINS-WANDB-PER-TENSOR
+    # Mirrors dead_neuron_logging.DeadNeuronLogger._maybe_log_wandb:
+    # shares Megatron's active ``wandb.run`` (initialised by Megatron
+    # when ``wandb_project`` is set), namespaces keys under
+    # ``<prefix>/<chunk>/<module>/<io>``, and swallows any logging-side
+    # failure so a wandb hiccup never kills training. State dict values
+    # are already 0-d RMS scalars on CPU (issue10 commit 24b50f1).
+    # ------------------------------------------------------------------
+
+    def _maybe_log_wandb(self, state, iteration: int, prefix: str) -> None:
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return
+        if getattr(wandb, "run", None) is None:
+            return
+        scalars: dict[str, float] = {}
+        for chunk_name, mods in state.items():
+            for key, tensor in mods.items():
+                try:
+                    val = float(tensor)
+                except Exception:
+                    continue
+                if val != val:  # NaN filter
+                    continue
+                scalars[f"{prefix}/{chunk_name}/{key}"] = val
+        if scalars:
+            try:
+                wandb.log(scalars, step=iteration)
+            except Exception:
+                pass
 
     def register_hooks(self, model: torch.nn.Module):
         """Find and register hooks on all linear layers."""
