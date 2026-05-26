@@ -26,6 +26,24 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
         iteration (int): iteration of the checkpoint
     """
 
+    # # CHAWKINS-ONLY-FINAL-ARTIFACT: only register the FINAL checkpoint as a wandb
+    # artifact, not every save_interval save. Each artifact call costs
+    # tens of seconds of wandb-client overhead; intermediate saves are
+    # scratch for resume and don't need a stable artifact version.
+    from megatron.training import get_args
+    try:
+        args = get_args()
+    except Exception:
+        args = None
+    if args is not None:
+        target_iter = None
+        if getattr(args, 'train_iters', None):
+            target_iter = int(args.train_iters)
+        elif getattr(args, 'train_samples', None) and getattr(args, 'global_batch_size', None):
+            target_iter = (int(args.train_samples) + int(args.global_batch_size) - 1) // int(args.global_batch_size)
+        if target_iter is not None and iteration < target_iter:
+            return
+
     wandb_writer = get_wandb_writer()
 
     # # CHAWKINS-NOOP-WANDB: also reject the case where wandb_writer is truthy
