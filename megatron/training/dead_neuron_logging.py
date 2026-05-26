@@ -225,8 +225,58 @@ class DeadNeuronLogger:
                 chunk_out[f"{module_name}/grad_count"] = torch.tensor(n, dtype=torch.int64)
 
         save_grads(self._save_dir, out, iteration, "dead_neurons")
+        self._maybe_log_wandb(out, iteration)
         self._act_state.clear()
         self._grad_state.clear()
+
+    # ------------------------------------------------------------------
+    # Live W&B push (shares Megatron's wandb.run when wandb_project is set)
+    # ------------------------------------------------------------------
+
+    def _maybe_log_wandb(self, out, iteration: int) -> None:
+        """Push per-layer dead-neuron median scalars to W&B if a run is active.
+
+        Megatron's built-in writer initializes ``wandb.run`` when
+        ``wandb_project`` is set; we share that run by calling
+        ``wandb.log`` on the same process. Metric keys are namespaced
+        under ``dead_neurons/`` so they don't collide with Megatron's
+        own keys. Silently a no-op when wandb isn't installed or no run
+        is active (e.g. non-rank-0 processes).
+        """
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return
+        if getattr(wandb, "run", None) is None:
+            return
+        import re
+
+        layer_re = re.compile(r"layers\.(\d+)")
+        scalars: dict[str, float] = {}
+        for chunk_name, mods in out.items():
+            for module_key, tensor in mods.items():
+                # Skip count tensors and any 0-D scalar fields.
+                if module_key.endswith("/act_count") or module_key.endswith("/grad_count"):
+                    continue
+                m = layer_re.search(module_key)
+                if m is None:
+                    continue
+                layer = int(m.group(1))
+                stat = module_key.rsplit("/", 1)[-1]
+                if not hasattr(tensor, "dim") or tensor.dim() == 0:
+                    continue
+                try:
+                    val = float(tensor.median().item())
+                except Exception:
+                    continue
+                scalars[f"dead_neurons/{chunk_name}/L{layer}/{stat}_median"] = val
+        if scalars:
+            try:
+                wandb.log(scalars, step=iteration)
+            except Exception:
+                # A logging error on a research metric must never bring
+                # the trainer down. Swallow and continue.
+                pass
 
 
 # ----------------------------------------------------------------------
