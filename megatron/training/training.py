@@ -387,21 +387,32 @@ def num_floating_point_operations(args, batch_size):
                      gdn_conv_kernel_dim=4,
                      vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
+        # Short-circuit per-block flops on layer count: Python's `*`
+        # evaluates the right operand eagerly, so `0 * moe_layer_flops(...,
+        # None, ...)` would still crash on a None * int multiply. Guard
+        # each per-block term so non-MoE / non-Mamba / non-GDN ladders
+        # (e.g. ladder_0_2_ssm at r<low_r with no MoE layers) skip the
+        # call entirely.
         flops_fwd = (
-                num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
-                                                   num_attn_heads, gqa, gqa_groups, kv_channels) +
-                num_mlp_layers * mlp_layer_flops(batch_size, seq_len, hidden_size,
-                                                 mlp_expansion, swiglu) +
-                num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
-                                                     mamba_state_dim, mamba_head_dim,
-                                                     mamba_num_groups, mamba_num_heads) +
-                num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
-                                                 shared_expert_ffn_hidden_size, num_experts_routed_to,
-                                                 moe_latent_size, swiglu) +
-                num_gdn_layers * gdn_layer_flops(batch_size, seq_len, hidden_size,
-                                                  gdn_qk_head_dim, gdn_v_head_dim,
-                                                  gdn_num_qk_heads, gdn_num_v_heads,
-                                                  gdn_conv_kernel_dim) +
+                (num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
+                                                    num_attn_heads, gqa, gqa_groups, kv_channels)
+                 if num_attn_layers else 0) +
+                (num_mlp_layers * mlp_layer_flops(batch_size, seq_len, hidden_size,
+                                                  mlp_expansion, swiglu)
+                 if num_mlp_layers else 0) +
+                (num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
+                                                      mamba_state_dim, mamba_head_dim,
+                                                      mamba_num_groups, mamba_num_heads)
+                 if num_mamba_layers else 0) +
+                (num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
+                                                  moe_latent_size, swiglu)
+                 if num_moe_layers else 0) +
+                (num_gdn_layers * gdn_layer_flops(batch_size, seq_len, hidden_size,
+                                                   gdn_qk_head_dim, gdn_v_head_dim,
+                                                   gdn_num_qk_heads, gdn_num_v_heads,
+                                                   gdn_conv_kernel_dim)
+                 if num_gdn_layers else 0) +
                 (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
