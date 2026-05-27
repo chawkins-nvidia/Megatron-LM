@@ -54,8 +54,14 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
         artifact = wandb_writer.Artifact(artifact_name, type="model", metadata=metadata)
         # wandb's artifact.add_reference requires absolute paths
         checkpoint_path = str(Path(checkpoint_path).resolve())
+        # CHAWKINS-REFERENCE-ONLY: the checkpoint payload is left on
+        # lustre and registered as a `file://` reference (no bytes
+        # uploaded to W&B). The tracker file is intentionally NOT
+        # added: its only useful field (the iteration) is already
+        # captured in the artifact's `metadata={"iteration": ...}`
+        # and in its version name (checkpoint_path.stem), so
+        # uploading the tracker would duplicate non-essential bytes.
         artifact.add_reference(f"file://{checkpoint_path}", checksum=False)
-        artifact.add_file(tracker_filename)
         wandb_writer.run.log_artifact(artifact, aliases=[artifact_version])
         wandb_tracker_filename = _get_wandb_artifact_tracker_filename(save_dir)
         wandb_tracker_filename.write_text(f"{wandb_writer.run.entity}/{wandb_writer.run.project}")
