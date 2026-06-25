@@ -265,6 +265,13 @@ from .dead_neuron_logging import (
     disable_dead_neuron_logging,
     save_dead_neuron_stats,
 )
+from .probe_logging import (
+    capture_probe_batch,
+    get_last_training_batch,
+    probe_pre,
+    probe_post,
+)
+from .linearization_logging import linearization_pre, linearization_post
 
 from . import ft_integration
 
@@ -2037,6 +2044,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     save_dead_neuron_in_this_iteration = (args.save_dead_neuron_interval is not None and
                                           (iteration + 1) % args.save_dead_neuron_interval == 0)
+    save_probe_in_this_iteration = (getattr(args, 'save_probe_interval', None) is not None and
+                                    (iteration + 1) % args.save_probe_interval == 0)
+    save_linearization_in_this_iteration = (
+        getattr(args, 'save_linearization_interval', None) is not None and
+        (iteration + 1) % args.save_linearization_interval == 0
+    )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -2142,6 +2155,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    # CompleteP coordinate diagnostics: run frozen-batch probes after grads are
+    # settled and before optimizer.step(), then compare against post-step params.
+    if save_probe_in_this_iteration or save_linearization_in_this_iteration:
+        probe_batch = get_last_training_batch()
+        if probe_batch is not None:
+            capture_probe_batch(model, probe_batch)
+            if save_probe_in_this_iteration:
+                probe_pre(model, args)
+            if save_linearization_in_this_iteration:
+                linearization_pre(model, args)
+        else:
+            print_rank_0(
+                "WARNING: dy/linearization diagnostics requested but no training "
+                "batch has been captured yet; skipping this step."
+            )
+
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -2154,6 +2183,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
 
     timers('optimizer').stop()
+
+    if save_probe_in_this_iteration and get_last_training_batch() is not None:
+        probe_post(model, args.save, iteration + 1)
+    if save_linearization_in_this_iteration and get_last_training_batch() is not None:
+        linearization_post(model, args.save, iteration + 1)
 
     # Checkpoint params with parameter names.
     if save_params_in_this_iteration:

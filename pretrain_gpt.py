@@ -171,7 +171,22 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
 
-    return (*batch.values(), packed_seq_params)
+    full_batch = (*batch.values(), packed_seq_params)
+    # Diagnostics such as delta-y and finite-epsilon linearization need a
+    # frozen real batch to replay around optimizer.step(). Keep this gated so
+    # diagnostics-off runs do not add per-step work.
+    if (
+        (
+            getattr(args, 'save_probe_interval', None) is not None
+            or getattr(args, 'save_linearization_interval', None) is not None
+        )
+        and full_batch
+        and full_batch[0] is not None
+    ):
+        from megatron.training.probe_logging import set_last_training_batch
+
+        set_last_training_batch(full_batch)
+    return full_batch
 
 
 # define spiky loss as a loss that's 10x the max loss observed

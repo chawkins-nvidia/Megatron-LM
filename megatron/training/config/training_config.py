@@ -396,6 +396,30 @@ class CheckpointConfig:
     save_dead_neuron_interval: int | None = None
     """Number of iterations between per-neuron dead-neuron stat saves."""
 
+    diagnostic_layer_pattern: str = "log2pluslast"
+    """Layer-selection pattern for high-cardinality diagnostic streams."""
+
+    diagnostic_include_special_layers: bool = True
+    """Include embedding, unembedding, and final norm anchors in diagnostics."""
+
+    probe_layer_pattern: str | None = None
+    """Optional layer-selection override for the delta-y probe stream."""
+
+    save_probe_interval: int | None = None
+    """Number of iterations between delta-y activation-update probe saves."""
+
+    save_linearization_interval: int | None = None
+    """Number of iterations between finite-epsilon linearization saves."""
+
+    linearization_eps: str = "1e-3,1e-2"
+    """Comma-separated finite-difference epsilons for linearization."""
+
+    linearization_source_fraction: float = 0.25
+    """Fractional depth used to select the source block for linearization."""
+
+    linearization_target_fraction: float = 0.75
+    """Fractional depth used to select the target residual for linearization."""
+
     save_retain_interval: int | None = None
     """Number of iterations between retained checkpoints
     (other checkpoints except the last checkpoint are automatically deleted).
