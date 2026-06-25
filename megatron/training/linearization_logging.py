@@ -4,8 +4,9 @@
 
 This stream measures whether the residual-stream displacement from one source block's real
 optimizer update is well approximated by a local finite-epsilon linear response at the current
-iterate. It is intentionally restricted to TP=PP=DP=1 for the first smoke so the source-only
-parameter perturbation and target residual readout are exact and easy to audit.
+iterate. It supports single-rank model layouts only (TP=PP=CP=1). Data parallelism is allowed:
+each replica measures its local mini-batch and scalar metrics are averaged across the DP group
+before W&B/checkpoint logging.
 """
 
 from __future__ import annotations
@@ -124,13 +125,58 @@ def _parallel_layout_supported() -> bool:
 
         if not mpu.model_parallel_is_initialized():
             return True
+        context_parallel_world_size = 1
+        if hasattr(mpu, "get_context_parallel_world_size"):
+            context_parallel_world_size = mpu.get_context_parallel_world_size()
         return (
             mpu.get_tensor_model_parallel_world_size() == 1
             and mpu.get_pipeline_model_parallel_world_size() == 1
-            and mpu.get_data_parallel_world_size() == 1
+            and context_parallel_world_size == 1
         )
     except Exception:
         return True
+
+
+def _data_parallel_world_size() -> int:
+    try:
+        from megatron.core import parallel_state as mpu
+
+        if not mpu.model_parallel_is_initialized():
+            return 1
+        return mpu.get_data_parallel_world_size()
+    except Exception:
+        return 1
+
+
+def _mean_scalar_across_data_parallel(value: torch.Tensor) -> torch.Tensor:
+    """Average one scalar diagnostic across the DP group and return it on CPU."""
+    dp_world_size = _data_parallel_world_size()
+    if dp_world_size <= 1 or not torch.distributed.is_available():
+        return value.detach().cpu()
+    if not torch.distributed.is_initialized():
+        return value.detach().cpu()
+    try:
+        from megatron.core import parallel_state as mpu
+
+        group = mpu.get_data_parallel_group()
+    except Exception:
+        group = None
+    work = value.detach().float()
+    if work.numel() != 1:
+        work = work.mean()
+    if torch.cuda.is_available():
+        work = work.to(device=torch.device("cuda", torch.cuda.current_device()))
+    torch.distributed.all_reduce(work, op=torch.distributed.ReduceOp.SUM, group=group)
+    work /= dp_world_size
+    return work.cpu()
+
+
+def _mean_metrics_across_data_parallel(
+    metrics: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    if _data_parallel_world_size() <= 1:
+        return metrics
+    return {key: _mean_scalar_across_data_parallel(value) for key, value in metrics.items()}
 
 
 def _layer_from_name(name: str) -> int | None:
@@ -227,7 +273,7 @@ class LinearizationLogger:
         self._step = None
         if not _parallel_layout_supported():
             logger.warning(
-                "linearization diagnostics are restricted to TP=PP=DP=1; skipping"
+                "linearization diagnostics require TP=PP=CP=1; pure DP replicas are supported"
             )
             return
         eps = parse_linearization_eps(getattr(args, "linearization_eps", None))
@@ -314,6 +360,7 @@ class LinearizationLogger:
             key_prefix = f"source_block{self._step.source_layer}_to_resid{self._step.target_layer}"
             state = defaultdict(dict)
             metrics = _metrics_from_residuals(self._step.h_pre, h_true, h_eps_by_eps)
+            metrics = _mean_metrics_across_data_parallel(metrics)
             for key, value in metrics.items():
                 state["model_chunk0"][f"{key_prefix}/{key}"] = value
             save_diag_state(
