@@ -34,6 +34,7 @@ _base_values:
   r8_residual_layer_ratio_from_r4: 0.5
   r8_residual_attention_const_center: 0.125
   r8_residual_mlp_const_center: 8.0
+  r8_extreme_residual_c_multiplier: 10000000.0
 _groups:
   attention_out:
     label: attention out
@@ -1212,6 +1213,26 @@ _groups:
     - hpo_r8_residual_c_attn_mlp_r8_high_edge_ext1_ca8_cm32
     - hpo_r8_residual_c_attn_mlp_r8_high_edge_ext1_ca8_cm128
     - hpo_r8_residual_c_attn_mlp_r8_high_edge_ext1_ca8_cm512
+  residual_c_attn_mlp_r8_x1e7:
+    label: r8 residual C x1e7 effect stress
+    target_type: residual_branch
+    cluster: oci_hsg
+    r: 8
+    num_layers: 16
+    axis_mode: residual_c
+    alpha: 0.5
+    depth_base: 8
+    center_source: 'Diagnostic-only effect probe: set both residual-C multipliers to 1e7 and require visible
+      degradation/divergence before trusting the knob wiring.'
+    residual_attention_const_values:
+    - 10000000.0
+    residual_mlp_const_values:
+    - 10000000.0
+    candidate_pairs:
+    - - 10000000.0
+      - 10000000.0
+    candidates:
+    - hpo_r8_residual_c_attn_mlp_r8_x1e7_ca10000000_cm10000000
 hpo_r4_attention_out_i0p0004375_lr9p375em05:
   metadata:
     group: attention_out
@@ -28903,6 +28924,79 @@ hpo_r8_residual_c_attn_mlp_r8_high_edge_ext1_ca8_cm512:
     depth_base: 8
     residual_attention_const: 8.0
     residual_mlp_const: 512.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: embedding_promoted
+      types:
+      - embedding
+      init_std:
+        const: 0.00390625
+      lr:
+        const: 2.0
+    - name: unembedding_promoted
+      types:
+      - unembedding
+      init_std:
+        const: 0.2732316575444772
+      lr:
+        const: 1.2479794516403904
+    - name: linear_qkv_promoted
+      types:
+      - linear_qkv
+      init_std:
+        const: 0.1847343014530187
+      lr:
+        const: 1.0346765291156776
+    - name: linear_proj_promoted
+      types:
+      - linear_proj
+      init_std:
+        const: 0.0457149279400607
+      lr:
+        const: 0.3404392456702275
+    - name: linear_fc1_promoted
+      types:
+      - linear_fc1
+      init_std:
+        const: 0.23807716876059987
+      lr:
+        const: 0.30126869818342167
+    - name: linear_fc2_promoted
+      types:
+      - linear_fc2
+      init_std:
+        const: 0.010036379796785322
+      lr:
+        const: 0.2763745364361374
+    - name: qk_norm_promoted
+      types:
+      - qk_norm
+      lr:
+        const: 1.306401214225225
+    - name: norm_bias_promoted
+      types:
+      - norm_bias
+      lr:
+        const: 9.021518498039438
+hpo_r8_residual_c_attn_mlp_r8_x1e7_ca10000000_cm10000000:
+  metadata:
+    group: residual_c_attn_mlp_r8_x1e7
+    label: r8 residual C x1e7 effect stress
+    target_type: residual_branch
+    axis_mode: residual_c
+    r: 8
+    num_layers: 16
+    center_source: 'Diagnostic-only effect probe: set both residual-C multipliers to 1e7 and require visible
+      degradation/divergence before trusting the knob wiring.'
+    residual_attention_const: 10000000.0
+    residual_mlp_const: 10000000.0
+  parametrization:
+    enabled: true
+    alpha: 0.5
+    depth_base: 8
+    residual_attention_const: 10000000.0
+    residual_mlp_const: 10000000.0
     expected_types: *id002
     type_registry: *id003
     rules:
