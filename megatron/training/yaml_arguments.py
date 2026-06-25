@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
-from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.core.utils import get_torch_version, init_method_normal, is_torch_min_version
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -422,6 +422,8 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     if getattr(args, "init_method", None) == "xavier_uniform":
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    if getattr(args, "output_layer_init_method", None) == "normal":
+        kw_args['output_layer_init_method'] = init_method_normal(args.init_method_std)
     if getattr(args, "embedding_init_method", None) == "xavier_uniform":
         kw_args['embedding_init_method'] = torch.nn.init.xavier_uniform_
     
