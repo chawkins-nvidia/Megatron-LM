@@ -1230,7 +1230,14 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
+        skip_final_checkpoint = os.environ.get("MEGATRON_SKIP_FINAL_CHECKPOINT") == "1"
+        if (
+            not skip_final_checkpoint
+            and not cfg_container.validation.skip_train
+            and cfg_container.checkpoint.save
+            and iteration != 0
+            and iteration % cfg_container.checkpoint.save_interval != 0
+        ):
             save_checkpoint_and_time(
                 iteration,
                 model,
