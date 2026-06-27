@@ -10,6 +10,29 @@ import torch.nn as nn
 from megatron.training.activation_logging import ActivationLogger
 
 
+class TinyDecoderBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.LayerNorm(16)
+        self.proj = nn.Linear(16, 16)
+
+    def forward(self, x):
+        return self.proj(self.norm(x))
+
+
+class TinyDecoderModel(nn.Module):
+    def __init__(self, num_layers: int):
+        super().__init__()
+        self.decoder = nn.Module()
+        self.decoder.layers = nn.ModuleList([TinyDecoderBlock() for _ in range(num_layers)])
+        self.output_layer = nn.Linear(16, 8)
+
+    def forward(self, x):
+        for layer in self.decoder.layers:
+            x = layer(x)
+        return self.output_layer(x)
+
+
 @pytest.fixture()
 def logger(tmp_path):
     return ActivationLogger(save_dir=str(tmp_path))
@@ -17,9 +40,8 @@ def logger(tmp_path):
 
 @pytest.fixture()
 def simple_model():
-    """A minimal model with two nn.Linear layers, wrapped as a single-element model chunk list."""
-    model = nn.Sequential(nn.LayerNorm(16), nn.Linear(16, 32), nn.Linear(32, 8))
-    return [model]
+    """A decoder-shaped model wrapped as a single-element model chunk list."""
+    return [TinyDecoderModel(num_layers=6)]
 
 
 class TestMakeTpeHook:
@@ -90,7 +112,9 @@ class TestActivationHookLifecycle:
 
     def test_register_and_remove(self, logger, simple_model):
         logger.register_activation_hooks(simple_model)
-        assert len(logger._activation_hooks) == 3
+        # log4pluslast on six 0-indexed layers selects 0/1, 3/4, and last=5.
+        # Each selected block has norm+proj hooks; output_layer is a special anchor.
+        assert len(logger._activation_hooks) == 11
 
         logger.remove_activation_hooks()
         assert len(logger._activation_hooks) == 0
@@ -102,9 +126,25 @@ class TestActivationHookLifecycle:
 
         assert len(logger._activations_state_dict) > 0
         keys = logger._activations_state_dict["model_chunk0"]
-        assert "0/input0" in keys
-        assert "0/output0" in keys
-        assert "1/input0" in keys
+        assert "decoder.layers.0.norm/input0" in keys
+        assert "decoder.layers.1.proj/output0" in keys
+        assert "decoder.layers.2.norm/input0" not in keys
+        assert "decoder.layers.3.norm/input0" in keys
+        assert "decoder.layers.4.proj/output0" in keys
+        assert "decoder.layers.5.proj/output0" in keys
+        assert "output_layer/output0" in keys
+        logger.remove_activation_hooks()
+
+    def test_hooks_average_across_microbatches(self, logger, simple_model):
+        logger.register_activation_hooks(simple_model)
+
+        simple_model[0](torch.ones(2, 16))
+        simple_model[0](torch.full((2, 16), 3.0))
+
+        keys = logger._activations_state_dict["model_chunk0"]
+        counts = logger._activation_counts["model_chunk0"]
+        assert counts["decoder.layers.0.norm/input0"] == 2
+        assert torch.isclose(keys["decoder.layers.0.norm/input0"], torch.tensor(2.0))
         logger.remove_activation_hooks()
 
     def test_removed_hooks_dont_capture(self, logger, simple_model):

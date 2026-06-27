@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 
-DEFAULT_LAYER_PATTERN = "log2pluslast"
+DEFAULT_LAYER_PATTERN = "log4pluslast"
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -57,7 +57,8 @@ def selected_layers(num_layers: int, pattern: str | None = None) -> set[int]:
     Supported patterns:
 
     * ``log2pluslast``: layers 1,2,4,... plus the final layer.
-    * ``log4plusonelast``: layers 1,2,4,5,16,17,... plus the final layer.
+    * ``log4pluslast``: 0-indexed layer pairs 0/1,3/4,15/16,... plus the final layer.
+    * ``log4plusonelast``: backward-compatible alias for ``log4pluslast``.
     * ``all``: every layer.
     * ``none``: no transformer layers.
     * ``every:N`` or ``stride:N``: layers 1,1+N,1+2N,... plus the final layer.
@@ -81,7 +82,7 @@ def selected_layers(num_layers: int, pattern: str | None = None) -> set[int]:
             layer *= 2
         layers.add(num_layers)
         return layers
-    if raw == "log4plusonelast":
+    if raw in {"log4pluslast", "log4plusonelast"}:
         layers: set[int] = set()
         layer = 1
         while layer <= num_layers:

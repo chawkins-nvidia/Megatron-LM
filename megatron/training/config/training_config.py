@@ -396,7 +396,7 @@ class CheckpointConfig:
     save_dead_neuron_interval: int | None = None
     """Number of iterations between per-neuron dead-neuron stat saves."""
 
-    diagnostic_layer_pattern: str = "log2pluslast"
+    diagnostic_layer_pattern: str = "log4pluslast"
     """Layer-selection pattern for high-cardinality diagnostic streams."""
 
     diagnostic_include_special_layers: bool = True

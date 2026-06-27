@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.transformer.moe.router import Router
 
 from .checkpointing import save_grads
+from .diagnostic_layer_selection import make_layer_name_filter
 from .utils import unwrap_model
 
 
@@ -203,6 +204,26 @@ def _rms_summary(tensor: torch.Tensor) -> torch.Tensor:
     return _STAT_FN(finite).cpu()
 
 
+def _update_streaming_scalar(state: dict, counts: dict, chunk_name: str, key: str, value) -> None:
+    """Update a low-memory scalar mean for one diagnostic key.
+
+    Hooks fire once per microbatch. Keep only a running scalar average on CPU so
+    activation/dgrad logs represent all observed microbatches without retaining
+    tensors or per-microbatch records.
+    """
+    try:
+        value = value.detach().float().cpu()
+    except AttributeError:
+        value = torch.tensor(float(value))
+    previous = state[chunk_name].get(key)
+    count = counts[chunk_name].get(key, 0)
+    if previous is None:
+        state[chunk_name][key] = value
+    else:
+        state[chunk_name][key] = previous + (value - previous) / (count + 1)
+    counts[chunk_name][key] = count + 1
+
+
 def _parse_tpe_module_name(module_name: str) -> Tuple[str, int | None, int] | None:
     """Parse a TPE-eligible module name into ``(block, mtp_idx, layer)``.
 
@@ -264,6 +285,7 @@ class ActivationLogger:
 
         # Full activation state.
         self._activations_state_dict: defaultdict = defaultdict(dict)
+        self._activation_counts: defaultdict = defaultdict(dict)
         self._activation_hooks: List[torch.utils.hooks.RemovableHook] = []
 
         # Tokens-per-expert state: per-microbatch token counts.  Decoder entries
@@ -279,6 +301,7 @@ class ActivationLogger:
     def _make_activation_hook(self, model_chunk_name: str, module_name: str) -> Callable:
         """Forward hook that captures all inputs, outputs and kwargs."""
         sd = self._activations_state_dict
+        counts = self._activation_counts
 
         def hook(_, args, kwargs, output):
             input_tuple = args if isinstance(args, tuple) else (args,)
@@ -286,20 +309,28 @@ class ActivationLogger:
                 if not isinstance(inp, torch.Tensor):
                     continue
                 key = f"{module_name}/input{idx}"
-                sd[model_chunk_name][key] = _rms_summary(inp)
+                _update_streaming_scalar(sd, counts, model_chunk_name, key, _rms_summary(inp))
             output_tuple = output if isinstance(output, tuple) else (output,)
             for idx, output_value in enumerate(output_tuple):
                 for suffix, out in _iter_tensors(output_value, f"output{idx}"):
-                    sd[model_chunk_name][f"{module_name}/{suffix}"] = _rms_summary(out)
+                    key = f"{module_name}/{suffix}"
+                    _update_streaming_scalar(sd, counts, model_chunk_name, key, _rms_summary(out))
             for kwarg_key, kwarg_value in kwargs.items():
                 for suffix, tensor in _iter_tensors(kwarg_value, kwarg_key):
-                    sd[model_chunk_name][f"{module_name}/{suffix}"] = _rms_summary(tensor)
+                    key = f"{module_name}/{suffix}"
+                    _update_streaming_scalar(sd, counts, model_chunk_name, key, _rms_summary(tensor))
 
         return hook
 
-    def register_activation_hooks(self, model):
+    def register_activation_hooks(self, model, args=None):
         assert not self._activation_hooks
-        self._activation_hooks = _register_hooks(model, LINEAR_TYPES, self._make_activation_hook)
+        name_filter = make_layer_name_filter(model, args, stream="diagnostic")
+        self._activation_hooks = _register_hooks(
+            model,
+            LINEAR_TYPES,
+            self._make_activation_hook,
+            name_filter=name_filter,
+        )
 
     def remove_activation_hooks(self):
         for hook in self._activation_hooks:
@@ -312,6 +343,7 @@ class ActivationLogger:
         save_grads(self._save_dir, self._activations_state_dict, iteration, "activations")
         self._maybe_log_wandb(self._activations_state_dict, iteration, "act")  # CHAWKINS-WANDB-PER-TENSOR
         self._activations_state_dict.clear()
+        self._activation_counts.clear()
 
     # ------------------------------------------------------------------
     # Live W&B push of per-tensor RMS scalars. # CHAWKINS-WANDB-PER-TENSOR
@@ -443,8 +475,8 @@ def _require_logger() -> ActivationLogger:
 
 # -- Full activation logging -------------------------------------------
 
-def enable_activation_logging(model: torch.nn.Module, save_dir: str):
-    _get_logger(save_dir).register_activation_hooks(model)
+def enable_activation_logging(model: torch.nn.Module, save_dir: str, args=None):
+    _get_logger(save_dir).register_activation_hooks(model, args)
 
 
 def disable_activation_logging():

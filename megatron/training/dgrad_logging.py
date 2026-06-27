@@ -8,9 +8,10 @@ import torch.nn as nn
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.moe.router import Router
-from megatron.training.activation_logging import LOGGABLE_TYPES
+from megatron.training.activation_logging import LOGGABLE_TYPES, _update_streaming_scalar
 
 from .checkpointing import save_grads
+from .diagnostic_layer_selection import make_layer_name_filter
 from .utils import unwrap_model
 
 
@@ -65,20 +66,24 @@ from megatron.training.activation_logging import _rms_summary  # noqa: E402, F40
 
 
 class DataGradLogger:
-    """Captures and saves gradients from loggable module tensors.
-    
-    NOTE: Right now, we only save the dgrads for the last microbatch in a batch on DP replica 0.
-    The code below would need to be extended to save dgrads for all microbatches in a batch."""
+    """Captures and saves streaming-averaged gradients from loggable module tensors."""
 
     def __init__(self, save_dir: str):
         self._save_dir = save_dir
         self._dgrads_state_dict = defaultdict(dict)
+        self._dgrads_counts = defaultdict(dict)
         self._hooks = []
 
     def _save_hook(self, model_chunk_name: str, key: str):
         def hook(grad):
             if grad is not None:
-                self._dgrads_state_dict[model_chunk_name][key] = _rms_summary(grad)
+                _update_streaming_scalar(
+                    self._dgrads_state_dict,
+                    self._dgrads_counts,
+                    model_chunk_name,
+                    key,
+                    _rms_summary(grad),
+                )
         return hook
 
     def _make_hook(self, model_chunk_name: str, module_name: str):
@@ -110,6 +115,7 @@ class DataGradLogger:
         save_grads(self._save_dir, self._dgrads_state_dict, iteration, "dgrads")
         self._maybe_log_wandb(self._dgrads_state_dict, iteration, "dgrad")  # CHAWKINS-WANDB-PER-TENSOR
         self._dgrads_state_dict.clear()
+        self._dgrads_counts.clear()
 
     # ------------------------------------------------------------------
     # Live W&B push of per-tensor RMS scalars. # CHAWKINS-WANDB-PER-TENSOR
@@ -144,13 +150,14 @@ class DataGradLogger:
             except Exception:
                 pass
 
-    def register_hooks(self, model: torch.nn.Module):
+    def register_hooks(self, model: torch.nn.Module, args=None):
         """Find and register hooks on all linear layers."""
         assert len(self._hooks) == 0
+        name_filter = make_layer_name_filter(model, args, stream="diagnostic")
         for model_chunk_id, model_chunk in enumerate(model):
             unwrapped_model_chunk = unwrap_model(model_chunk)
             for module_name, module in unwrapped_model_chunk.named_modules():
-                if isinstance(module, LINEAR_TYPES):
+                if isinstance(module, LINEAR_TYPES) and name_filter(module_name):
                     model_chunk_name = f"model_chunk{model_chunk_id}"
                     handle = module.register_forward_hook(
                         self._make_hook(model_chunk_name, module_name),
@@ -168,12 +175,12 @@ class DataGradLogger:
 _LOGGER = None
 
 
-def enable_dgrad_logging(model: torch.nn.Module, save_dir: str):
+def enable_dgrad_logging(model: torch.nn.Module, save_dir: str, args=None):
     """Enable dgrad logging on a model."""
     global _LOGGER
     if _LOGGER is None:
         _LOGGER = DataGradLogger(save_dir)
-    _LOGGER.register_hooks(model)
+    _LOGGER.register_hooks(model, args)
 
 
 def disable_dgrad_logging():

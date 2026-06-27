@@ -2095,11 +2095,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
         # Forward pass.
         if save_activations_in_this_iteration:
-            enable_activation_logging(model, args.save)
+            enable_activation_logging(model, args.save, args)
         if save_tpe_in_this_iteration:
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
-            enable_dgrad_logging(model, args.save)
+            enable_dgrad_logging(model, args.save, args)
         if save_dead_neuron_in_this_iteration:
             enable_dead_neuron_logging(model, args.save)
         losses_reduced = forward_backward_func(
