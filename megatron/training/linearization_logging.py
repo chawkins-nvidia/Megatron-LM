@@ -30,6 +30,12 @@ _STREAM = "linearization"
 _WANDB_PREFIX = "lin"
 _EPS_FLOOR = 1.0e-12
 GLOBAL_LAYER_ATTR = "param_global_layer_number"
+SOURCE_MODULE_PATTERNS = (
+    ("qkv", ("self_attention.linear_qkv", "self_attention.query_key_value")),
+    ("attention_proj", ("self_attention.linear_proj", "self_attention.dense")),
+    ("mlp_up_fc1", ("mlp.linear_fc1", "mlp.fc1")),
+    ("mlp_down_fc2", ("mlp.linear_fc2", "mlp.fc2")),
+)
 
 
 def _rms_fp32(tensor: torch.Tensor) -> torch.Tensor:
@@ -193,6 +199,13 @@ def _param_layer(name: str, param: torch.nn.Parameter) -> int | None:
     return _layer_from_name(name)
 
 
+def _source_module(name: str) -> str | None:
+    for module, patterns in SOURCE_MODULE_PATTERNS:
+        if any(pattern in name for pattern in patterns):
+            return module
+    return None
+
+
 def _iter_trainable_params(model):
     for chunk_id, chunk in enumerate(_as_model_list(model)):
         chunk_name = f"model_chunk{chunk_id}"
@@ -245,6 +258,7 @@ class _LinearizationStep:
     target_layer: int
     theta_pre: dict[str, torch.Tensor]
     source_keys: set[str]
+    source_keys_by_module: dict[str, set[str]]
     h_pre: torch.Tensor
 
 
@@ -288,11 +302,14 @@ class LinearizationLogger:
             target_layer = source_layer + 1
         theta_pre: dict[str, torch.Tensor] = {}
         source_keys: set[str] = set()
+        source_keys_by_module: dict[str, set[str]] = {}
         for chunk_name, name, param in _iter_trainable_params(model):
             key = f"{chunk_name}/{name}"
             theta_pre[key] = param.detach().float().clone()
             if _param_layer(name, param) == source_layer:
                 source_keys.add(key)
+                if (module := _source_module(name)) is not None:
+                    source_keys_by_module.setdefault(module, set()).add(key)
         if not source_keys:
             logger.warning(
                 "linearization diagnostics found no trainable params at source layer %s",
@@ -312,6 +329,7 @@ class LinearizationLogger:
             target_layer=target_layer,
             theta_pre=theta_pre,
             source_keys=source_keys,
+            source_keys_by_module=source_keys_by_module,
             h_pre=h_pre,
         )
 
@@ -323,18 +341,41 @@ class LinearizationLogger:
                 if value is not None:
                     param.data.copy_(value.to(device=param.device, dtype=param.dtype))
 
-    def _apply_source_scale(self, model, scale: float) -> None:
+    def _apply_source_scale(
+        self, model, scale: float, source_keys: set[str] | None = None
+    ) -> None:
         assert self._step is not None
+        active_source_keys = self._step.source_keys if source_keys is None else source_keys
         with torch.no_grad():
             for chunk_name, name, param in _iter_trainable_params(model):
                 key = f"{chunk_name}/{name}"
                 base = self._step.theta_pre[key].to(device=param.device)
-                if key in self._step.source_keys:
+                if key in active_source_keys:
                     delta = param.detach().float() - base
                     value = base + scale * delta
                 else:
                     value = base
                 param.data.copy_(value.to(dtype=param.dtype))
+
+    def _linearization_metrics_for_source_keys(
+        self, model, post_values: dict[str, torch.Tensor], source_keys: set[str]
+    ) -> dict[str, torch.Tensor] | None:
+        assert self._step is not None
+        self._restore(model, post_values)
+        self._apply_source_scale(model, 1.0, source_keys)
+        h_true = self._capture_target_residual(model, self._step.target_layer)
+        if h_true is None:
+            return None
+        h_eps_by_eps = {}
+        for eps in self._step.eps:
+            self._restore(model, post_values)
+            self._apply_source_scale(model, eps, source_keys)
+            h_eps = self._capture_target_residual(model, self._step.target_layer)
+            if h_eps is not None:
+                h_eps_by_eps[eps] = h_eps
+        if not h_eps_by_eps:
+            return None
+        return _metrics_from_residuals(self._step.h_pre, h_true, h_eps_by_eps)
 
     def post(self, model, save_dir: str, iteration: int) -> None:
         if self._step is None:
@@ -344,25 +385,29 @@ class LinearizationLogger:
             for chunk_name, name, param in _iter_trainable_params(model)
         }
         try:
-            self._apply_source_scale(model, 1.0)
-            h_true = self._capture_target_residual(model, self._step.target_layer)
-            if h_true is None:
-                return
-            h_eps_by_eps = {}
-            for eps in self._step.eps:
-                self._restore(model, post_values)
-                self._apply_source_scale(model, eps)
-                h_eps = self._capture_target_residual(model, self._step.target_layer)
-                if h_eps is not None:
-                    h_eps_by_eps[eps] = h_eps
-            if not h_eps_by_eps:
+            metrics = self._linearization_metrics_for_source_keys(
+                model, post_values, self._step.source_keys
+            )
+            if metrics is None:
                 return
             key_prefix = f"source_block{self._step.source_layer}_to_resid{self._step.target_layer}"
             state = defaultdict(dict)
-            metrics = _metrics_from_residuals(self._step.h_pre, h_true, h_eps_by_eps)
             metrics = _mean_metrics_across_data_parallel(metrics)
             for key, value in metrics.items():
                 state["model_chunk0"][f"{key_prefix}/{key}"] = value
+            for module, source_keys in sorted(self._step.source_keys_by_module.items()):
+                module_metrics = self._linearization_metrics_for_source_keys(
+                    model, post_values, source_keys
+                )
+                if module_metrics is None:
+                    continue
+                module_key_prefix = (
+                    f"source_block{self._step.source_layer}_{module}"
+                    f"_to_resid{self._step.target_layer}"
+                )
+                module_metrics = _mean_metrics_across_data_parallel(module_metrics)
+                for key, value in module_metrics.items():
+                    state["model_chunk0"][f"{module_key_prefix}/{key}"] = value
             save_diag_state(
                 save_dir,
                 stream=_STREAM,
