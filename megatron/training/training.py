@@ -1845,6 +1845,10 @@ def setup_model_and_optimizer(
                 f'enabled={manifest.get("enabled")} n_override_groups={len(par_overrides)} '
                 f'realized_params={n_real} hash={manifest.get("config_hash")}'
             )
+            for rule_name, names in (manifest.get("per_rule") or {}).items():
+                print_rank_0(
+                    f'[#118 param] rule={rule_name} count={len(names)} names={",".join(names)}'
+                )
 
         optimizer = get_megatron_optimizer(
             config,
