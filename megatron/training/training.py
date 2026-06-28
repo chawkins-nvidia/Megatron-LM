@@ -1769,8 +1769,20 @@ def setup_model_and_optimizer(
     # and before optimizer state is captured.
     _par118 = None
     _m_L118 = None
-    if getattr(args, 'parametrization_config', None):
-        from megatron.training.parametrization import load_parametrization
+    _parametrization_block118 = getattr(args, 'parametrization', None)
+    _inline_candidate118 = (
+        _parametrization_block118.get('candidate_name')
+        if isinstance(_parametrization_block118, dict)
+        else getattr(_parametrization_block118, 'candidate_name', None)
+    )
+    _has_inline_parametrization118 = _parametrization_block118 is not None
+    _has_file_parametrization118 = (
+        getattr(args, 'parametrization_config', None) is not None
+        and getattr(args, 'parametrization_candidate', None) is not None
+    )
+    _has_parametrization118 = _has_inline_parametrization118 or _has_file_parametrization118
+    if _has_parametrization118:
+        from megatron.training.parametrization import load_parametrization, load_parametrization_block
 
         model_config_source = (
             unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
@@ -1778,19 +1790,28 @@ def setup_model_and_optimizer(
         model_config = get_model_config(model_config_source)
         _depth_base118 = getattr(args, 'parametrization_depth_base', None)
         _m_L118 = (model_config.num_layers / _depth_base118) if _depth_base118 else None
-        _par118 = load_parametrization(
-            args.parametrization_config,
-            args.parametrization_candidate,
+        _parametrization_kwargs118 = dict(
             m_N=getattr(args, 'parametrization_m_n', 1.0),
             m_L=_m_L118,
             alpha=getattr(args, 'parametrization_alpha', None),
-            residual_const=getattr(args, 'parametrization_residual_const', 1.0),
+            residual_const=getattr(args, 'parametrization_residual_const', None),
             residual_attention_const=getattr(
                 args, 'parametrization_residual_attention_const', None
             ),
             residual_mlp_const=getattr(args, 'parametrization_residual_mlp_const', None),
             depth_base=_depth_base118,
         )
+        if _has_file_parametrization118:
+            _par118 = load_parametrization(
+                args.parametrization_config,
+                args.parametrization_candidate,
+                **_parametrization_kwargs118,
+            )
+        else:
+            _par118 = load_parametrization_block(
+                _parametrization_block118,
+                **_parametrization_kwargs118,
+            )
         init_manifest = _par118.reinitialize_rule_inits(
             unwrapped_model, base_init_std=model_config.init_method_std,
         )
@@ -1825,9 +1846,9 @@ def setup_model_and_optimizer(
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
         # --- #118 unified Parametrization object: OPTIMIZER half. ---
-        if getattr(args, 'parametrization_config', None):
+        if _has_parametrization118:
             assert getattr(args, 'decoupled_lr', None) is None, (
-                "--decoupled-lr is incompatible with --parametrization-config: both emit "
+                "--decoupled-lr is incompatible with Megatron parametrization: both emit "
                 "per-group max_lr for embedding/output params."
             )
             assert _par118 is not None
@@ -1839,7 +1860,8 @@ def setup_model_and_optimizer(
             manifest = _par118.validate_coverage(model)
             n_real = sum((manifest.get("realized_types") or {}).values())
             print_rank_0(
-                f'[#118 param] candidate={getattr(args, "parametrization_candidate", None)} '
+                f'[#118 param] source={"file" if _has_file_parametrization118 else "inline"} '
+                f'candidate={getattr(args, "parametrization_candidate", None) or _inline_candidate118} '
                 f'm_N={getattr(args, "parametrization_m_n", 1.0)} m_L={_m_L118} '
                 f'alpha={_par118.cfg.alpha} depth_base={_par118.cfg.depth_base} '
                 f'enabled={manifest.get("enabled")} n_override_groups={len(par_overrides)} '

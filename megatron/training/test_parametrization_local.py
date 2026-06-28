@@ -181,6 +181,18 @@ def test_multipliers_and_reduce_to_baseline():
     assert approx(par2.init_std_mult("norm_bias"), 1.0)
 
 
+def test_explicit_multiplier_aliases_and_inline_loader():
+    cfg = c1_config(m_N=2.0)
+    hidden = next(r for r in cfg["rules"] if r["name"] == "hidden")
+    hidden["init_std_mult"] = hidden.pop("init_std")
+    hidden["lr_mult"] = hidden.pop("lr")
+    par = P.load_parametrization_block(types.SimpleNamespace(**cfg))
+    hid = next(r for r in par.cfg.rules if r.name == "hidden")
+    ov = par._override_for_rule(hid, 3e-3, 3e-5, 1e-15)
+    assert approx(ov["max_lr"], 3e-3 * 0.5), ov
+    assert approx(par.init_std_mult("hidden"), 2.0 ** -0.5)
+
+
 def test_completep_depth_uses_unscaled_output_init_std():
     install_fake_megatron_utils()
     cfg = c1_config()

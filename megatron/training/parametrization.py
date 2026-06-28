@@ -118,6 +118,34 @@ class Rule:
         return True
 
 
+def _as_plain_config(value: Any) -> Any:
+    """Convert YAML SimpleNamespace/list trees back into plain dict/list trees."""
+    if isinstance(value, dict):
+        return {k: _as_plain_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_as_plain_config(v) for v in value]
+    if hasattr(value, "__dict__"):
+        return {k: _as_plain_config(v) for k, v in vars(value).items()}
+    return value
+
+
+def _mult_block(rule: dict, old_key: str, new_key: str) -> Dict[str, float]:
+    """Read a multiplier block, accepting old internal names and new explicit names.
+
+    Candidate files historically used ``init_std`` and ``lr`` for multiplier
+    blocks. Hydra-facing configs should use ``init_std_mult`` and ``lr_mult`` so
+    the value is visibly a multiplier, not a resolved LR/init value.
+    """
+    old_value = rule.get(old_key)
+    new_value = rule.get(new_key)
+    if old_value is not None and new_value is not None and old_value != new_value:
+        raise ValueError(
+            f"[#118 param] rule {rule.get('name')!r} sets both {old_key} and {new_key}; "
+            "use only the explicit *_mult key for inline Hydra config."
+        )
+    return dict((new_value if new_value is not None else old_value) or {})
+
+
 @dataclass
 class ParametrizationConfig:
     enabled: bool = False
@@ -136,6 +164,7 @@ class ParametrizationConfig:
 
     @staticmethod
     def from_dict(d: Optional[dict]) -> "ParametrizationConfig":
+        d = _as_plain_config(d)
         if not d or not d.get("enabled", False):
             return ParametrizationConfig(enabled=False)
         ratios = {v: float(d.get("ratios", {}).get(v, 1.0)) for v in RATIO_VARS}
@@ -157,8 +186,8 @@ class ParametrizationConfig:
                 types=tuple(r["types"]),
                 depth_start=(r.get("depth") or {}).get("start"),
                 depth_end=(r.get("depth") or {}).get("end"),
-                init_std=dict(r.get("init_std", {}) or {}),
-                lr=dict(r.get("lr", {}) or {}),
+                init_std=_mult_block(r, "init_std", "init_std_mult"),
+                lr=_mult_block(r, "lr", "lr_mult"),
                 eps=dict(r.get("eps", {}) or {}),
                 wd=dict(r.get("wd", {}) or {}),
             )
@@ -538,6 +567,72 @@ class Parametrization:
 # --------------------------------------------------------------------------------------
 # Loader: build a compiled Parametrization from the candidates YAML
 # --------------------------------------------------------------------------------------
+def _block_with_runtime_overrides(
+    block: dict,
+    *,
+    ratios: Optional[Dict[str, float]] = None,
+    m_N: Optional[float] = None,
+    m_L: Optional[float] = None,
+    alpha: Optional[float] = None,
+    residual_const: Optional[float] = None,
+    residual_attention_const: Optional[float] = None,
+    residual_mlp_const: Optional[float] = None,
+    depth_base: Optional[int] = None,
+) -> dict:
+    block = dict(block)  # shallow copy so we never mutate the loaded doc
+    if ratios or m_N is not None or m_L is not None:
+        merged = dict(block.get("ratios", {}) or {})
+        if ratios:
+            merged.update(ratios)
+        if m_N is not None:
+            merged["m_N"] = float(m_N)
+        if m_L is not None:
+            merged["m_L"] = float(m_L)
+        block["ratios"] = merged
+    # CompleteP depth knobs: launch-arg overrides win over the YAML block when provided.
+    if alpha is not None:
+        block["alpha"] = float(alpha)
+    if residual_const is not None:
+        block["residual_const"] = float(residual_const)
+    if residual_attention_const is not None:
+        block["residual_attention_const"] = float(residual_attention_const)
+    if residual_mlp_const is not None:
+        block["residual_mlp_const"] = float(residual_mlp_const)
+    if depth_base is not None:
+        block["depth_base"] = int(depth_base)
+    return block
+
+
+def load_parametrization_block(
+    block: dict,
+    *,
+    ratios: Optional[Dict[str, float]] = None,
+    m_N: Optional[float] = None,
+    m_L: Optional[float] = None,
+    alpha: Optional[float] = None,
+    residual_const: Optional[float] = None,
+    residual_attention_const: Optional[float] = None,
+    residual_mlp_const: Optional[float] = None,
+    depth_base: Optional[int] = None,
+) -> "Parametrization":
+    """Compile an inline Hydra ``megatron.parametrization`` block."""
+    block = _as_plain_config(block)
+    if block and "parametrization" in block:
+        block = block["parametrization"]
+    block = _block_with_runtime_overrides(
+        block,
+        ratios=ratios,
+        m_N=m_N,
+        m_L=m_L,
+        alpha=alpha,
+        residual_const=residual_const,
+        residual_attention_const=residual_attention_const,
+        residual_mlp_const=residual_mlp_const,
+        depth_base=depth_base,
+    )
+    return Parametrization(ParametrizationConfig.from_dict(block))
+
+
 def load_parametrization(
     path: str,
     candidate: str,
@@ -574,25 +669,14 @@ def load_parametrization(
         raise KeyError(
             f"[#118 param] candidate '{candidate}' has no 'parametrization' block in {path}"
         )
-    block = dict(block)  # shallow copy so we never mutate the loaded doc
-    if ratios or m_N is not None or m_L is not None:
-        merged = dict(block.get("ratios", {}) or {})
-        if ratios:
-            merged.update(ratios)
-        if m_N is not None:
-            merged["m_N"] = float(m_N)
-        if m_L is not None:
-            merged["m_L"] = float(m_L)
-        block["ratios"] = merged
-    # CompleteP depth knobs: launch-arg overrides win over the YAML block when provided.
-    if alpha is not None:
-        block["alpha"] = float(alpha)
-    if residual_const is not None:
-        block["residual_const"] = float(residual_const)
-    if residual_attention_const is not None:
-        block["residual_attention_const"] = float(residual_attention_const)
-    if residual_mlp_const is not None:
-        block["residual_mlp_const"] = float(residual_mlp_const)
-    if depth_base is not None:
-        block["depth_base"] = int(depth_base)
-    return Parametrization(ParametrizationConfig.from_dict(block))
+    return load_parametrization_block(
+        block,
+        ratios=ratios,
+        m_N=m_N,
+        m_L=m_L,
+        alpha=alpha,
+        residual_const=residual_const,
+        residual_attention_const=residual_attention_const,
+        residual_mlp_const=residual_mlp_const,
+        depth_base=depth_base,
+    )

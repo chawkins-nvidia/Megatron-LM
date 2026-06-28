@@ -2686,7 +2686,7 @@ def _add_learning_rate_args(parser):
                        'applied to attention and MLP residual branches.')
     group.add_argument('--parametrization-alpha', type=float, default=None,
                        help='(#118 CompleteP) Depth exponent alpha in the residual rule.')
-    group.add_argument('--parametrization-residual-const', type=float, default=1.0,
+    group.add_argument('--parametrization-residual-const', type=float, default=None,
                        help='(#118 CompleteP) Default residual branch multiplier C.')
     group.add_argument('--parametrization-residual-attention-const', type=float, default=None,
                        help='(#118 CompleteP) Attention residual branch multiplier C_attention.')
