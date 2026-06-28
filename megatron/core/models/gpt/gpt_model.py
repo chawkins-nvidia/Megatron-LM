@@ -244,14 +244,20 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
+            _param_unembed_init = getattr(config, "unembedding_init_method", None)
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
                 init_method=(
-                    config.embedding_init_method
-                    if config.use_mup and not self.share_embeddings_and_output_weights
-                    else config.init_method
+                    _param_unembed_init
+                    if _param_unembed_init is not None
+                    and not self.share_embeddings_and_output_weights
+                    else (
+                        config.embedding_init_method
+                        if config.use_mup and not self.share_embeddings_and_output_weights
+                        else config.init_method
+                    )
                 ),
                 bias=False,
                 skip_bias_add=False,

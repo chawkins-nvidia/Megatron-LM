@@ -330,6 +330,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
 
+        # (#118 CompleteP depth scaling) Forward multipliers on the attention/mlp residual
+        # branches: h^{l+1} = h^l + C_type * f_l(h^l). 1.0 => inert. The scalar
+        # residual_branch_mult remains a backward-compatible fallback for old configs.
+        residual_branch_mult = getattr(config, "residual_branch_mult", 1.0)
+        self.residual_attention_mult = getattr(
+            config, "residual_attention_mult", residual_branch_mult
+        )
+        self.residual_mlp_mult = getattr(config, "residual_mlp_mult", residual_branch_mult)
+
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
         self.input_layernorm = submodules.input_layernorm(
@@ -652,6 +661,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention")
 
+        # (#118 CompleteP) Scale the attention residual branch before the add.
+        if self.residual_attention_mult != 1.0:
+            attention_output_with_bias = (
+                attention_output_with_bias[0] * self.residual_attention_mult,
+                attention_output_with_bias[1] * self.residual_attention_mult
+                if attention_output_with_bias[1] is not None
+                else None,
+            )
+
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
             # as a gradient hook of attention_output_with_bias[0]
@@ -906,6 +924,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # as a gradient hook of mlp_output_with_bias[0]
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
                 mlp_output_with_bias[0]
+            )
+
+        # (#118 CompleteP) Scale the MLP residual branch before the add.
+        if self.residual_mlp_mult != 1.0:
+            mlp_output_with_bias = (
+                mlp_output_with_bias[0] * self.residual_mlp_mult,
+                mlp_output_with_bias[1] * self.residual_mlp_mult
+                if mlp_output_with_bias[1] is not None
+                else None,
             )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself

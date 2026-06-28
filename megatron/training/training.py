@@ -1762,6 +1762,46 @@ def setup_model_and_optimizer(
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
+    # --- #118 unified Parametrization object: fine-grained INIT half. ---
+    # gpt_builders.maybe_apply_parametrization_init handles the coarse config init hooks
+    # before model construction. Per-parameter-group HPO needs finer routing for
+    # qkv/proj/fc1/fc2/readout, so rules with init_std are applied here after modules exist
+    # and before optimizer state is captured.
+    _par118 = None
+    _m_L118 = None
+    if getattr(args, 'parametrization_config', None):
+        from megatron.training.parametrization import load_parametrization
+
+        model_config_source = (
+            unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
+        )
+        model_config = get_model_config(model_config_source)
+        _depth_base118 = getattr(args, 'parametrization_depth_base', None)
+        _m_L118 = (model_config.num_layers / _depth_base118) if _depth_base118 else None
+        _par118 = load_parametrization(
+            args.parametrization_config,
+            args.parametrization_candidate,
+            m_N=getattr(args, 'parametrization_m_n', 1.0),
+            m_L=_m_L118,
+            alpha=getattr(args, 'parametrization_alpha', None),
+            residual_const=getattr(args, 'parametrization_residual_const', 1.0),
+            residual_attention_const=getattr(
+                args, 'parametrization_residual_attention_const', None
+            ),
+            residual_mlp_const=getattr(args, 'parametrization_residual_mlp_const', None),
+            depth_base=_depth_base118,
+        )
+        init_manifest = _par118.reinitialize_rule_inits(
+            unwrapped_model, base_init_std=model_config.init_method_std,
+        )
+        if init_manifest.get("reinitialized"):
+            print_rank_0(
+                f'[#118 param] reinitialized per-rule init_std: '
+                f'base={init_manifest.get("base_init_std")} '
+                f'stds={init_manifest.get("stds")} '
+                f'counts={init_manifest.get("reinitialized")}'
+            )
+
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:
         optimizer, opt_param_scheduler = None, None
@@ -1783,6 +1823,28 @@ def setup_model_and_optimizer(
             )
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
+
+        # --- #118 unified Parametrization object: OPTIMIZER half. ---
+        if getattr(args, 'parametrization_config', None):
+            assert getattr(args, 'decoupled_lr', None) is None, (
+                "--decoupled-lr is incompatible with --parametrization-config: both emit "
+                "per-group max_lr for embedding/output params."
+            )
+            assert _par118 is not None
+            par_overrides = _par118.build_config_overrides(
+                base_lr=config.lr, base_min_lr=config.min_lr, base_eps=config.adam_eps,
+            )
+            if par_overrides:
+                config_overrides = {**(config_overrides or {}), **par_overrides}
+            manifest = _par118.validate_coverage(model)
+            n_real = sum((manifest.get("realized_types") or {}).values())
+            print_rank_0(
+                f'[#118 param] candidate={getattr(args, "parametrization_candidate", None)} '
+                f'm_N={getattr(args, "parametrization_m_n", 1.0)} m_L={_m_L118} '
+                f'alpha={_par118.cfg.alpha} depth_base={_par118.cfg.depth_base} '
+                f'enabled={manifest.get("enabled")} n_override_groups={len(par_overrides)} '
+                f'realized_params={n_real} hash={manifest.get("config_hash")}'
+            )
 
         optimizer = get_megatron_optimizer(
             config,

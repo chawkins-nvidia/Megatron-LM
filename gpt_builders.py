@@ -21,6 +21,43 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
+def maybe_apply_parametrization_init(args, config):
+    """Apply the unified Parametrization object's per-module-type init rules to ``config``."""
+    if not getattr(args, 'parametrization_config', None):
+        return config
+    cand = getattr(args, 'parametrization_candidate', None)
+    if not cand:
+        raise ValueError("--parametrization-config requires --parametrization-candidate.")
+
+    from megatron.training.parametrization import load_parametrization
+
+    depth_base = getattr(args, 'parametrization_depth_base', None)
+    m_L = (config.num_layers / depth_base) if depth_base else None
+    par = load_parametrization(
+        args.parametrization_config,
+        cand,
+        m_N=getattr(args, 'parametrization_m_n', 1.0),
+        m_L=m_L,
+        alpha=getattr(args, 'parametrization_alpha', None),
+        residual_const=getattr(args, 'parametrization_residual_const', 1.0),
+        residual_attention_const=getattr(args, 'parametrization_residual_attention_const', None),
+        residual_mlp_const=getattr(args, 'parametrization_residual_mlp_const', None),
+        depth_base=depth_base,
+    )
+    residual_mult = 1.0 if getattr(config, 'is_hybrid_model', False) else 2.0
+    par.apply_init(config, residual_depth_multiplier=residual_mult)
+    print_rank_0(
+        f'[#118 param] applied init: candidate={cand}, '
+        f'm_N={getattr(args, "parametrization_m_n", 1.0)}, '
+        f'm_L={m_L}, residual_depth_multiplier={residual_mult}, '
+        f'enabled={par.cfg.enabled}, alpha={par.cfg.alpha}, '
+        f'depth_base={par.cfg.depth_base}, '
+        f'residual_attention_mult={getattr(config, "residual_attention_mult", 1.0)}, '
+        f'residual_mlp_mult={getattr(config, "residual_mlp_mult", 1.0)}'
+    )
+    return config
+
+
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
     if config is None:
@@ -28,6 +65,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
+        maybe_apply_parametrization_init(args, config)
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:

@@ -2671,6 +2671,28 @@ def _add_learning_rate_args(parser):
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
 
+    # --- #118 unified config-driven Parametrization object (init+optim) ---
+    group.add_argument('--parametrization-config', type=str, default=None,
+                       help='(#118) Path to a parametrization candidates YAML. Selects the '
+                       'candidate via --parametrization-candidate and drives init + optimizer '
+                       'from the unified object.')
+    group.add_argument('--parametrization-candidate', type=str, default=None,
+                       help='(#118) Candidate name within --parametrization-config.')
+    group.add_argument('--parametrization-m-n', type=float, default=1.0,
+                       help='(#118) Width ratio m_N = hidden_size / base_hidden_size.')
+    group.add_argument('--parametrization-depth-base', type=int, default=None,
+                       help='(#118 CompleteP) Base depth L_0 for depth scaling. When set, '
+                       'm_L = num_layers / depth_base is derived and residual multipliers are '
+                       'applied to attention and MLP residual branches.')
+    group.add_argument('--parametrization-alpha', type=float, default=None,
+                       help='(#118 CompleteP) Depth exponent alpha in the residual rule.')
+    group.add_argument('--parametrization-residual-const', type=float, default=1.0,
+                       help='(#118 CompleteP) Default residual branch multiplier C.')
+    group.add_argument('--parametrization-residual-attention-const', type=float, default=None,
+                       help='(#118 CompleteP) Attention residual branch multiplier C_attention.')
+    group.add_argument('--parametrization-residual-mlp-const', type=float, default=None,
+                       help='(#118 CompleteP) MLP residual branch multiplier C_mlp.')
+
     return parser
 
 

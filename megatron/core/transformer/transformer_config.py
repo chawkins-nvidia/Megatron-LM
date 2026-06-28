@@ -415,6 +415,24 @@ class TransformerConfig(ModelParallelConfig):
     Default: 1.0 (MuP scaling when use_mup is True). Set to 0.5 for standard scaling.
     """
 
+    residual_branch_mult: float = 1.0
+    """
+    (#118 CompleteP depth scaling) Backward-compatible forward multiplier applied to each
+    transformer layer's attention AND MLP residual-branch output.
+    """
+
+    residual_attention_mult: float = 1.0
+    """
+    (#118 CompleteP depth scaling) Forward multiplier for the attention residual branch:
+    h^{l+1} = h^l + C_attention * f_attention_l(h^l). 1.0 => inert.
+    """
+
+    residual_mlp_mult: float = 1.0
+    """
+    (#118 CompleteP depth scaling) Forward multiplier for the MLP residual branch:
+    h^{l+1} = h^l + C_mlp * f_mlp_l(h^l). 1.0 => inert.
+    """
+
     ####################
     # mixed-precision
     ####################
