@@ -456,6 +456,11 @@ def _get_param_groups(
                 "OPTIMIZER_PARAM_GROUP_NAMES "
                 f"index={idx} names={','.join(names)}"
             )
+            for name in names:
+                _rank0_print_optimizer_group(
+                    "OPTIMIZER_PARAM_GROUP_NAME "
+                    f"index={idx} name={name}"
+                )
 
     return param_groups
 
