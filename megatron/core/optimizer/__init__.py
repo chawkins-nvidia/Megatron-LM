@@ -93,6 +93,11 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
+def _rank0_print_optimizer_group(message: str) -> None:
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(message, flush=True)
+
+
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
     """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
 
@@ -326,8 +331,9 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel) to params.
+    # Map (pg_overrides, is_expert_parallel) to params and names.
     params_map = {}
+    param_names_map = {}
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
@@ -358,7 +364,9 @@ def _get_param_groups(
             key = (param_override_tuple, is_expert_parallel)
             if key not in params_map:
                 params_map[key] = []
+                param_names_map[key] = []
             params_map[key].append(param)
+            param_names_map[key].append(name)
 
     params_key = list(params_map.keys())
     if os.environ.get('MEGATRON_SKIP_OPTIMIZER_PARAM_GROUP_SYNC') != '1':
@@ -374,7 +382,8 @@ def _get_param_groups(
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
     # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
+    sorted_params_key = sorted(params_key, key=lambda x: (x[0] is not None, x[0]))
+    for key in sorted_params_key:
         param_override_tuple, is_expert_parallel = key
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
@@ -413,6 +422,40 @@ def _get_param_groups(
             **param_override,  # keep **param_override last so that users can override other fields.
         }
         param_groups.append(param_group)
+
+    if os.environ.get("MEGATRON_LOG_OPTIMIZER_PARAM_GROUPS", "1") != "0":
+        opt_impl = "torch-adamw" if USING_PYTORCH_OPTIMIZER else "fused-adam"
+        _rank0_print_optimizer_group(
+            "OPTIMIZER_PARAM_GROUP_SUMMARY "
+            f"optimizer={config.optimizer} impl={opt_impl} "
+            f"decoupled_weight_decay={config.decoupled_weight_decay} "
+            f"base_weight_decay={config.weight_decay} "
+            f"apply_wd_to_qk_layernorm={config.apply_wd_to_qk_layernorm} "
+            f"groups={len(param_groups)}"
+        )
+        for idx, (param_group, key) in enumerate(zip(param_groups, sorted_params_key)):
+            names = param_names_map.get(key, [])
+            wd_mult = param_group.get("wd_mult", 1.0)
+            start_wd = param_group.get("start_wd", config.weight_decay)
+            end_wd = param_group.get("end_wd", config.weight_decay)
+            _rank0_print_optimizer_group(
+                "OPTIMIZER_PARAM_GROUP "
+                f"index={idx} params={len(param_group['params'])} "
+                f"wd_mult={wd_mult} "
+                f"start_wd={start_wd} end_wd={end_wd} "
+                f"effective_start_wd={start_wd * wd_mult} "
+                f"effective_end_wd={end_wd * wd_mult} "
+                f"max_lr={param_group.get('max_lr')} "
+                f"min_lr={param_group.get('min_lr')} "
+                f"lr_mult={param_group.get('lr_mult', 1.0)} "
+                f"is_decoupled_lr={param_group.get('is_decoupled_lr', False)} "
+                f"is_expert_parallel={param_group.get('is_expert_parallel', False)} "
+                f"default_config={param_group.get('default_config', False)}"
+            )
+            _rank0_print_optimizer_group(
+                "OPTIMIZER_PARAM_GROUP_NAMES "
+                f"index={idx} names={','.join(names)}"
+            )
 
     return param_groups
 
@@ -560,9 +603,19 @@ def _get_megatron_optimizer_based_on_param_groups(
             # on source of optimizer (Torch or TE/Apex)
             if USING_PYTORCH_OPTIMIZER:
                 adam_cls = torch.optim.AdamW if config.decoupled_weight_decay else torch.optim.Adam
+                _rank0_print_optimizer_group(
+                    "OPTIMIZER_WEIGHT_DECAY_MODE "
+                    f"optimizer=adam backend=torch optimizer_class={adam_cls.__name__} "
+                    f"decoupled_weight_decay={config.decoupled_weight_decay}"
+                )
             else:
                 kwargs["adam_w_mode"] = config.decoupled_weight_decay
                 adam_cls = Adam
+                _rank0_print_optimizer_group(
+                    "OPTIMIZER_WEIGHT_DECAY_MODE "
+                    f"optimizer=adam backend=fused optimizer_class={adam_cls.__name__} "
+                    f"adam_w_mode={kwargs['adam_w_mode']}"
+                )
 
             if config.use_precision_aware_optimizer:
                 kwargs.update(
