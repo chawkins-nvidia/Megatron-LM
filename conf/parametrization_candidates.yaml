@@ -107,6 +107,62 @@ _groups:
     - hpo_r6_promoted_embedding_i0p3664_lr0p0011
     - hpo_r6_promoted_embedding_i0p3664_lr0p0044
     - hpo_r6_promoted_embedding_i0p3664_lr0p0176
+  promoted_embedding_high_lr_ext1:
+    label: r6 restart embedding high-LR edge repair
+    target_type: embedding
+    cluster: gcp_nrt
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_center: 0.0229
+    lr_center: 0.0704
+    axis_mode: init_lr
+    init_values:
+    - 0.005725
+    - 0.0229
+    - 0.0916
+    lr_values:
+    - 0.0704
+    - 0.2816
+    candidates:
+    - hpo_r6_promoted_embedding_high_lr_ext1_i0p005725_lr0p0704
+    - hpo_r6_promoted_embedding_high_lr_ext1_i0p005725_lr0p2816
+    - hpo_r6_promoted_embedding_high_lr_ext1_i0p0229_lr0p0704
+    - hpo_r6_promoted_embedding_high_lr_ext1_i0p0229_lr0p2816
+    - hpo_r6_promoted_embedding_high_lr_ext1_i0p0916_lr0p0704
+    - hpo_r6_promoted_embedding_high_lr_ext1_i0p0916_lr0p2816
+  promoted_embedding_low_init_ext2:
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    cluster: gcp_nrt
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_center: 0.0003578125
+    lr_center: 0.0011
+    axis_mode: init_lr
+    init_values:
+    - 8.9453125e-05
+    - 0.0003578125
+    lr_values:
+    - 0.0011
+    - 0.0044
+    - 0.0176
+    - 0.0704
+    - 0.2816
+    candidates:
+    - hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p0011
+    - hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p0044
+    - hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p0176
+    - hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p0704
+    - hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p2816
+    - hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p0011
+    - hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p0044
+    - hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p0176
+    - hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p0704
+    - hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p2816
   attention_out:
     label: attention out
     target_type: linear_proj
@@ -3697,6 +3753,1174 @@ hpo_r6_promoted_embedding_i0p3664_lr0p0176:
         const: 16.0
       lr_mult:
         const: 16.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_high_lr_ext1_i0p005725_lr0p0704:
+  metadata:
+    group: promoted_embedding_high_lr_ext1
+    label: r6 restart embedding high-LR edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.005725
+    lr: 0.0704
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_high_lr_ext1_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.25
+      lr_mult:
+        const: 64.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_high_lr_ext1_i0p005725_lr0p2816:
+  metadata:
+    group: promoted_embedding_high_lr_ext1
+    label: r6 restart embedding high-LR edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.005725
+    lr: 0.2816
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_high_lr_ext1_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.25
+      lr_mult:
+        const: 256.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_high_lr_ext1_i0p0229_lr0p0704:
+  metadata:
+    group: promoted_embedding_high_lr_ext1
+    label: r6 restart embedding high-LR edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0229
+    lr: 0.0704
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_high_lr_ext1_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 64.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_high_lr_ext1_i0p0229_lr0p2816:
+  metadata:
+    group: promoted_embedding_high_lr_ext1
+    label: r6 restart embedding high-LR edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0229
+    lr: 0.2816
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_high_lr_ext1_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 256.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_high_lr_ext1_i0p0916_lr0p0704:
+  metadata:
+    group: promoted_embedding_high_lr_ext1
+    label: r6 restart embedding high-LR edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0916
+    lr: 0.0704
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_high_lr_ext1_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 4.0
+      lr_mult:
+        const: 64.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_high_lr_ext1_i0p0916_lr0p2816:
+  metadata:
+    group: promoted_embedding_high_lr_ext1
+    label: r6 restart embedding high-LR edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0916
+    lr: 0.2816
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_high_lr_ext1_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 4.0
+      lr_mult:
+        const: 256.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p0011:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0003578125
+    lr: 0.0011
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 1.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p0044:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0003578125
+    lr: 0.0044
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 4.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p0176:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0003578125
+    lr: 0.0176
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 16.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p0704:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0003578125
+    lr: 0.0704
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 64.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i0p0003578125_lr0p2816:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.0003578125
+    lr: 0.2816
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 256.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p0011:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 8.9453125e-05
+    lr: 0.0011
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.00390625
+      lr_mult:
+        const: 1.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p0044:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 8.9453125e-05
+    lr: 0.0044
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.00390625
+      lr_mult:
+        const: 4.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p0176:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 8.9453125e-05
+    lr: 0.0176
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.00390625
+      lr_mult:
+        const: 16.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p0704:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 8.9453125e-05
+    lr: 0.0704
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.00390625
+      lr_mult:
+        const: 64.0
+    - name: unembedding_identity
+      types:
+      - unembedding
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_qkv_identity
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_proj_identity
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_embedding_low_init_ext2_i8p9453125em05_lr0p2816:
+  metadata:
+    group: promoted_embedding_low_init_ext2
+    label: r6 restart embedding low-init edge repair
+    target_type: embedding
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 8.9453125e-05
+    lr: 0.2816
+  parametrization:
+    enabled: true
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types: *id002
+    type_registry: *id003
+    rules:
+    - name: promoted_embedding_low_init_ext2_tuned
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.00390625
+      lr_mult:
+        const: 256.0
     - name: unembedding_identity
       types:
       - unembedding
