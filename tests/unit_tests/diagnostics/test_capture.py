@@ -24,45 +24,48 @@ from megatron.training.diagnostics.accumulator import ReductionBinding
 from megatron.training.diagnostics.capture import (
     CaptureTopology,
     Tier0CaptureSession,
+    pack_valid_token_mask_sideband,
     slice_sequence_parallel_mask,
     stage_valid_token_mask,
-    transport_valid_token_mask,
+    unpack_valid_token_mask_sideband,
 )
 from megatron.training.diagnostics.normalization import CanonicalDgradNormalizer
-from megatron.training.diagnostics.registry import MetricFamily
+from megatron.training.diagnostics.registry import MaskKind, MetricFamily
 from megatron.training.diagnostics.schema import Tier0Status
 
 
 class _FakeColumnParallelLinear(ColumnParallelLinear):
-    def __init__(self, scale: float) -> None:
+    def __init__(self, scale: float, *, sequence_parallel: bool = False) -> None:
         nn.Module.__init__(self)
         self.scale = scale
+        self.sequence_parallel = sequence_parallel
 
     def forward(self, values: torch.Tensor):
         return values * self.scale, None
 
 
 class _FakeRowParallelLinear(RowParallelLinear):
-    def __init__(self, scale: float) -> None:
+    def __init__(self, scale: float, *, sequence_parallel: bool = False) -> None:
         nn.Module.__init__(self)
         self.scale = scale
+        self.sequence_parallel = sequence_parallel
 
     def forward(self, values: torch.Tensor):
         return values * self.scale, None
 
 
 class _FakeAttention(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, *, sequence_parallel: bool = False) -> None:
         super().__init__()
-        self.linear_qkv = _FakeColumnParallelLinear(2.0)
-        self.linear_proj = _FakeRowParallelLinear(0.5)
+        self.linear_qkv = _FakeColumnParallelLinear(2.0, sequence_parallel=sequence_parallel)
+        self.linear_proj = _FakeRowParallelLinear(0.5, sequence_parallel=sequence_parallel)
 
 
 class _FakeMLP(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, *, sequence_parallel: bool = False) -> None:
         super().__init__()
-        self.linear_fc1 = _FakeColumnParallelLinear(3.0)
-        self.linear_fc2 = _FakeRowParallelLinear(0.25)
+        self.linear_fc1 = _FakeColumnParallelLinear(3.0, sequence_parallel=sequence_parallel)
+        self.linear_fc2 = _FakeRowParallelLinear(0.25, sequence_parallel=sequence_parallel)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         values, _ = self.linear_fc1(values)
@@ -71,19 +74,26 @@ class _FakeMLP(nn.Module):
 
 
 class _FakeTransformerLayer(TransformerLayer):
-    def __init__(self, layer_number: int = 1, *, selective_recompute: bool = False) -> None:
+    def __init__(
+        self,
+        layer_number: int = 1,
+        *,
+        selective_recompute: bool = False,
+        sequence_parallel: bool = False,
+    ) -> None:
         nn.Module.__init__(self)
         self.layer_number = layer_number
         self.is_moe_layer = False
         self.config = SimpleNamespace(
             transformer_impl="local",
+            sequence_parallel=sequence_parallel,
             fp8=None,
             fp4=None,
             cuda_graph_impl="none",
             mlp_chunks_for_training=1,
         )
-        self.self_attention = _FakeAttention()
-        self.mlp = _FakeMLP()
+        self.self_attention = _FakeAttention(sequence_parallel=sequence_parallel)
+        self.mlp = _FakeMLP(sequence_parallel=sequence_parallel)
         self.selective_recompute = selective_recompute
 
     def forward(self, values: torch.Tensor):
@@ -258,7 +268,7 @@ def test_topology_ownership_and_full_pipeline_slots() -> None:
     rank_one.close()
 
     sequence_parallel = Tier0CaptureSession(
-        model,
+        _FakeModel(_FakeTransformerLayer(layer_number=3, sequence_parallel=True)),
         num_layers=4,
         topology=CaptureTopology(
             tensor_parallel_rank=1, tensor_parallel_size=2, sequence_parallel=True
@@ -272,51 +282,53 @@ def test_topology_ownership_and_full_pipeline_slots() -> None:
     )
     assert sequence_parallel.registry.owns("activation/attn_out/layer_2")
     assert sequence_parallel.registry.owns("activation/residual/layer_2")
+    descriptors = {
+        descriptor.logical_name: descriptor for descriptor in sequence_parallel.registry.descriptors
+    }
+    assert descriptors["activation/qkv/layer_2"].mask_kind == MaskKind.TOKEN
+    assert descriptors["activation/fc1/layer_2"].mask_kind == MaskKind.TOKEN
+    assert descriptors["activation/attn_out/layer_2"].mask_kind == MaskKind.SEQUENCE_PARALLEL_TOKEN
+    assert descriptors["activation/residual/layer_2"].mask_kind == MaskKind.SEQUENCE_PARALLEL_TOKEN
     sequence_parallel.close()
 
 
-def test_mask_staging_sequence_parallel_slice_and_single_transport(
+def test_mask_staging_and_sideband_helpers_invoke_no_collective(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def fail_collective(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("mask staging and capture must not invoke a collective")
+
+    for collective in (
+        "all_gather",
+        "all_gather_into_tensor",
+        "all_reduce",
+        "broadcast",
+        "gather",
+        "reduce",
+        "reduce_scatter",
+        "reduce_scatter_tensor",
+        "scatter",
+    ):
+        if hasattr(torch.distributed, collective):
+            monkeypatch.setattr(torch.distributed, collective, fail_collective)
+
     mask = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     staged = stage_valid_token_mask(mask, micro_batch_size=1, sequence_length=4, device="cpu")
     sliced = slice_sequence_parallel_mask(staged, tensor_parallel_rank=1, tensor_parallel_size=2)
     torch.testing.assert_close(sliced.values[:, 0, 0], torch.tensor([3.0, 4.0]))
     assert sliced.valid
 
-    calls = []
-
-    def broadcast(payload, *, src, group):
-        calls.append((payload.shape, src, group))
-
-    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
-    group = object()
-    assert (
-        transport_valid_token_mask(
-            mask,
-            armed=False,
-            micro_batch_size=1,
-            sequence_length=4,
-            device="cpu",
-            pipeline_group=group,
-            pipeline_last_global_rank=7,
-            is_pipeline_last_stage=True,
-        )
-        is None
+    payload = pack_valid_token_mask_sideband(
+        mask, micro_batch_size=1, sequence_length=4, device="cpu"
     )
-    transported = transport_valid_token_mask(
-        mask,
-        armed=True,
-        micro_batch_size=1,
-        sequence_length=4,
-        device="cpu",
-        pipeline_group=group,
-        pipeline_last_global_rank=7,
-        is_pipeline_last_stage=True,
+    transported = unpack_valid_token_mask_sideband(
+        payload, micro_batch_size=1, sequence_length=4, device="cpu"
     )
-    assert calls == [(torch.Size([5]), 7, group)]
     torch.testing.assert_close(transported.values, staged.values)
     assert transported.valid
+
+    _, result = _run_capture(masks=(mask,))
+    assert result.status == Tier0Status.OK
 
 
 @pytest.mark.parametrize("failure", ("all_masked", "nonfinite", "mismatch"))
@@ -365,6 +377,142 @@ def test_session_installs_no_duplicate_hooks_across_events() -> None:
         assert result.accumulator.sum_pack[slots.count] == 4
     session.close()
     assert all(not target.module._forward_hooks for target in session.targets)
+
+
+def test_missing_dgrad_is_packed_invalid_even_when_activation_was_observed() -> None:
+    layer = _FakeTransformerLayer()
+    session = Tier0CaptureSession(
+        _FakeModel(layer),
+        num_layers=1,
+        topology=CaptureTopology(),
+        device="cpu",
+        micro_batch_size=1,
+        local_sequence_length=2,
+        calculate_per_token_loss=True,
+        dgrad_normalizer=CanonicalDgradNormalizer(),
+        reduction_binding=_binding(),
+    )
+    session.arm(expected_microbatch_ids=(0,))
+    session.begin_microbatch(0)
+    session.register_valid_token_mask(0, torch.ones(1, 2))
+    with torch.no_grad():
+        layer(torch.ones(2, 1, 2))
+    session.end_microbatch(0)
+
+    result = session.finalize()
+
+    slots = result.accumulator.slots("dgrad/residual/layer_0")
+    assert result.accumulator.sum_pack[slots.observation_error] == 1
+    assert result.status == Tier0Status.INVALID_STATISTICS
+    session.close()
+
+
+def test_partial_layer_execution_and_duplicate_hooks_are_packed_invalid() -> None:
+    layer = _FakeTransformerLayer()
+    session = Tier0CaptureSession(
+        _FakeModel(layer),
+        num_layers=1,
+        topology=CaptureTopology(),
+        device="cpu",
+        micro_batch_size=1,
+        local_sequence_length=2,
+        calculate_per_token_loss=True,
+        dgrad_normalizer=CanonicalDgradNormalizer(),
+        reduction_binding=_binding(),
+    )
+    session.arm(expected_microbatch_ids=(0,))
+    session.begin_microbatch(0)
+    session.register_valid_token_mask(0, torch.ones(1, 2))
+    values = torch.ones(2, 1, 2, requires_grad=True)
+    first = layer.self_attention.linear_qkv(values)[0]
+    second = layer.self_attention.linear_qkv(values)[0]
+    session.end_microbatch(0)
+    (first + second).sum().backward()
+
+    result = session.finalize()
+
+    duplicate_slots = result.accumulator.slots("activation/qkv/layer_0")
+    skipped_slots = result.accumulator.slots("activation/fc1/layer_0")
+    assert result.accumulator.sum_pack[duplicate_slots.observation_error] > 0
+    assert result.accumulator.sum_pack[skipped_slots.observation_error] > 0
+    assert result.status == Tier0Status.INVALID_STATISTICS
+    session.close()
+
+
+def test_wholly_skipped_expected_microbatch_marks_every_owned_slot_missing() -> None:
+    layer = _FakeTransformerLayer()
+    session = Tier0CaptureSession(
+        _FakeModel(layer),
+        num_layers=1,
+        topology=CaptureTopology(),
+        device="cpu",
+        micro_batch_size=1,
+        local_sequence_length=2,
+        calculate_per_token_loss=True,
+        dgrad_normalizer=CanonicalDgradNormalizer(),
+        reduction_binding=_binding(),
+    )
+    session.arm(expected_microbatch_ids=(0, 1))
+    session.begin_microbatch(0)
+    session.register_valid_token_mask(0, torch.ones(1, 2))
+    output = layer(torch.ones(2, 1, 2, requires_grad=True))[0]
+    session.end_microbatch(0)
+    output.sum().backward()
+
+    result = session.finalize()
+
+    for family in ("residual", "qkv", "attn_out", "fc1", "fc2"):
+        for observation in ("activation", "dgrad"):
+            slots = result.accumulator.slots(f"{observation}/{family}/layer_0")
+            assert result.accumulator.sum_pack[slots.observation_error] == 1
+    assert result.status == Tier0Status.RUNTIME_ERROR
+    session.close()
+
+
+def test_all_masked_observation_is_distinct_from_missing_callback() -> None:
+    _, result = _run_capture(masks=(torch.zeros(1, 2),))
+    slots = result.accumulator.slots("activation/residual/layer_0")
+
+    assert result.accumulator.sum_pack[slots.count] == 0
+    assert result.accumulator.sum_pack[slots.observation_error] == 0
+    assert result.status == Tier0Status.INVALID_STATISTICS
+
+
+def test_observation_allocation_failure_is_packed_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = _FakeTransformerLayer()
+    session = Tier0CaptureSession(
+        _FakeModel(layer),
+        num_layers=1,
+        topology=CaptureTopology(),
+        device="cpu",
+        micro_batch_size=1,
+        local_sequence_length=2,
+        calculate_per_token_loss=True,
+        dgrad_normalizer=CanonicalDgradNormalizer(),
+        reduction_binding=_binding(),
+    )
+    session.arm(expected_microbatch_ids=(0,))
+    session.begin_microbatch(0)
+    session.register_valid_token_mask(0, torch.ones(1, 2))
+    accumulator = session._require_accumulator()
+    original_add = accumulator.add_masked_tensor
+
+    def fail_observation(slot: str | int, *_args: object, **_kwargs: object) -> None:
+        if isinstance(slot, int) and slot >= 2:
+            raise torch.OutOfMemoryError("injected bounded-scratch allocation failure")
+        original_add(slot, *_args, **_kwargs)
+
+    monkeypatch.setattr(accumulator, "add_masked_tensor", fail_observation)
+    output = layer(torch.ones(2, 1, 2, requires_grad=True))[0]
+    session.end_microbatch(0)
+    output.sum().backward()
+
+    result = session.finalize()
+
+    assert result.status == Tier0Status.RUNTIME_ERROR
+    session.close()
 
 
 def test_capture_hooks_have_no_host_synchronization_calls() -> None:

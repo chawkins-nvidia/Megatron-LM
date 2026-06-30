@@ -8,24 +8,17 @@ import torch
 import torch.distributed as dist
 
 import megatron.training.diagnostics.accumulator as accumulator_module
-from megatron.training.diagnostics.accumulator import (
-    PackedSufficientStatistics,
-    ReductionBinding,
-)
+from megatron.training.diagnostics.accumulator import PackedSufficientStatistics, ReductionBinding
 from megatron.training.diagnostics.schema import Tier0Reason
 
 
 class _PeerReducer:
-    def __init__(
-        self, peer: PackedSufficientStatistics, expected_group: object
-    ) -> None:
+    def __init__(self, peer: PackedSufficientStatistics, expected_group: object) -> None:
         self.peer = peer
         self.expected_group = expected_group
         self.operations: list[object] = []
 
-    def __call__(
-        self, tensor: torch.Tensor, *, op: object, group: object | None
-    ) -> None:
+    def __call__(self, tensor: torch.Tensor, *, op: object, group: object | None) -> None:
         assert group is self.expected_group
         self.operations.append(op)
         if op == dist.ReduceOp.SUM:
@@ -46,16 +39,12 @@ def _accumulator(
         "cpu",
         descriptor_hash=f"test:{slot_names!r}",
         reduction_binding=(
-            ReductionBinding.flat_world(None)
-            if reduction_binding is None
-            else reduction_binding
+            ReductionBinding.flat_world(None) if reduction_binding is None else reduction_binding
         ),
     )
 
 
-def test_unequal_populations_masks_and_microbatches_match_concatenated_reference() -> (
-    None
-):
+def test_unequal_populations_masks_and_microbatches_match_concatenated_reference() -> None:
     accumulator = _accumulator("activation")
     microbatches = (
         (torch.tensor([[1.0, 2.0], [3.0, 4.0]]), torch.tensor([[1.0], [0.0]])),
@@ -76,41 +65,25 @@ def test_unequal_populations_masks_and_microbatches_match_concatenated_reference
         (selected_values.square() * selected_weights).sum() / selected_weights.sum()
     )
 
-    torch.testing.assert_close(
-        accumulator.mean("activation").value, expected_mean.double()
-    )
-    torch.testing.assert_close(
-        accumulator.rms("activation").value, expected_rms.double()
-    )
-    torch.testing.assert_close(
-        accumulator.maximum("activation").value, torch.tensor(12.0)
-    )
-    torch.testing.assert_close(
-        accumulator.minimum("activation").value, torch.tensor(1.0)
-    )
+    torch.testing.assert_close(accumulator.mean("activation").value, expected_mean.double())
+    torch.testing.assert_close(accumulator.rms("activation").value, expected_rms.double())
+    torch.testing.assert_close(accumulator.maximum("activation").value, torch.tensor(12.0))
+    torch.testing.assert_close(accumulator.minimum("activation").value, torch.tensor(1.0))
 
 
-def test_zero_contributor_rank_and_injected_process_group_preserve_fixed_collectives() -> (
-    None
-):
+def test_zero_contributor_rank_and_injected_process_group_preserve_fixed_collectives() -> None:
     peer = _accumulator("residual", "qkv")
     peer.add_masked_tensor("qkv", torch.tensor([2.0, 4.0]))
     group = object()
     reducer = _PeerReducer(peer, group)
     local = _accumulator(
-        "residual",
-        "qkv",
-        reduction_binding=ReductionBinding.flat_world(group, reducer=reducer),
+        "residual", "qkv", reduction_binding=ReductionBinding.flat_world(group, reducer=reducer)
     )
     local.add_masked_tensor("residual", torch.empty(0))
 
     local.reduce_()
 
-    assert reducer.operations == [
-        dist.ReduceOp.SUM,
-        dist.ReduceOp.MAX,
-        dist.ReduceOp.MIN,
-    ]
+    assert reducer.operations == [dist.ReduceOp.SUM, dist.ReduceOp.MAX, dist.ReduceOp.MIN]
     assert not local.rms("residual").valid
     assert local.rms("residual").reason == Tier0Reason.NO_CONTRIBUTORS
     torch.testing.assert_close(
@@ -132,9 +105,7 @@ def test_tp_replicated_multiplicity_counts_each_logical_value_once() -> None:
     reference.finalize_local_()
 
     torch.testing.assert_close(replicated.sum_pack, reference.sum_pack)
-    torch.testing.assert_close(
-        replicated.rms("residual").value, reference.rms("residual").value
-    )
+    torch.testing.assert_close(replicated.rms("residual").value, reference.rms("residual").value)
 
 
 def test_packed_sum_count_sumsq_zero_and_extrema_slots() -> None:
@@ -153,8 +124,7 @@ def test_packed_sum_count_sumsq_zero_and_extrema_slots() -> None:
         accumulator.sum_pack[slots.sumsq], torch.tensor(20.0, dtype=torch.float64)
     )
     torch.testing.assert_close(
-        accumulator.zero_fraction("moments").value,
-        torch.tensor(0.5, dtype=torch.float64),
+        accumulator.zero_fraction("moments").value, torch.tensor(0.5, dtype=torch.float64)
     )
     torch.testing.assert_close(accumulator.maximum("moments").value, torch.tensor(4.0))
     torch.testing.assert_close(accumulator.minimum("moments").value, torch.tensor(-2.0))
@@ -162,9 +132,7 @@ def test_packed_sum_count_sumsq_zero_and_extrema_slots() -> None:
 
 def test_nonfinites_are_counted_but_invalidate_numeric_derivations() -> None:
     accumulator = _accumulator("health")
-    accumulator.add_masked_tensor(
-        "health", torch.tensor([0.0, torch.nan, torch.inf, 2.0])
-    )
+    accumulator.add_masked_tensor("health", torch.tensor([0.0, torch.nan, torch.inf, 2.0]))
     accumulator.finalize_local_()
 
     rms = accumulator.rms("health")
@@ -172,8 +140,7 @@ def test_nonfinites_are_counted_but_invalidate_numeric_derivations() -> None:
     assert torch.isnan(rms.value)
     assert rms.reason == Tier0Reason.NONFINITE_INPUT
     torch.testing.assert_close(
-        accumulator.nonfinite_fraction("health").value,
-        torch.tensor(0.5, dtype=torch.float64),
+        accumulator.nonfinite_fraction("health").value, torch.tensor(0.5, dtype=torch.float64)
     )
 
 
@@ -189,9 +156,7 @@ def test_nonfinites_are_counted_but_invalidate_numeric_derivations() -> None:
     ),
     ids=("negative", "nan", "infinite", "shape", "complex", "device"),
 )
-def test_invalid_masks_are_neutral_and_surface_packed_mask_mismatch(
-    mask: torch.Tensor,
-) -> None:
+def test_invalid_masks_are_neutral_and_surface_packed_mask_mismatch(mask: torch.Tensor) -> None:
     accumulator = _accumulator("masked")
     accumulator.add_masked_tensor("masked", torch.tensor([3.0, 4.0]), mask=mask)
     slots = accumulator.slots("masked")
@@ -212,24 +177,17 @@ def test_invalid_masks_are_neutral_and_surface_packed_mask_mismatch(
 
 def test_mask_mismatch_reduces_collectively_without_changing_collective_count() -> None:
     peer = _accumulator("masked")
-    peer.add_masked_tensor(
-        "masked", torch.tensor([100.0, 200.0]), mask=torch.tensor([-1.0, 1.0])
-    )
+    peer.add_masked_tensor("masked", torch.tensor([100.0, 200.0]), mask=torch.tensor([-1.0, 1.0]))
     group = object()
     reducer = _PeerReducer(peer, group)
     local = _accumulator(
-        "masked",
-        reduction_binding=ReductionBinding.flat_world(group, reducer=reducer),
+        "masked", reduction_binding=ReductionBinding.flat_world(group, reducer=reducer)
     )
     local.add_masked_tensor("masked", torch.tensor([3.0, 4.0]))
 
     local.reduce_()
 
-    assert reducer.operations == [
-        dist.ReduceOp.SUM,
-        dist.ReduceOp.MAX,
-        dist.ReduceOp.MIN,
-    ]
+    assert reducer.operations == [dist.ReduceOp.SUM, dist.ReduceOp.MAX, dist.ReduceOp.MIN]
     statistic = local.rms("masked")
     assert not statistic.valid
     assert torch.isnan(statistic.value)
@@ -255,15 +213,11 @@ def test_zero_denominators_are_invalid_nan_not_zero() -> None:
 
 def test_pooled_cosine_avoids_known_mean_of_rank_cosines_sign_flip() -> None:
     rank1 = _accumulator("cosine")
-    rank1.add_masked_pair(
-        "cosine", torch.tensor([10.0, 0.0]), torch.tensor([-8.0, 6.0])
-    )
+    rank1.add_masked_pair("cosine", torch.tensor([10.0, 0.0]), torch.tensor([-8.0, 6.0]))
     group = object()
     rank0 = _accumulator(
         "cosine",
-        reduction_binding=ReductionBinding.flat_world(
-            group, reducer=_PeerReducer(rank1, group)
-        ),
+        reduction_binding=ReductionBinding.flat_world(group, reducer=_PeerReducer(rank1, group)),
     )
     rank0.add_masked_pair("cosine", torch.ones(10), torch.ones(10))
 
@@ -273,9 +227,7 @@ def test_pooled_cosine_avoids_known_mean_of_rank_cosines_sign_flip() -> None:
     rank0_local.min_pack.copy_(rank0.min_pack)
     rank0_local.finalize_local_()
     rank1.finalize_local_()
-    mean_of_local_cosines = (
-        rank0_local.cosine("cosine").value + rank1.cosine("cosine").value
-    ) / 2
+    mean_of_local_cosines = (rank0_local.cosine("cosine").value + rank1.cosine("cosine").value) / 2
 
     rank0.reduce_()
 
@@ -294,16 +246,11 @@ def test_finite_fp32_square_overflow_range_is_safe_for_rms() -> None:
     assert statistic.valid
     assert torch.isfinite(statistic.value)
     torch.testing.assert_close(
-        statistic.value,
-        torch.tensor(2.0e19, dtype=torch.float64),
-        rtol=1e-6,
-        atol=0,
+        statistic.value, torch.tensor(2.0e19, dtype=torch.float64), rtol=1e-6, atol=0
     )
 
 
-def test_finite_fp32_product_overflow_range_is_safe_for_relative_rms_and_cosine() -> (
-    None
-):
+def test_finite_fp32_product_overflow_range_is_safe_for_relative_rms_and_cosine() -> None:
     lhs = torch.tensor([2.0e19, -2.0e19], dtype=torch.float32)
     rhs = torch.tensor([2.0e19, -2.0e19], dtype=torch.float32)
     assert not torch.isfinite(lhs * rhs).all()
@@ -334,9 +281,7 @@ def test_nonfinite_reduced_arithmetic_cannot_be_valid() -> None:
     assert statistic.reason == Tier0Reason.NONFINITE_ARITHMETIC
 
 
-@pytest.mark.parametrize(
-    "dtype,tolerance", [(torch.float32, 1e-6), (torch.bfloat16, 1e-3)]
-)
+@pytest.mark.parametrize("dtype,tolerance", [(torch.float32, 1e-6), (torch.bfloat16, 1e-3)])
 def test_fp32_and_bf16_inputs_accumulate_with_expected_tolerance(
     dtype: torch.dtype, tolerance: float
 ) -> None:
@@ -360,12 +305,51 @@ def test_update_relative_rms_uses_delta_only_after_accumulation() -> None:
         accumulator.relative_rms("update")
     accumulator.finalize_local_()
 
-    expected = torch.linalg.vector_norm(after - before) / torch.linalg.vector_norm(
-        before
+    expected = torch.linalg.vector_norm(after - before) / torch.linalg.vector_norm(before)
+    torch.testing.assert_close(accumulator.relative_rms("update").value, expected.double())
+
+
+@pytest.mark.parametrize("numel", (1, 17, 257, 4097))
+def test_tensor_moment_scratch_is_bounded_independently_of_observation_size(numel: int) -> None:
+    capacity = 17
+    accumulator = PackedSufficientStatistics(
+        ("bounded",),
+        "cpu",
+        descriptor_hash="bounded-scratch-v1",
+        reduction_binding=ReductionBinding.flat_world(None),
+        scratch_element_capacity=capacity,
     )
-    torch.testing.assert_close(
-        accumulator.relative_rms("update").value, expected.double()
+    values = torch.linspace(-2.0, 3.0, numel, dtype=torch.bfloat16)
+    accumulator.add_masked_tensor("bounded", values)
+    accumulator.finalize_local_()
+
+    assert accumulator.maximum_scratch_bytes == accumulator.scratch_bytes_for_capacity(capacity)
+    assert accumulator.peak_scratch_bytes <= accumulator.maximum_scratch_bytes
+    if numel > capacity:
+        assert accumulator.peak_scratch_bytes == accumulator.maximum_scratch_bytes
+    reference = values.float().square().mean(dtype=torch.float64).sqrt()
+    torch.testing.assert_close(accumulator.rms("bounded").value, reference)
+
+
+def test_update_scratch_bound_covers_chunked_delta_without_full_size_temporary() -> None:
+    capacity = 31
+    accumulator = PackedSufficientStatistics(
+        ("update",),
+        "cpu",
+        descriptor_hash="bounded-update-scratch-v1",
+        reduction_binding=ReductionBinding.flat_world(None),
+        scratch_element_capacity=capacity,
     )
+    before = torch.linspace(-1.0, 1.0, capacity * 128, dtype=torch.bfloat16)
+    after = before + torch.tensor(0.125, dtype=torch.bfloat16)
+    accumulator.add_update("update", before, after)
+    accumulator.finalize_local_()
+
+    assert accumulator.peak_scratch_bytes == accumulator.maximum_scratch_bytes
+    expected = torch.linalg.vector_norm(after.float() - before.float()) / torch.linalg.vector_norm(
+        before.float()
+    )
+    torch.testing.assert_close(accumulator.relative_rms("update").value, expected.double())
 
 
 def test_full_accumulation_module_has_no_prohibited_host_synchronization() -> None:

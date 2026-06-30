@@ -487,6 +487,25 @@ class MetricRegistry:
         if self.local_owners[index]:
             accumulator.mark_mask_error(index, error)
 
+    def mark_observation_error(
+        self,
+        accumulator: PackedSufficientStatistics,
+        logical_name: str,
+        error: torch.Tensor | None = None,
+    ) -> None:
+        """Record packed callback-completeness failure for an owned descriptor.
+
+        Args:
+            accumulator: Registry-bound packed accumulator.
+            logical_name: Registered descriptor name.
+            error: Optional device-resident scalar error flag.
+        """
+
+        index = self._index(logical_name)
+        self._validate_accumulator(accumulator)
+        if self.local_owners[index]:
+            accumulator.mark_observation_error(index, error)
+
     def apply_normalizations_(
         self, accumulator: PackedSufficientStatistics, *, global_valid_tokens: torch.Tensor
     ) -> None:

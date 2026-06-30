@@ -16,10 +16,12 @@ from .capture import (
     StagedTokenMask,
     Tier0CaptureResult,
     Tier0CaptureSession,
+    TokenLayout,
     discover_layer_capture_targets,
+    pack_valid_token_mask_sideband,
     slice_sequence_parallel_mask,
     stage_valid_token_mask,
-    transport_valid_token_mask,
+    unpack_valid_token_mask_sideband,
 )
 from .normalization import CanonicalDgradNormalizer
 from .registry import (
@@ -79,9 +81,11 @@ __all__ = [
     "Tier0CaptureResult",
     "Tier0CaptureSession",
     "Tier0Status",
+    "TokenLayout",
     "assert_payload_schema",
     "discover_layer_capture_targets",
+    "pack_valid_token_mask_sideband",
     "slice_sequence_parallel_mask",
     "stage_valid_token_mask",
-    "transport_valid_token_mask",
+    "unpack_valid_token_mask_sideband",
 ]

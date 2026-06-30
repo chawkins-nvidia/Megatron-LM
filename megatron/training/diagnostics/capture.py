@@ -3,10 +3,10 @@
 """Recompute-safe, topology-aware Tier-0 activation and dgrad capture."""
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Sequence
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from megatron.core import parallel_state
@@ -96,6 +96,13 @@ class CaptureTopology:
         )
 
 
+class TokenLayout(StrEnum):
+    """Describe the first dimension of one typed MCore module output."""
+
+    CP_LOCAL_SEQUENCE = "cp_local_sequence"
+    TP_SEQUENCE_SHARD = "tp_sequence_shard"
+
+
 @dataclass(frozen=True)
 class LayerCaptureTarget:
     """Bind one typed local MCore module to a global layer/family identity."""
@@ -103,6 +110,7 @@ class LayerCaptureTarget:
     global_layer: int
     family: MetricFamily
     module: nn.Module
+    token_layout: TokenLayout
 
 
 @dataclass(frozen=True)
@@ -159,39 +167,79 @@ def stage_valid_token_mask(
     return StagedTokenMask(values=values, valid=valid)
 
 
-def transport_valid_token_mask(
+def pack_valid_token_mask_sideband(
     loss_mask: torch.Tensor | None,
     *,
-    armed: bool,
     micro_batch_size: int,
     sequence_length: int,
     device: torch.device | str,
-    pipeline_group: object,
-    pipeline_last_global_rank: int,
-    is_pipeline_last_stage: bool,
-) -> StagedTokenMask | None:
-    """Broadcast one fixed-shape mask/status payload through a PP group.
+) -> torch.Tensor:
+    """Pack one fixed-shape mask/status payload without communication.
 
-    This helper performs no collective when capture is unarmed and exactly one
-    broadcast when armed. The final payload element transports source-side
-    shape/device validity without an additional scalar collective.
+    The supported non-interleaved schedule owns ordered pipeline transport. This
+    helper only prepares the caller-provided CP-local payload that the schedule
+    can send alongside its normal forward traffic.
+
+    Args:
+        loss_mask: Caller-provided CP-local mask in ``[batch, sequence]`` order.
+        micro_batch_size: Configured fixed local microbatch size.
+        sequence_length: Configured fixed CP-local sequence length.
+        device: Sideband payload device.
+
+    Returns:
+        Flat FP32 mask values followed by one device-validity value.
     """
 
-    if not armed:
-        return None
     target_device = torch.device(device)
     num_mask_values = micro_batch_size * sequence_length
     payload = torch.zeros(num_mask_values + 1, dtype=torch.float32, device=target_device)
-    if is_pipeline_last_stage:
-        staged = stage_valid_token_mask(
-            loss_mask,
+    staged = stage_valid_token_mask(
+        loss_mask,
+        micro_batch_size=micro_batch_size,
+        sequence_length=sequence_length,
+        device=target_device,
+    )
+    payload[:-1].copy_(staged.values.reshape(-1))
+    payload[-1].copy_(staged.valid.to(dtype=payload.dtype))
+    return payload
+
+
+def unpack_valid_token_mask_sideband(
+    payload: torch.Tensor | None,
+    *,
+    micro_batch_size: int,
+    sequence_length: int,
+    device: torch.device | str,
+) -> StagedTokenMask:
+    """Validate and unpack a schedule-delivered mask payload without collectives.
+
+    Args:
+        payload: Flat schedule-delivered FP32 payload, or ``None`` on failure.
+        micro_batch_size: Configured fixed local microbatch size.
+        sequence_length: Configured fixed CP-local sequence length.
+        device: Capture device.
+
+    Returns:
+        Canonical values and a device-resident validity scalar. Malformed
+        payloads return a neutral invalid mask.
+    """
+
+    target_device = torch.device(device)
+    expected_numel = micro_batch_size * sequence_length + 1
+    if (
+        payload is None
+        or payload.device != target_device
+        or payload.is_complex()
+        or payload.dtype != torch.float32
+        or payload.dim() != 1
+        or payload.numel() != expected_numel
+    ):
+        return stage_valid_token_mask(
+            None,
             micro_batch_size=micro_batch_size,
             sequence_length=sequence_length,
             device=target_device,
         )
-        payload[:-1].copy_(staged.values.reshape(-1))
-        payload[-1].copy_(staged.valid.to(dtype=payload.dtype))
-    dist.broadcast(payload, src=pipeline_last_global_rank, group=pipeline_group)
     return StagedTokenMask(
         values=payload[:-1].view(sequence_length, micro_batch_size, 1), valid=payload[-1] > 0
     )
@@ -200,7 +248,17 @@ def transport_valid_token_mask(
 def slice_sequence_parallel_mask(
     staged: StagedTokenMask, *, tensor_parallel_rank: int, tensor_parallel_size: int
 ) -> StagedTokenMask:
-    """Take the contiguous first-dimension TP slice used by MCore SP mappings."""
+    """Take the contiguous first-dimension TP slice used by MCore SP mappings.
+
+    Args:
+        staged: Full CP-local staged mask.
+        tensor_parallel_rank: Local TP coordinate.
+        tensor_parallel_size: TP group size.
+
+    Returns:
+        The rank's contiguous first-dimension slice, or an invalid mask when
+        the sequence dimension is not evenly partitionable.
+    """
 
     sequence_length = staged.values.shape[0]
     if tensor_parallel_size <= 0 or sequence_length % tensor_parallel_size != 0:
@@ -265,13 +323,45 @@ def discover_layer_capture_targets(
             raise ValueError("attention output/fc2 must be local RowParallelLinear modules")
 
         seen_layers.add(global_layer)
+        sequence_parallel = bool(getattr(config, "sequence_parallel", False))
         targets.extend(
             (
-                LayerCaptureTarget(global_layer, MetricFamily.RESIDUAL, module),
-                LayerCaptureTarget(global_layer, MetricFamily.QKV, qkv),
-                LayerCaptureTarget(global_layer, MetricFamily.ATTN_OUT, attention_output),
-                LayerCaptureTarget(global_layer, MetricFamily.FC1, fc1),
-                LayerCaptureTarget(global_layer, MetricFamily.FC2, fc2),
+                LayerCaptureTarget(
+                    global_layer,
+                    MetricFamily.RESIDUAL,
+                    module,
+                    (
+                        TokenLayout.TP_SEQUENCE_SHARD
+                        if sequence_parallel
+                        else TokenLayout.CP_LOCAL_SEQUENCE
+                    ),
+                ),
+                LayerCaptureTarget(
+                    global_layer, MetricFamily.QKV, qkv, TokenLayout.CP_LOCAL_SEQUENCE
+                ),
+                LayerCaptureTarget(
+                    global_layer,
+                    MetricFamily.ATTN_OUT,
+                    attention_output,
+                    (
+                        TokenLayout.TP_SEQUENCE_SHARD
+                        if getattr(attention_output, "sequence_parallel", sequence_parallel)
+                        else TokenLayout.CP_LOCAL_SEQUENCE
+                    ),
+                ),
+                LayerCaptureTarget(
+                    global_layer, MetricFamily.FC1, fc1, TokenLayout.CP_LOCAL_SEQUENCE
+                ),
+                LayerCaptureTarget(
+                    global_layer,
+                    MetricFamily.FC2,
+                    fc2,
+                    (
+                        TokenLayout.TP_SEQUENCE_SHARD
+                        if getattr(fc2, "sequence_parallel", sequence_parallel)
+                        else TokenLayout.CP_LOCAL_SEQUENCE
+                    ),
+                ),
             )
         )
     if not targets:
@@ -336,6 +426,7 @@ class Tier0CaptureSession:
         self._activation_seen: set[tuple[int, str]] = set()
         self._dgrad_registered: set[tuple[int, str]] = set()
         self._dgrad_seen: set[tuple[int, str]] = set()
+        self._expected_microbatch_ids: set[int] | None = None
         self._runtime_status = torch.zeros((), dtype=torch.int64, device=self.device)
 
     @property
@@ -344,8 +435,14 @@ class Tier0CaptureSession:
 
         return self._armed
 
-    def arm(self) -> None:
-        """Allocate neutral event packs and arm dormant hooks."""
+    def arm(self, *, expected_microbatch_ids: Sequence[int] | None = None) -> None:
+        """Allocate neutral event packs and arm dormant hooks.
+
+        Args:
+            expected_microbatch_ids: Optional complete schedule-local microbatch
+                identity sequence. When provided, a wholly skipped microbatch is
+                reported through packed observation-completeness status.
+        """
 
         if self._armed:
             raise RuntimeError("Tier-0 capture session is already armed")
@@ -356,6 +453,15 @@ class Tier0CaptureSession:
         self._activation_seen.clear()
         self._dgrad_registered.clear()
         self._dgrad_seen.clear()
+        if expected_microbatch_ids is None:
+            self._expected_microbatch_ids = None
+        else:
+            expected = tuple(expected_microbatch_ids)
+            if any(microbatch_id < 0 for microbatch_id in expected) or len(expected) != len(
+                set(expected)
+            ):
+                raise ValueError("expected diagnostic microbatch identities must be unique")
+            self._expected_microbatch_ids = set(expected)
         self._runtime_status.zero_()
         self._armed = True
 
@@ -366,6 +472,11 @@ class Tier0CaptureSession:
             raise RuntimeError("Tier-0 capture session is not armed")
         if microbatch_id < 0 or microbatch_id in self._begun:
             raise ValueError("diagnostic microbatch must be unique and nonnegative")
+        if (
+            self._expected_microbatch_ids is not None
+            and microbatch_id not in self._expected_microbatch_ids
+        ):
+            self._set_runtime_error()
         self._begun.add(microbatch_id)
         set_diagnostic_microbatch_id(microbatch_id)
 
@@ -406,16 +517,7 @@ class Tier0CaptureSession:
             )
         numeric_valid = torch.isfinite(staged.values).all() & (staged.values >= 0).all()
         staged = StagedTokenMask(staged.values, staged.valid & numeric_valid)
-        capture_mask = (
-            slice_sequence_parallel_mask(
-                staged,
-                tensor_parallel_rank=self.topology.tensor_parallel_rank,
-                tensor_parallel_size=self.topology.tensor_parallel_size,
-            )
-            if self.topology.sequence_parallel
-            else staged
-        )
-        self._masks[microbatch_id] = capture_mask
+        self._masks[microbatch_id] = staged
 
         if self.registry.owns(_EVENT_VALID_TOKENS):
             accumulator = self._require_accumulator()
@@ -444,6 +546,7 @@ class Tier0CaptureSession:
         accumulator = self._require_accumulator()
         if self._begun != self._ended or self._begun != self._masks.keys():
             self._set_runtime_error()
+        self._mark_incomplete_observations(accumulator)
         self.registry.add_masked_tensor(accumulator, _EVENT_RUNTIME_STATUS, self._runtime_status)
         accumulator.reduce_()
         token_slots = accumulator.slots(_EVENT_VALID_TOKENS)
@@ -460,6 +563,7 @@ class Tier0CaptureSession:
                     descriptor.packed_slots.nonfinite,
                     descriptor.packed_slots.mask_error,
                     descriptor.packed_slots.nonfinite_arithmetic,
+                    descriptor.packed_slots.observation_error,
                 )
             )
         )
@@ -566,13 +670,15 @@ class Tier0CaptureSession:
             partition_axes=(),
         )
 
-        mask_kind = (
-            MaskKind.SEQUENCE_PARALLEL_TOKEN if self.topology.sequence_parallel else MaskKind.TOKEN
-        )
         for observation in ("activation", "dgrad"):
             for global_layer in range(num_layers):
                 for family in _CAPTURE_FAMILIES:
                     feature_sharded = family in _FEATURE_SHARDED_FAMILIES
+                    mask_kind = (
+                        MaskKind.SEQUENCE_PARALLEL_TOKEN
+                        if self.topology.sequence_parallel and not feature_sharded
+                        else MaskKind.TOKEN
+                    )
                     tp_owner = (
                         feature_sharded
                         or self.topology.sequence_parallel
@@ -624,13 +730,17 @@ class Tier0CaptureSession:
                     self._set_runtime_error()
                     return
                 tensor = self._output_tensor(output)
-                mask = self._masks[microbatch_id]
+                mask = self._mask_for_target(self._masks[microbatch_id], target)
                 if is_diagnostic_recompute():
                     self._register_dgrad_hook(tensor, microbatch_id, dgrad_name, mask)
                     return
 
                 activation_key = (microbatch_id, activation_name)
-                if activation_key not in self._activation_seen:
+                if activation_key in self._activation_seen:
+                    self.registry.mark_observation_error(
+                        self._require_accumulator(), activation_name
+                    )
+                else:
                     self._activation_seen.add(activation_key)
                     accumulator = self._require_accumulator()
                     self.registry.mark_mask_error(accumulator, activation_name, ~mask.valid)
@@ -647,7 +757,10 @@ class Tier0CaptureSession:
         self, tensor: torch.Tensor, microbatch_id: int, logical_name: str, mask: StagedTokenMask
     ) -> None:
         key = (microbatch_id, logical_name)
-        if key in self._dgrad_registered or not tensor.requires_grad:
+        if key in self._dgrad_registered:
+            self.registry.mark_observation_error(self._require_accumulator(), logical_name)
+            return
+        if not tensor.requires_grad:
             return
         self._dgrad_registered.add(key)
 
@@ -660,11 +773,47 @@ class Tier0CaptureSession:
                     self.registry.add_masked_tensor(
                         accumulator, logical_name, gradient, mask=mask.values
                     )
+                elif self._armed:
+                    self.registry.mark_observation_error(self._require_accumulator(), logical_name)
             except Exception:  # Hooks must convert rank-local runtime failures to packed status.
                 self._record_hook_error(logical_name)
             return gradient
 
         tensor.register_hook(capture_dgrad)
+
+    def _mask_for_target(
+        self, staged: StagedTokenMask, target: LayerCaptureTarget
+    ) -> StagedTokenMask:
+        if target.token_layout != TokenLayout.TP_SEQUENCE_SHARD:
+            return staged
+        if not self.topology.sequence_parallel:
+            return StagedTokenMask(staged.values, staged.valid & torch.zeros_like(staged.valid))
+        return slice_sequence_parallel_mask(
+            staged,
+            tensor_parallel_rank=self.topology.tensor_parallel_rank,
+            tensor_parallel_size=self.topology.tensor_parallel_size,
+        )
+
+    def _mark_incomplete_observations(self, accumulator: PackedSufficientStatistics) -> None:
+        expected_microbatches = (
+            self._begun if self._expected_microbatch_ids is None else self._expected_microbatch_ids
+        )
+        if expected_microbatches != self._begun:
+            self._set_runtime_error()
+        for microbatch_id in expected_microbatches:
+            for target in self.targets:
+                for observation, seen in (
+                    ("activation", self._activation_seen),
+                    ("dgrad", self._dgrad_seen),
+                ):
+                    logical_name = (
+                        f"{observation}/{target.family.value}/layer_{target.global_layer}"
+                    )
+                    if (
+                        self.registry.owns(logical_name)
+                        and (microbatch_id, logical_name) not in seen
+                    ):
+                        self.registry.mark_observation_error(accumulator, logical_name)
 
     @staticmethod
     def _output_tensor(output) -> torch.Tensor:

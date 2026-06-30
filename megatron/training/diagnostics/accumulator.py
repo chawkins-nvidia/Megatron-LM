@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Iterator, Protocol
 
 import torch
 import torch.distributed as dist
@@ -22,8 +22,11 @@ _SUM_FIELDS = (
     "nonfinite",
     "mask_error",
     "nonfinite_arithmetic",
+    "observation_error",
 )
 _SUM_FIELD_COUNT = len(_SUM_FIELDS)
+_DEFAULT_SCRATCH_ELEMENT_CAPACITY = 16 * 1024
+_MAX_SCRATCH_BYTES_PER_ELEMENT = 96
 
 
 class PackedReducer(Protocol):
@@ -123,6 +126,7 @@ class PackedSlots:
         nonfinite: Offset for the weighted nonfinite-input count.
         mask_error: Offset for device-resident mask contract failures.
         nonfinite_arithmetic: Offset for device-resident arithmetic failures.
+        observation_error: Offset for missing or duplicate semantic observations.
         maximum: Offset in the FP32 MAX pack.
         minimum: Offset in the FP32 MIN pack.
     """
@@ -137,6 +141,7 @@ class PackedSlots:
     nonfinite: int
     mask_error: int
     nonfinite_arithmetic: int
+    observation_error: int
     maximum: int
     minimum: int
 
@@ -168,6 +173,7 @@ class PackedSlots:
             nonfinite=base + 7,
             mask_error=base + 8,
             nonfinite_arithmetic=base + 9,
+            observation_error=base + 10,
             maximum=index,
             minimum=index,
         )
@@ -212,6 +218,7 @@ class PackedSufficientStatistics:
         descriptor_hash: str,
         reduction_binding: ReductionBinding,
         schema_identity: str = SCHEMA_PREFIX.rstrip("/"),
+        scratch_element_capacity: int = _DEFAULT_SCRATCH_ELEMENT_CAPACITY,
     ) -> None:
         """Allocate neutral packed buffers in a stable slot order.
 
@@ -221,6 +228,8 @@ class PackedSufficientStatistics:
             descriptor_hash: Rank-independent descriptor hash.
             reduction_binding: Typed runtime binding for the declared collective.
             schema_identity: Versioned diagnostic schema identity.
+            scratch_element_capacity: Maximum number of logical elements processed
+                by any tensor-sized moment temporary at once.
 
         Raises:
             ValueError: If slot names, identities, or the reduction binding are invalid.
@@ -232,6 +241,8 @@ class PackedSufficientStatistics:
             raise ValueError("packed statistic identities must be nonempty")
         if reduction_binding is None:
             raise ValueError("packed statistics require a reduction binding")
+        if scratch_element_capacity <= 0:
+            raise ValueError("scratch element capacity must be positive")
         if (
             reduction_binding.process_group_identity != ProcessGroupIdentity.WORLD
             or reduction_binding.reduction_kind != ReductionKind.PACKED_SUM_MAX_MIN
@@ -241,6 +252,7 @@ class PackedSufficientStatistics:
         self.descriptor_hash = descriptor_hash
         self.schema_identity = schema_identity
         self.reduction_binding = reduction_binding
+        self.scratch_element_capacity = scratch_element_capacity
         self._slot_indices = {name: index for index, name in enumerate(slot_names)}
         self.sum_pack = torch.zeros(
             len(slot_names) * _SUM_FIELD_COUNT, dtype=torch.float64, device=device
@@ -251,7 +263,45 @@ class PackedSufficientStatistics:
         self.min_pack = torch.full(
             (len(slot_names),), torch.inf, dtype=torch.float32, device=device
         )
+        self._peak_scratch_bytes = 0
         self._reduced = False
+
+    @property
+    def maximum_scratch_bytes(self) -> int:
+        """Return the exact configured ceiling for tensor-moment scratch.
+
+        The bound includes every simultaneously live tensor-sized temporary in
+        the pair/update path, which is the largest supported observation. Scalar
+        pack updates are persistent accumulator storage and are not scratch.
+        """
+
+        return self.scratch_element_capacity * _MAX_SCRATCH_BYTES_PER_ELEMENT
+
+    @property
+    def peak_scratch_bytes(self) -> int:
+        """Return the largest tensor-moment scratch use observed so far."""
+
+        return self._peak_scratch_bytes
+
+    @staticmethod
+    def scratch_bytes_for_capacity(
+        scratch_element_capacity: int = _DEFAULT_SCRATCH_ELEMENT_CAPACITY,
+    ) -> int:
+        """Compute the exact HBM-preflight scratch ceiling without allocating it.
+
+        Args:
+            scratch_element_capacity: Maximum logical elements per scratch chunk.
+
+        Returns:
+            Maximum tensor-sized transient bytes for one observation.
+
+        Raises:
+            ValueError: If the capacity is not positive.
+        """
+
+        if scratch_element_capacity <= 0:
+            raise ValueError("scratch element capacity must be positive")
+        return scratch_element_capacity * _MAX_SCRATCH_BYTES_PER_ELEMENT
 
     @property
     def reduced(self) -> bool:
@@ -320,35 +370,68 @@ class PackedSufficientStatistics:
         self._ensure_accumulating()
         self._validate_multiplicity(replication_multiplicity)
         slots = self.slots(slot)
-        values_fp32 = values.detach().to(dtype=torch.float32)
-        weights = self._weights_like(values_fp32, mask, slots, require_mask=require_mask)
-        if values_fp32.numel() == 0:
+        detached = values.detach()
+        weights, mask_valid = self._validated_broadcast_mask(
+            detached, mask, slots, require_mask=require_mask
+        )
+        if detached.numel() == 0:
             return
-
-        selected = weights != 0
-        finite = torch.isfinite(values_fp32)
-        finite_selected = selected & finite
-        clean_fp32 = torch.where(finite, values_fp32, torch.zeros_like(values_fp32))
-        finite_weights_fp32 = torch.where(finite, weights, torch.zeros_like(weights))
-        clean = clean_fp32.to(dtype=torch.float64)
-        finite_weights = finite_weights_fp32.to(dtype=torch.float64)
         scale = replication_multiplicity
-
-        weighted_sum = (clean * finite_weights).sum() / scale
-        count = finite_weights.sum() / scale
-        weighted_sumsq = (clean.square() * finite_weights).sum() / scale
-        zero = (
-            torch.where(
-                finite_selected & (values_fp32 == 0), weights, torch.zeros_like(weights)
-            ).sum(dtype=torch.float64)
-            / scale
-        )
-        nonfinite = (
-            torch.where(selected & ~finite, weights, torch.zeros_like(weights)).sum(
-                dtype=torch.float64
+        contributions = torch.zeros(5, dtype=torch.float64, device=detached.device)
+        candidate_max = torch.full((), -torch.inf, dtype=torch.float32, device=detached.device)
+        candidate_min = torch.full((), torch.inf, dtype=torch.float32, device=detached.device)
+        tensors = (detached,) if weights is None else (detached, weights)
+        for chunks in self._bounded_chunks(*tensors):
+            values_fp32 = chunks[0].to(dtype=torch.float32)
+            chunk_weights = (
+                torch.ones_like(values_fp32)
+                if weights is None
+                else chunks[1].to(dtype=torch.float32)
             )
-            / scale
-        )
+            valid_weights = torch.isfinite(chunk_weights) & (chunk_weights >= 0)
+            chunk_weights = torch.where(
+                valid_weights, chunk_weights, torch.zeros_like(chunk_weights)
+            )
+            selected = chunk_weights != 0
+            finite = torch.isfinite(values_fp32)
+            finite_selected = selected & finite
+            clean_fp32 = torch.where(finite, values_fp32, torch.zeros_like(values_fp32))
+            finite_weights_fp32 = torch.where(
+                finite, chunk_weights, torch.zeros_like(chunk_weights)
+            )
+            clean = clean_fp32.to(dtype=torch.float64)
+            finite_weights = finite_weights_fp32.to(dtype=torch.float64)
+            contributions[0].add_((clean * finite_weights).sum() / scale)
+            contributions[1].add_(finite_weights.sum() / scale)
+            contributions[2].add_((clean.square() * finite_weights).sum() / scale)
+            contributions[3].add_(
+                torch.where(
+                    finite_selected & (values_fp32 == 0),
+                    chunk_weights,
+                    torch.zeros_like(chunk_weights),
+                ).sum(dtype=torch.float64)
+                / scale
+            )
+            contributions[4].add_(
+                torch.where(selected & ~finite, chunk_weights, torch.zeros_like(chunk_weights)).sum(
+                    dtype=torch.float64
+                )
+                / scale
+            )
+            candidate_max = torch.maximum(
+                candidate_max,
+                torch.where(
+                    finite_selected, values_fp32, torch.full_like(values_fp32, -torch.inf)
+                ).amax(),
+            )
+            candidate_min = torch.minimum(
+                candidate_min,
+                torch.where(
+                    finite_selected, values_fp32, torch.full_like(values_fp32, torch.inf)
+                ).amin(),
+            )
+        contributions.mul_(mask_valid.to(dtype=contributions.dtype))
+        weighted_sum, count, weighted_sumsq, zero, nonfinite = contributions.unbind()
         weighted_sum, count, weighted_sumsq, zero, nonfinite = self._finite_contributions(
             slots, weighted_sum, count, weighted_sumsq, zero, nonfinite
         )
@@ -361,11 +444,11 @@ class PackedSufficientStatistics:
         self.sum_pack[slots.nonfinite].add_(nonfinite)
 
         candidate_max = torch.where(
-            finite_selected, values_fp32, torch.full_like(values_fp32, -torch.inf)
-        ).amax()
+            mask_valid, candidate_max, torch.full_like(candidate_max, -torch.inf)
+        )
         candidate_min = torch.where(
-            finite_selected, values_fp32, torch.full_like(values_fp32, torch.inf)
-        ).amin()
+            mask_valid, candidate_min, torch.full_like(candidate_min, torch.inf)
+        )
         self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
         self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
 
@@ -396,44 +479,95 @@ class PackedSufficientStatistics:
             IndexError: If an integer slot is out of range.
         """
 
+        self._add_masked_pair(
+            slot,
+            lhs,
+            rhs,
+            mask=mask,
+            replication_multiplicity=replication_multiplicity,
+            require_mask=require_mask,
+            difference_lhs=False,
+        )
+
+    def _add_masked_pair(
+        self,
+        slot: str | int,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        *,
+        mask: torch.Tensor | None,
+        replication_multiplicity: int,
+        require_mask: bool,
+        difference_lhs: bool,
+    ) -> None:
         self._ensure_accumulating()
         self._validate_multiplicity(replication_multiplicity)
         slots = self.slots(slot)
-        lhs_fp32, rhs_fp32 = torch.broadcast_tensors(
-            lhs.detach().to(dtype=torch.float32), rhs.detach().to(dtype=torch.float32)
+        lhs_values, rhs_values = torch.broadcast_tensors(lhs.detach(), rhs.detach())
+        weights, mask_valid = self._validated_broadcast_mask(
+            lhs_values, mask, slots, require_mask=require_mask
         )
-        weights = self._weights_like(lhs_fp32, mask, slots, require_mask=require_mask)
-        if lhs_fp32.numel() == 0:
+        if lhs_values.numel() == 0:
             return
-
-        selected = weights != 0
-        finite = torch.isfinite(lhs_fp32) & torch.isfinite(rhs_fp32)
-        finite_selected = selected & finite
-        clean_lhs_fp32 = torch.where(finite, lhs_fp32, torch.zeros_like(lhs_fp32))
-        clean_rhs_fp32 = torch.where(finite, rhs_fp32, torch.zeros_like(rhs_fp32))
-        finite_weights_fp32 = torch.where(finite, weights, torch.zeros_like(weights))
-        clean_lhs = clean_lhs_fp32.to(dtype=torch.float64)
-        clean_rhs = clean_rhs_fp32.to(dtype=torch.float64)
-        finite_weights = finite_weights_fp32.to(dtype=torch.float64)
         scale = replication_multiplicity
-
-        weighted_sum = (clean_lhs * finite_weights).sum() / scale
-        count = finite_weights.sum() / scale
-        lhs_sumsq = (clean_lhs.square() * finite_weights).sum() / scale
-        rhs_sumsq = (clean_rhs.square() * finite_weights).sum() / scale
-        dot = (clean_lhs * clean_rhs * finite_weights).sum() / scale
-        zero = (
-            torch.where(finite_selected & (lhs_fp32 == 0), weights, torch.zeros_like(weights)).sum(
-                dtype=torch.float64
+        contributions = torch.zeros(7, dtype=torch.float64, device=lhs_values.device)
+        candidate_max = torch.full((), -torch.inf, dtype=torch.float32, device=lhs_values.device)
+        candidate_min = torch.full((), torch.inf, dtype=torch.float32, device=lhs_values.device)
+        tensors = (lhs_values, rhs_values) if weights is None else (lhs_values, rhs_values, weights)
+        for chunks in self._bounded_chunks(*tensors):
+            lhs_fp32 = chunks[0].to(dtype=torch.float32)
+            rhs_fp32 = chunks[1].to(dtype=torch.float32)
+            if difference_lhs:
+                lhs_fp32 = lhs_fp32 - rhs_fp32
+            chunk_weights = (
+                torch.ones_like(lhs_fp32) if weights is None else chunks[2].to(dtype=torch.float32)
             )
-            / scale
-        )
-        nonfinite = (
-            torch.where(selected & ~finite, weights, torch.zeros_like(weights)).sum(
-                dtype=torch.float64
+            valid_weights = torch.isfinite(chunk_weights) & (chunk_weights >= 0)
+            chunk_weights = torch.where(
+                valid_weights, chunk_weights, torch.zeros_like(chunk_weights)
             )
-            / scale
-        )
+            selected = chunk_weights != 0
+            finite = torch.isfinite(lhs_fp32) & torch.isfinite(rhs_fp32)
+            finite_selected = selected & finite
+            clean_lhs_fp32 = torch.where(finite, lhs_fp32, torch.zeros_like(lhs_fp32))
+            clean_rhs_fp32 = torch.where(finite, rhs_fp32, torch.zeros_like(rhs_fp32))
+            finite_weights_fp32 = torch.where(
+                finite, chunk_weights, torch.zeros_like(chunk_weights)
+            )
+            clean_lhs = clean_lhs_fp32.to(dtype=torch.float64)
+            clean_rhs = clean_rhs_fp32.to(dtype=torch.float64)
+            finite_weights = finite_weights_fp32.to(dtype=torch.float64)
+            contributions[0].add_((clean_lhs * finite_weights).sum() / scale)
+            contributions[1].add_(finite_weights.sum() / scale)
+            contributions[2].add_((clean_lhs.square() * finite_weights).sum() / scale)
+            contributions[3].add_((clean_rhs.square() * finite_weights).sum() / scale)
+            contributions[4].add_((clean_lhs * clean_rhs * finite_weights).sum() / scale)
+            contributions[5].add_(
+                torch.where(
+                    finite_selected & (lhs_fp32 == 0),
+                    chunk_weights,
+                    torch.zeros_like(chunk_weights),
+                ).sum(dtype=torch.float64)
+                / scale
+            )
+            contributions[6].add_(
+                torch.where(selected & ~finite, chunk_weights, torch.zeros_like(chunk_weights)).sum(
+                    dtype=torch.float64
+                )
+                / scale
+            )
+            candidate_max = torch.maximum(
+                candidate_max,
+                torch.where(
+                    finite_selected, lhs_fp32, torch.full_like(lhs_fp32, -torch.inf)
+                ).amax(),
+            )
+            candidate_min = torch.minimum(
+                candidate_min,
+                torch.where(finite_selected, lhs_fp32, torch.full_like(lhs_fp32, torch.inf)).amin(),
+            )
+        contributions.mul_(mask_valid.to(dtype=contributions.dtype))
+        weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite = contributions.unbind()
         (weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite) = (
             self._finite_contributions(
                 slots, weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite
@@ -450,11 +584,11 @@ class PackedSufficientStatistics:
         self.sum_pack[slots.nonfinite].add_(nonfinite)
 
         candidate_max = torch.where(
-            finite_selected, lhs_fp32, torch.full_like(lhs_fp32, -torch.inf)
-        ).amax()
+            mask_valid, candidate_max, torch.full_like(candidate_max, -torch.inf)
+        )
         candidate_min = torch.where(
-            finite_selected, lhs_fp32, torch.full_like(lhs_fp32, torch.inf)
-        ).amin()
+            mask_valid, candidate_min, torch.full_like(candidate_min, torch.inf)
+        )
         self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
         self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
 
@@ -483,15 +617,14 @@ class PackedSufficientStatistics:
             ValueError: If replication multiplicity is not positive.
         """
 
-        before_fp32 = before.detach().to(dtype=torch.float32)
-        after_fp32 = after.detach().to(dtype=torch.float32)
-        self.add_masked_pair(
+        self._add_masked_pair(
             slot,
-            after_fp32 - before_fp32,
-            before_fp32,
+            after,
+            before,
             mask=mask,
             replication_multiplicity=replication_multiplicity,
             require_mask=require_mask,
+            difference_lhs=True,
         )
 
     def mark_mask_error(self, slot: str | int, error: torch.Tensor | None = None) -> None:
@@ -533,6 +666,27 @@ class PackedSufficientStatistics:
             self.sum_pack[slots.nonfinite_arithmetic].add_(1)
             return
         self.sum_pack[slots.nonfinite_arithmetic].add_(
+            error.detach().reshape(()).to(dtype=self.sum_pack.dtype)
+        )
+
+    def mark_observation_error(self, slot: str | int, error: torch.Tensor | None = None) -> None:
+        """Record missing or duplicate callback completion for one slot.
+
+        Args:
+            slot: Registered logical name or zero-based slot index.
+            error: Optional boolean or numeric scalar. A missing, malformed, or
+                wrong-device scalar records one error without moving data.
+
+        Raises:
+            RuntimeError: If accumulation already completed.
+        """
+
+        self._ensure_accumulating()
+        slots = self.slots(slot)
+        if error is None or error.numel() != 1 or error.device != self.sum_pack.device:
+            self.sum_pack[slots.observation_error].add_(1)
+            return
+        self.sum_pack[slots.observation_error].add_(
             error.detach().reshape(()).to(dtype=self.sum_pack.dtype)
         )
 
@@ -795,32 +949,59 @@ class PackedSufficientStatistics:
             raise IndexError(f"packed statistic slot is out of range: {slot}")
         return slot
 
-    def _weights_like(
+    def _validated_broadcast_mask(
         self,
         values: torch.Tensor,
         mask: torch.Tensor | None,
         slots: PackedSlots,
         *,
         require_mask: bool,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        mask_valid = torch.ones((), dtype=torch.bool, device=values.device)
         if mask is None:
             if require_mask:
                 self.sum_pack[slots.mask_error].add_(1)
-                return torch.zeros_like(values, dtype=torch.float32)
-            return torch.ones_like(values, dtype=torch.float32)
+                mask_valid.zero_()
+            return None, mask_valid
         if mask.device != values.device or mask.is_complex():
             self.sum_pack[slots.mask_error].add_(1)
-            return torch.zeros_like(values, dtype=torch.float32)
+            mask_valid.zero_()
+            return None, mask_valid
         try:
-            weights = torch.broadcast_to(mask.detach().to(dtype=torch.float32), values.shape)
+            weights = torch.broadcast_to(mask.detach(), values.shape)
         except RuntimeError:
             self.sum_pack[slots.mask_error].add_(1)
-            return torch.zeros_like(values, dtype=torch.float32)
+            mask_valid.zero_()
+            return None, mask_valid
 
-        valid_elements = torch.isfinite(weights) & (weights >= 0)
-        mask_valid = valid_elements.all()
+        for (weight_chunk,) in self._bounded_chunks(weights):
+            weights_fp32 = weight_chunk.to(dtype=torch.float32)
+            mask_valid.logical_and_((torch.isfinite(weights_fp32) & (weights_fp32 >= 0)).all())
         self.sum_pack[slots.mask_error].add_((~mask_valid).to(dtype=self.sum_pack.dtype))
-        return torch.where(mask_valid, weights, torch.zeros_like(weights))
+        return weights, mask_valid
+
+    def _bounded_chunks(self, *tensors: torch.Tensor) -> Iterator[tuple[torch.Tensor, ...]]:
+        pending = [tensors]
+        while pending:
+            chunks = pending.pop()
+            reference = chunks[0]
+            if reference.numel() <= self.scratch_element_capacity:
+                self._peak_scratch_bytes = max(
+                    self._peak_scratch_bytes, reference.numel() * _MAX_SCRATCH_BYTES_PER_ELEMENT
+                )
+                yield chunks
+                continue
+            split_dimension = next(
+                dimension for dimension, length in enumerate(reference.shape) if length > 1
+            )
+            split = reference.shape[split_dimension] // 2
+            first = tuple(tensor.narrow(split_dimension, 0, split) for tensor in chunks)
+            second = tuple(
+                tensor.narrow(split_dimension, split, reference.shape[split_dimension] - split)
+                for tensor in chunks
+            )
+            pending.append(second)
+            pending.append(first)
 
     def _finite_contributions(
         self, slots: PackedSlots, *contributions: torch.Tensor

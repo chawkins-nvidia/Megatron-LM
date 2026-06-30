@@ -267,6 +267,12 @@ source = [
     "/home/runner/work/Megatron-LM/Megatron-LM/",
 ]
 
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true
+
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the
 # Google convention via `convention = "google"`, below.

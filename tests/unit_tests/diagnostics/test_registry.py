@@ -361,6 +361,7 @@ def test_packed_slot_order_is_static_and_complete() -> None:
         nonfinite=7,
         mask_error=8,
         nonfinite_arithmetic=9,
+        observation_error=10,
         maximum=0,
         minimum=0,
     )
