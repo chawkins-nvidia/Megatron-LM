@@ -4,6 +4,7 @@
 
 
 import random
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -11,9 +12,28 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+
+
+@dataclass(frozen=True, order=True)
+class SamplerIssuedIndex:
+    """Carry immutable sample identity from the sampler into a worker.
+
+    Persistent workers receive this value with every index task, so neither
+    prefetch nor a stale worker-local dataset epoch can change the identity.
+    """
+
+    epoch: int
+    sampler_index: int
+
+
+def _index_for_dataset(dataset, epoch, sampler_index):
+    """Return an issued identity only for datasets that explicitly accept it."""
+
+    if getattr(dataset, "accepts_sampler_issued_identity", False):
+        return SamplerIssuedIndex(int(epoch), int(sampler_index))
+    return sampler_index
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
@@ -61,7 +81,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 consumed_samples=consumed_samples,
                 micro_batch_size=micro_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+                dataset=dataset)
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
@@ -129,6 +150,7 @@ class MegatronPretrainingSampler:
         data_parallel_rank,
         data_parallel_size,
         drop_last=True,
+        dataset=None,
     ):
         # Keep a copy of input params for later use.
         self.total_samples = total_samples
@@ -137,6 +159,7 @@ class MegatronPretrainingSampler:
         self.data_parallel_rank = data_parallel_rank
         self.micro_batch_times_data_parallel_size = self.micro_batch_size * data_parallel_size
         self.drop_last = drop_last
+        self.dataset = dataset
 
         # Sanity checks.
         assert self.total_samples > 0, 'no sample to consume: {}'.format(self.total_samples)
@@ -170,7 +193,7 @@ class MegatronPretrainingSampler:
         batch = []
         # Last batch will be dropped if drop_last is not set False
         for idx in range(self.consumed_samples, self.total_samples):
-            batch.append(idx)
+            batch.append(_index_for_dataset(self.dataset, 0, idx))
             if len(batch) == self.micro_batch_times_data_parallel_size:
                 start_idx, end_idx = self.get_start_end_idx()
                 yield batch[start_idx:end_idx]
@@ -286,6 +309,8 @@ class RandomSeedDataset(Dataset):
         __getitem__(idx): Sets the seed based on the sample index and current epoch.
     """
 
+    accepts_sampler_issued_identity = True
+
     def __init__(self, dataset, seed):
         self.base_seed = seed
         self.curr_seed = seed
@@ -304,11 +329,23 @@ class RandomSeedDataset(Dataset):
         self.curr_seed = self.base_seed + epoch
 
     def __getitem__(self, idx):
-        seed = idx + self.curr_seed
+        if isinstance(idx, SamplerIssuedIndex):
+            epoch = idx.epoch
+            sample_index = idx.sampler_index
+            seed = sample_index + self.base_seed + epoch
+        else:
+            sample_index = idx
+            seed = sample_index + self.curr_seed
         torch.manual_seed(seed)
         random.seed(seed)
         np.random.seed(seed)
-        return self.dataset[idx]
+        source_index = (
+            idx
+            if isinstance(idx, SamplerIssuedIndex)
+            and getattr(self.dataset, "accepts_sampler_issued_identity", False)
+            else sample_index
+        )
+        return self.dataset[source_index]
 
 
 class MegatronPretrainingRandomSampler:
@@ -386,7 +423,7 @@ class MegatronPretrainingRandomSampler:
         batch = []
         # Last batch if not complete will be dropped.
         for idx in idx_range:
-            batch.append(idx)
+            batch.append(_index_for_dataset(self.dataset, self.epoch, idx))
             if len(batch) == self.micro_batch_size:
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
                 yield batch

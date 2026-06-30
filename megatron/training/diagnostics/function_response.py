@@ -1,0 +1,624 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Selected-token function response on the canonical diagnostic accumulator."""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import math
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
+
+import torch
+import torch.distributed as dist
+
+from megatron.core.transformer.transformer_layer import TransformerLayer
+
+from .accumulator import PackedSlots, PackedSufficientStatistics, ReductionBinding
+from .registry import (
+    DenominatorKind,
+    MaskKind,
+    MetricDescriptor,
+    MetricFamily,
+    MetricRegistry,
+    NormalizationKind,
+    Ownership,
+    PartitionAxis,
+    ReplicationAxis,
+    StatisticKind,
+)
+
+
+class ResponseFamily(StrEnum):
+    """Fixed Tier-1 response families."""
+
+    RESIDUAL = "residual"
+    QKV = "qkv"
+    ATTN_OUT = "attn_out"
+    FC1 = "fc1"
+    FC2 = "fc2"
+
+
+RESPONSE_FAMILIES: tuple[ResponseFamily, ...] = tuple(ResponseFamily)
+_FAMILY_INDEX = {family: index for index, family in enumerate(RESPONSE_FAMILIES)}
+_RESIDUAL_DEPTH_NAMES = ("first", "q25", "mid", "q75", "last")
+_QUANTILE_NAMES = ("p10", "p50", "p90")
+TIER1_PREFIX = "diag/v2/tier1/"
+TIER1_KEYS: tuple[str, ...] = (
+    *(
+        f"{TIER1_PREFIX}residual/dy_rel/{name}"
+        for name in (*_RESIDUAL_DEPTH_NAMES, *_QUANTILE_NAMES)
+    ),
+    *(
+        f"{TIER1_PREFIX}{family}/dy_rel/{name}"
+        for family in ("qkv", "attn_out", "fc1", "fc2")
+        for name in _QUANTILE_NAMES
+    ),
+    *(f"{TIER1_PREFIX}{family.value}/starved_fraction" for family in RESPONSE_FAMILIES),
+    *(f"{TIER1_PREFIX}{family.value}/valid_fraction" for family in RESPONSE_FAMILIES),
+)
+
+
+@dataclass(frozen=True)
+class ResponseHookDescriptor:
+    """Bind one typed dense-MCore response hook to a global slot."""
+
+    global_layer: int
+    family: ResponseFamily
+    module: torch.nn.Module = field(compare=False, repr=False)
+    owner: bool
+    sequence_sharded: bool
+    affine_bias_output: bool
+
+    @property
+    def key(self) -> tuple[int, ResponseFamily]:
+        """Return the global canonical hook key."""
+
+        return self.global_layer, self.family
+
+
+def discover_response_hooks(
+    models: Sequence[torch.nn.Module],
+    *,
+    global_layers: int,
+    expected_local_layers: Sequence[int],
+    tensor_parallel_rank: int,
+    sequence_parallel: bool,
+    layer_type: type[torch.nn.Module] = TransformerLayer,
+) -> tuple[ResponseHookDescriptor, ...]:
+    """Discover exact dense layer hooks and reject missing or duplicate local slots."""
+
+    if global_layers <= 0:
+        raise ValueError("Tier-1 response requires a positive global layer count")
+    expected = tuple(sorted(expected_local_layers))
+    if len(expected) != len(set(expected)) or any(
+        not 0 <= layer < global_layers for layer in expected
+    ):
+        raise ValueError("expected local response layers must be unique global indices")
+    descriptors: list[ResponseHookDescriptor] = []
+    discovered: set[int] = set()
+    for model in models:
+        for layer in model.modules():
+            if not isinstance(layer, layer_type):
+                continue
+            number = getattr(layer, "layer_number", None)
+            if not isinstance(number, int):
+                raise ValueError("MCore TransformerLayer lacks an integer layer_number")
+            global_layer = number - 1
+            if global_layer in discovered or global_layer not in expected:
+                raise ValueError("response layer ownership is duplicate or unexpected")
+            discovered.add(global_layer)
+            try:
+                modules = {
+                    ResponseFamily.RESIDUAL: layer,
+                    ResponseFamily.QKV: layer.self_attention.linear_qkv,
+                    ResponseFamily.ATTN_OUT: layer.self_attention.linear_proj,
+                    ResponseFamily.FC1: layer.mlp.linear_fc1,
+                    ResponseFamily.FC2: layer.mlp.linear_fc2,
+                }
+            except AttributeError as error:
+                raise ValueError("unsupported dense MCore response layer") from error
+            for family in RESPONSE_FAMILIES:
+                feature_sharded = family in (ResponseFamily.QKV, ResponseFamily.FC1)
+                sequence_sharded = sequence_parallel and not feature_sharded
+                descriptors.append(
+                    ResponseHookDescriptor(
+                        global_layer=global_layer,
+                        family=family,
+                        module=modules[family],
+                        owner=feature_sharded
+                        or sequence_parallel
+                        or tensor_parallel_rank == 0,
+                        sequence_sharded=sequence_sharded,
+                        affine_bias_output=family != ResponseFamily.RESIDUAL,
+                    )
+                )
+    if discovered != set(expected):
+        raise ValueError(
+            f"missing local response layers: {sorted(set(expected) - discovered)}"
+        )
+    descriptors.sort(
+        key=lambda descriptor: (
+            descriptor.global_layer,
+            _FAMILY_INDEX[descriptor.family],
+        )
+    )
+    return tuple(descriptors)
+
+
+def _validate_descriptor_order(descriptors: Sequence[ResponseHookDescriptor]) -> None:
+    keys = tuple(descriptor.key for descriptor in descriptors)
+    if len(keys) != len(set(keys)):
+        raise ValueError("response hook descriptors contain duplicate global slots")
+    if keys != tuple(sorted(keys, key=lambda key: (key[0], _FAMILY_INDEX[key[1]]))):
+        raise ValueError(
+            "response hook descriptors are not in canonical global slot order"
+        )
+
+
+def _response_registry(
+    descriptors: Sequence[ResponseHookDescriptor],
+    *,
+    global_layers: int,
+    sequence_parallel: bool,
+    reduction_binding: ReductionBinding,
+) -> MetricRegistry:
+    _validate_descriptor_order(descriptors)
+    local = {descriptor.key: descriptor for descriptor in descriptors}
+    metrics: list[MetricDescriptor] = []
+    owners: list[bool] = []
+    family_map = {
+        ResponseFamily.RESIDUAL: MetricFamily.RESIDUAL,
+        ResponseFamily.QKV: MetricFamily.QKV,
+        ResponseFamily.ATTN_OUT: MetricFamily.ATTN_OUT,
+        ResponseFamily.FC1: MetricFamily.FC1,
+        ResponseFamily.FC2: MetricFamily.FC2,
+    }
+    for layer in range(global_layers):
+        for family in RESPONSE_FAMILIES:
+            hook = local.get((layer, family))
+            feature_sharded = family in (ResponseFamily.QKV, ResponseFamily.FC1)
+            sequence_sharded = sequence_parallel and not feature_sharded
+            partition_axes = [
+                PartitionAxis.DATA_SAMPLE,
+                PartitionAxis.PIPELINE_LAYER,
+                PartitionAxis.CONTEXT_SEQUENCE,
+            ]
+            if feature_sharded:
+                partition_axes.append(PartitionAxis.TENSOR_FEATURE)
+            replicated = not feature_sharded and not sequence_sharded
+            metrics.append(
+                MetricDescriptor(
+                    logical_name=f"tier1/response/layer/{layer}/{family.value}",
+                    family=family_map[family],
+                    global_layer=layer,
+                    partition_axes=tuple(partition_axes),
+                    replication_axes=(ReplicationAxis.TENSOR,) if replicated else (),
+                    replication_multiplicity=1,
+                    ownership=(
+                        Ownership.TENSOR_PARALLEL_RANK_ZERO
+                        if replicated
+                        else Ownership.PIPELINE_STAGE
+                    ),
+                    mask_kind=MaskKind.NONE,
+                    statistic_kind=StatisticKind.UPDATE,
+                    denominator_kind=DenominatorKind.PRE_UPDATE_SUMSQ,
+                    normalization_kind=NormalizationKind.NONE,
+                    process_group_identity=reduction_binding.process_group_identity,
+                    reduction_kind=reduction_binding.reduction_kind,
+                    tied_owner_identity=None,
+                    packed_slots=PackedSlots.for_index(len(metrics)),
+                )
+            )
+            owners.append(bool(hook is not None and hook.owner))
+    return MetricRegistry(
+        metrics, reduction_binding=reduction_binding, local_owners=owners
+    )
+
+
+@dataclass
+class ResponseAccumulator:
+    """Typed Tier-1 view over the canonical registry and packed accumulator."""
+
+    registry: MetricRegistry
+    statistics: PackedSufficientStatistics
+    global_layers: int
+
+    @property
+    def descriptor_hash(self) -> str:
+        """Return the canonical global descriptor hash."""
+
+        return self.registry.descriptor_hash
+
+    def finalize_local_(self) -> "ResponseAccumulator":
+        """Finalize an intentional single-process accumulation."""
+
+        self.statistics.finalize_local_()
+        return self
+
+
+def verify_response_descriptor_consensus(
+    accumulator: ResponseAccumulator, group: object | None = None
+) -> None:
+    """Reject slot-count or descriptor-hash disagreement using typed collectives."""
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if dist.get_backend(group) == "nccl"
+        else torch.device("cpu")
+    )
+    digest = bytes.fromhex(accumulator.descriptor_hash)
+    wire = torch.tensor(
+        [len(accumulator.registry.slot_names), *digest],
+        dtype=torch.int64,
+        device=device,
+    )
+    minimum = wire.clone()
+    maximum = wire.clone()
+    dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=group)
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group)
+    if not torch.equal(minimum, maximum):
+        raise RuntimeError("Tier-1 response descriptor/slot hash mismatch")
+
+
+def _canonical_output(
+    output: Any, *, affine_bias_output: bool
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if affine_bias_output:
+        if isinstance(output, tuple):
+            if len(output) != 2:
+                raise ValueError("affine response expected (output, output_bias)")
+            tensor, bias = output
+        else:
+            tensor, bias = output, None
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError("affine response output must contain a tensor")
+        if bias is not None and not isinstance(bias, torch.Tensor):
+            raise TypeError("affine response bias must be a tensor or None")
+        return tensor, bias
+    tensor = output[0] if isinstance(output, tuple) else output
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("residual response output must contain a tensor")
+    return tensor, None
+
+
+def _selected_rows(
+    activation: torch.Tensor, mask: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    """Select rows before bias materialization, bounding work by selected tokens."""
+
+    boolean = mask if mask.dtype == torch.bool else mask != 0
+    if activation.ndim == 2:
+        if activation.shape[0] != boolean.numel():
+            raise ValueError("flattened response activation does not match its mask")
+        rows = activation.reshape(-1, activation.shape[-1])[boolean.reshape(-1)]
+    elif activation.ndim == 3 and boolean.ndim == 2:
+        if activation.shape[:2] == boolean.shape:
+            aligned = activation
+        elif activation.shape[:2] == tuple(reversed(boolean.shape)):
+            aligned = activation.transpose(0, 1)
+        else:
+            raise ValueError("response activation shape does not match its mask")
+        rows = aligned.reshape(-1, aligned.shape[-1])[boolean.reshape(-1)]
+    else:
+        raise ValueError("Tier-1 response expects 2D or [sequence,batch,hidden] output")
+    return rows if bias is None else rows + bias
+
+
+class FunctionResponseProbe:
+    """Capture bounded selected pre rows and accumulate post deltas canonically."""
+
+    def __init__(
+        self,
+        descriptors: Sequence[ResponseHookDescriptor],
+        *,
+        global_layers: int,
+        device: torch.device | str,
+        expected_hook_calls: int,
+        sequence_parallel: bool = False,
+        reduction_binding: ReductionBinding | None = None,
+        scratch_element_capacity: int = 16 * 1024,
+    ) -> None:
+        if expected_hook_calls < 0 or scratch_element_capacity <= 0:
+            raise ValueError("response hook counts and scratch capacity must be valid")
+        self.descriptors = tuple(descriptors)
+        _validate_descriptor_order(self.descriptors)
+        self.global_layers = global_layers
+        self.device = torch.device(device)
+        self.expected_hook_calls = expected_hook_calls
+        self.sequence_parallel = sequence_parallel
+        binding = reduction_binding or ReductionBinding.flat_world(None)
+        self.registry = _response_registry(
+            self.descriptors,
+            global_layers=global_layers,
+            sequence_parallel=sequence_parallel,
+            reduction_binding=binding,
+        )
+        statistics = PackedSufficientStatistics(
+            self.registry.slot_names,
+            self.device,
+            descriptor_hash=self.registry.descriptor_hash,
+            reduction_binding=binding,
+            scratch_element_capacity=scratch_element_capacity,
+        )
+        self.accumulator = ResponseAccumulator(self.registry, statistics, global_layers)
+        self._pre_rows: dict[tuple[int, ResponseFamily], list[torch.Tensor]] = {}
+        self._pre_calls: dict[tuple[int, ResponseFamily], int] = {}
+        self._post_calls: dict[tuple[int, ResponseFamily], int] = {}
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+        self._phase: str | None = None
+        self._full_mask: torch.Tensor | None = None
+        self._sequence_mask: torch.Tensor | None = None
+        self._finalized = False
+
+    @property
+    def descriptor_hash(self) -> str:
+        """Return the response registry descriptor hash."""
+
+        return self.registry.descriptor_hash
+
+    def set_masks(
+        self,
+        full_mask: torch.Tensor,
+        *,
+        sequence_parallel_mask: torch.Tensor | None = None,
+    ) -> None:
+        """Set CP-local and optional SP-local masks for one schedule microbatch."""
+
+        if full_mask.device != self.device:
+            raise ValueError("response mask is on the wrong device")
+        if (
+            sequence_parallel_mask is not None
+            and sequence_parallel_mask.device != self.device
+        ):
+            raise ValueError("sequence-parallel response mask is on the wrong device")
+        self._full_mask = full_mask
+        self._sequence_mask = sequence_parallel_mask
+
+    @contextlib.contextmanager
+    def capture_pre(self) -> Iterator[None]:
+        """Install hooks for the pre-update forward-only schedule."""
+
+        with self._capture("pre"):
+            yield
+
+    @contextlib.contextmanager
+    def capture_post(self) -> Iterator[None]:
+        """Install hooks for the post-update forward-only schedule."""
+
+        with self._capture("post"):
+            yield
+
+    @contextlib.contextmanager
+    def _capture(self, phase: str) -> Iterator[None]:
+        if self._phase is not None or self._finalized:
+            raise RuntimeError(
+                "response capture phases cannot overlap or follow finalize"
+            )
+        self._phase = phase
+        try:
+            for descriptor in self.descriptors:
+                self._handles.append(
+                    descriptor.module.register_forward_hook(self._make_hook(descriptor))
+                )
+            yield
+        finally:
+            for handle in self._handles:
+                handle.remove()
+            self._handles.clear()
+            self._phase = None
+            self._full_mask = None
+            self._sequence_mask = None
+
+    def _make_hook(self, descriptor: ResponseHookDescriptor):
+        def hook(
+            _module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any
+        ) -> None:
+            try:
+                self._observe(descriptor, output)
+            except (RuntimeError, TypeError, ValueError):
+                self.registry.mark_observation_error(
+                    self.accumulator.statistics,
+                    self.registry.slot_names[self._slot(descriptor)],
+                )
+                raise
+
+        return hook
+
+    def _slot(self, descriptor: ResponseHookDescriptor) -> int:
+        return (
+            descriptor.global_layer * len(RESPONSE_FAMILIES)
+            + _FAMILY_INDEX[descriptor.family]
+        )
+
+    def _observe(self, descriptor: ResponseHookDescriptor, output: Any) -> None:
+        if self._phase not in ("pre", "post"):
+            raise RuntimeError("response hook fired outside replay capture")
+        mask = self._sequence_mask if descriptor.sequence_sharded else self._full_mask
+        if mask is None:
+            raise ValueError("response schedule did not supply the required mask")
+        activation, bias = _canonical_output(
+            output, affine_bias_output=descriptor.affine_bias_output
+        )
+        rows = _selected_rows(activation, mask, bias)
+        calls = self._pre_calls if self._phase == "pre" else self._post_calls
+        calls[descriptor.key] = calls.get(descriptor.key, 0) + 1
+        if not descriptor.owner:
+            return
+        if self._phase == "pre":
+            self._pre_rows.setdefault(descriptor.key, []).append(rows.detach().clone())
+            return
+        before_values = self._pre_rows.get(descriptor.key, [])
+        before = before_values.pop(0) if before_values else None
+        if not before_values:
+            self._pre_rows.pop(descriptor.key, None)
+        logical_name = self.registry.slot_names[self._slot(descriptor)]
+        if before is None or before.shape != rows.shape:
+            self.registry.mark_observation_error(
+                self.accumulator.statistics, logical_name
+            )
+            return
+        self.registry.add_update(
+            self.accumulator.statistics, logical_name, before, rows.detach()
+        )
+
+    def finalize(self) -> ResponseAccumulator:
+        """Mark exact hook-cardinality errors and return neutral global slots."""
+
+        if self._phase is not None or self._finalized:
+            raise RuntimeError(
+                "response probe finalizes exactly once after both schedules"
+            )
+        for descriptor in self.descriptors:
+            if (
+                self._pre_calls.get(descriptor.key, 0) != self.expected_hook_calls
+                or self._post_calls.get(descriptor.key, 0) != self.expected_hook_calls
+                or descriptor.key in self._pre_rows
+            ):
+                self.registry.mark_observation_error(
+                    self.accumulator.statistics,
+                    self.registry.slot_names[self._slot(descriptor)],
+                )
+        self._pre_rows.clear()
+        self._finalized = True
+        return self.accumulator
+
+    @property
+    def retained_pre_bytes(self) -> int:
+        """Return exact currently retained selected-row storage."""
+
+        return sum(
+            value.numel() * value.element_size()
+            for values in self._pre_rows.values()
+            for value in values
+        )
+
+    @property
+    def maximum_accumulator_scratch_bytes(self) -> int:
+        """Return canonical bounded FP32/FP64 update scratch."""
+
+        return self.accumulator.statistics.maximum_scratch_bytes
+
+    def release(self) -> None:
+        """Remove temporary hooks and release all retained response rows."""
+
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self._pre_rows.clear()
+        self._full_mask = None
+        self._sequence_mask = None
+        self._phase = None
+
+
+@dataclass(frozen=True)
+class FunctionResponseResult:
+    """All-layer pooled response values and canonical validity."""
+
+    dy_rel: torch.Tensor
+    valid: torch.Tensor
+    count: torch.Tensor
+    delta_square_sum: torch.Tensor
+
+    @classmethod
+    def from_reduced(cls, accumulator: ResponseAccumulator) -> "FunctionResponseResult":
+        """Derive ratios only after canonical packed reduction/finalization."""
+
+        if not accumulator.statistics.reduced:
+            raise RuntimeError(
+                "Tier-1 response statistics must be reduced before derivation"
+            )
+        values = torch.empty(
+            (accumulator.global_layers, len(RESPONSE_FAMILIES)),
+            dtype=torch.float64,
+            device=accumulator.statistics.sum_pack.device,
+        )
+        valid = torch.empty_like(values, dtype=torch.bool)
+        count = torch.empty_like(values)
+        delta = torch.empty_like(values)
+        for layer in range(accumulator.global_layers):
+            for family in range(len(RESPONSE_FAMILIES)):
+                slot = layer * len(RESPONSE_FAMILIES) + family
+                statistic = accumulator.statistics.relative_rms(slot)
+                packed = accumulator.statistics.slots(slot)
+                values[layer, family] = statistic.value
+                slot_valid = statistic.valid & (
+                    accumulator.statistics.sum_pack[packed.observation_error] == 0
+                )
+                valid[layer, family] = slot_valid
+                values[layer, family] = torch.where(
+                    slot_valid,
+                    statistic.value,
+                    torch.full_like(statistic.value, torch.nan),
+                )
+                count[layer, family] = accumulator.statistics.sum_pack[packed.count]
+                delta[layer, family] = accumulator.statistics.sum_pack[packed.lhs_sumsq]
+        return cls(values, valid, count, delta)
+
+
+def derive_tier1_summaries(accumulator: ResponseAccumulator) -> dict[str, float]:
+    """Derive the exact fixed 30-key Tier-1 payload from pooled sufficient sums."""
+
+    result = FunctionResponseResult.from_reduced(accumulator)
+    values_by_key: dict[str, float] = {}
+    quantiles = torch.tensor(
+        (0.1, 0.5, 0.9), dtype=torch.float64, device=result.dy_rel.device
+    )
+    for family in RESPONSE_FAMILIES:
+        family_index = _FAMILY_INDEX[family]
+        response = result.dy_rel[:, family_index]
+        validity = result.valid[:, family_index]
+        prefix = f"{TIER1_PREFIX}{family.value}"
+        if family == ResponseFamily.RESIDUAL:
+            last = response.numel() - 1
+            anchors = (
+                0,
+                math.floor(last * 0.25 + 0.5),
+                math.floor(last * 0.5 + 0.5),
+                math.floor(last * 0.75 + 0.5),
+                last,
+            )
+            for name, index in zip(_RESIDUAL_DEPTH_NAMES, anchors, strict=True):
+                values_by_key[f"{prefix}/dy_rel/{name}"] = float(response[index])
+        selected = response[validity]
+        values = (
+            torch.quantile(selected, quantiles)
+            if selected.numel()
+            else torch.full(
+                (3,), torch.nan, dtype=torch.float64, device=response.device
+            )
+        )
+        for name, value in zip(_QUANTILE_NAMES, values, strict=True):
+            values_by_key[f"{prefix}/dy_rel/{name}"] = float(value)
+        contributors = validity
+        values_by_key[f"{prefix}/starved_fraction"] = (
+            float(
+                (result.delta_square_sum[:, family_index][contributors] == 0)
+                .double()
+                .mean()
+            )
+            if contributors.any()
+            else math.nan
+        )
+        values_by_key[f"{prefix}/valid_fraction"] = float(validity.double().mean())
+    payload = {key: values_by_key[key] for key in TIER1_KEYS}
+    if len(set(payload)) != 30:
+        raise RuntimeError(
+            "derived Tier-1 payload does not match the canonical 30-key list"
+        )
+    return payload
+
+
+def descriptor_fingerprint(descriptors: Sequence[ResponseHookDescriptor]) -> str:
+    """Hash local canonical hook identities for preflight diagnostics."""
+
+    _validate_descriptor_order(descriptors)
+    digest = hashlib.sha256()
+    for descriptor in descriptors:
+        digest.update(f"{descriptor.global_layer}:{descriptor.family.value}".encode())
+    return digest.hexdigest()
