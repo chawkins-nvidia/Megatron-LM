@@ -6,9 +6,9 @@ import gc
 import itertools
 import logging
 from collections import ChainMap
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional
@@ -55,7 +55,7 @@ from ..distributed.param_and_grad_buffer import (
 from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
-from ..transformer.module import MegatronModule
+from ..transformer.module import MegatronModule, param_is_not_shared
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
@@ -97,6 +97,81 @@ class Range:
 
     def __len__(self):
         return self.end - self.start
+
+
+@dataclass(frozen=True)
+class ParamShardRange:
+    """Stable half-open range identifying one distributed-optimizer shard view."""
+
+    start: int
+    end: int
+
+    @property
+    def size(self) -> int:
+        """Return the number of elements in the range."""
+
+        return self.end - self.start
+
+    @classmethod
+    def from_range(cls, value: Range) -> "ParamShardRange":
+        """Copy an internal optimizer range into the stable public representation.
+
+        Args:
+            value: Internal distributed-optimizer range.
+
+        Returns:
+            An immutable half-open range with the same bounds.
+        """
+
+        return cls(value.start, value.end)
+
+
+@dataclass(frozen=True)
+class ModelMainParamShard:
+    """Describe aligned forward and authoritative owner shards for one model parameter.
+
+    The range fields are copied from the distributed optimizer's existing mapping;
+    consumers must not reconstruct parameter-to-bucket ownership independently.
+
+    Attributes:
+        model_param: Complete BF16 model parameter on this TP/PP rank.
+        model_shard: BF16 owner slice staged in the parameter bucket for all-gather.
+        main_shard: Authoritative FP32 optimizer owner shard.
+        optimizer_group_index: Optimizer parameter-group index.
+        group_parameter_index: Parameter index within that optimizer group.
+        model_chunk_index: Model chunk owning the parameter.
+        buffer_index: Contiguous parameter-buffer index.
+        bucket_index: Bucket index within the contiguous parameter buffer.
+        param_range: Owner range within the complete model parameter.
+        gbuf_world_range: Owner range within the complete grad/parameter buffer.
+        bucket_range: Owner range within the bucket buffer.
+        local_buffer_range: Parameter range within this rank's local buffer shard.
+        tensor_parallel_sharded: Whether TP ranks contain distinct parameter elements.
+        tensor_parallel_duplicate: Whether another TP rank owns the same logical elements.
+        shared: Whether Megatron marks this as a noncanonical shared parameter copy.
+        tied: Whether this is a tied embedding/output parameter.
+        tied_owner: Whether this rank owns the canonical tied parameter copy.
+        logical_owner: Whether this shard is a unique logical Tier-0 contributor.
+    """
+
+    model_param: torch.nn.Parameter
+    model_shard: torch.Tensor
+    main_shard: torch.Tensor
+    optimizer_group_index: int
+    group_parameter_index: int
+    model_chunk_index: int
+    buffer_index: int
+    bucket_index: int
+    param_range: ParamShardRange
+    gbuf_world_range: ParamShardRange
+    bucket_range: ParamShardRange
+    local_buffer_range: ParamShardRange
+    tensor_parallel_sharded: bool
+    tensor_parallel_duplicate: bool
+    shared: bool
+    tied: bool
+    tied_owner: bool
+    logical_owner: bool
 
 
 class DistributedOptimizer(MixedPrecisionOptimizer):
@@ -767,6 +842,109 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_range_map = self.gbuf_ranges[gbuf_index][dtype][bucket_index]
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
+
+    def iter_model_main_param_shards(self) -> Iterator[ModelMainParamShard]:
+        """Iterate aligned BF16 applied and FP32 authoritative owner shards.
+
+        The iterator exposes the optimizer's existing parameter/bucket mapping as
+        immutable identity metadata. It deliberately supports only the standard
+        BF16 distributed-optimizer representation; quantized, precision-aware,
+        FSDP, and stub representations fail closed.
+
+        Yields:
+            One :class:`ModelMainParamShard` for each locally owned DP/CP shard.
+
+        Raises:
+            RuntimeError: If this optimizer does not use the standard owner-shard representation.
+            ValueError: If aligned optimizer structures or shard lengths disagree.
+        """
+
+        if self.is_stub_optimizer:
+            raise RuntimeError("stub distributed optimizers have no diagnostic owner shards")
+        if self.ddp_config.use_megatron_fsdp:
+            raise RuntimeError("Megatron FSDP owner shards are not supported")
+        if self.config.use_precision_aware_optimizer:
+            raise RuntimeError("precision-aware optimizer owner shards are not supported")
+        if self.ddp_config.fp8_param_gather or self.config.fp8_recipe is not None:
+            raise RuntimeError("FP8 optimizer owner shards are not supported")
+        if self.ddp_config.fp4_param_gather:
+            raise RuntimeError("FP4 optimizer owner shards are not supported")
+
+        if not (
+            len(self.model_float16_groups)
+            == len(self.shard_float16_groups)
+            == len(self.shard_fp32_from_float16_groups)
+        ):
+            raise ValueError("distributed-optimizer diagnostic groups are not aligned")
+
+        for group_index, (model_group, model_shard_group, main_group) in enumerate(
+            zip(
+                self.model_float16_groups,
+                self.shard_float16_groups,
+                self.shard_fp32_from_float16_groups,
+            )
+        ):
+            if not (len(model_group) == len(model_shard_group) == len(main_group)):
+                raise ValueError(
+                    f"distributed-optimizer diagnostic group {group_index} is not aligned"
+                )
+            for group_parameter_index, (
+                model_param,
+                aligned_model_shard,
+                main_shard,
+            ) in enumerate(zip(model_group, model_shard_group, main_group)):
+                if aligned_model_shard is None or main_shard is None:
+                    raise RuntimeError("quantized or missing owner shards are not supported")
+                if model_param.dtype != torch.bfloat16 or aligned_model_shard.dtype != torch.bfloat16:
+                    raise RuntimeError("diagnostic forward owner shards must be BF16")
+                if main_shard.dtype != torch.float32:
+                    raise RuntimeError("diagnostic authoritative owner shards must be FP32")
+
+                buffer_index, _, bucket_index = self.model_param_gbuf_map[model_param]
+                range_map = self._get_model_param_range_map(model_param)
+                bucket_range = range_map["gbuf_world_in_bucket"]
+                model_param_buffer = self.buffers[buffer_index].buckets[bucket_index].param_data
+                model_shard = model_param_buffer.view(-1)[bucket_range.start : bucket_range.end]
+                if not (
+                    range_map["param"].size
+                    == aligned_model_shard.numel()
+                    == model_shard.numel()
+                    == main_shard.numel()
+                ):
+                    raise ValueError("distributed-optimizer diagnostic shard lengths disagree")
+                if model_shard.dtype != torch.bfloat16:
+                    raise RuntimeError("diagnostic applied owner bucket slices must be BF16")
+
+                tensor_parallel_sharded = bool(
+                    getattr(model_param, "tensor_model_parallel", False)
+                )
+                tensor_parallel_owner = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                    model_param, tp_group=getattr(self, "tp_group", None)
+                )
+                shared = not param_is_not_shared(model_param)
+                tied = bool(getattr(model_param, "shared_embedding", False))
+                tied_owner = tied and not shared
+
+                yield ModelMainParamShard(
+                    model_param=model_param,
+                    model_shard=model_shard,
+                    main_shard=main_shard,
+                    optimizer_group_index=group_index,
+                    group_parameter_index=group_parameter_index,
+                    model_chunk_index=self.gbuf_idx_to_model_idx_map[buffer_index],
+                    buffer_index=buffer_index,
+                    bucket_index=bucket_index,
+                    param_range=ParamShardRange.from_range(range_map["param"]),
+                    gbuf_world_range=ParamShardRange.from_range(range_map["gbuf_world"]),
+                    bucket_range=ParamShardRange.from_range(bucket_range),
+                    local_buffer_range=ParamShardRange.from_range(range_map["gbuf_local"]),
+                    tensor_parallel_sharded=tensor_parallel_sharded,
+                    tensor_parallel_duplicate=not tensor_parallel_owner,
+                    shared=shared,
+                    tied=tied,
+                    tied_owner=tied_owner,
+                    logical_owner=tensor_parallel_owner and not shared,
+                )
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """

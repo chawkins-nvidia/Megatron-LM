@@ -690,6 +690,135 @@ class PackedSufficientStatistics:
             error.detach().reshape(()).to(dtype=self.sum_pack.dtype)
         )
 
+    def add_applied_update(
+        self,
+        slot: str | int,
+        master_before: torch.Tensor,
+        master_after: torch.Tensor,
+        applied_before: torch.Tensor,
+        applied_after: torch.Tensor,
+        *,
+        replication_multiplicity: int = 1,
+    ) -> None:
+        """Add authoritative and applied-update retention moments.
+
+        This specialized update layout retains all quantities needed to derive
+        metrics only after global pooling: ``sumsq`` stores master-delta square
+        sum, ``lhs_sumsq`` applied-delta square sum, ``rhs_sumsq`` applied-pre
+        square sum, ``sum`` master-delta nonzero count, ``dot`` applied-delta
+        nonzero count among nonzero master deltas, and ``zero`` cast-to-zero
+        count among nonzero master deltas.
+
+        Args:
+            slot: Registered update slot.
+            master_before: Pre-step FP32 authoritative owner shard.
+            master_after: Post-step FP32 authoritative owner shard.
+            applied_before: Pre-step BF16 forward owner shard.
+            applied_after: Post-materialization BF16 forward owner shard.
+            replication_multiplicity: Number of identical logical replicas.
+
+        Raises:
+            RuntimeError: If accumulation already completed.
+            ValueError: If replication multiplicity is not positive.
+        """
+
+        self._ensure_accumulating()
+        self._validate_multiplicity(replication_multiplicity)
+        slots = self.slots(slot)
+        (
+            master_before_fp32,
+            master_after_fp32,
+            applied_before_fp32,
+            applied_after_fp32,
+        ) = torch.broadcast_tensors(
+            master_before.detach().to(dtype=torch.float32),
+            master_after.detach().to(dtype=torch.float32),
+            applied_before.detach().to(dtype=torch.float32),
+            applied_after.detach().to(dtype=torch.float32),
+        )
+        if master_before_fp32.numel() == 0:
+            return
+
+        finite = (
+            torch.isfinite(master_before_fp32)
+            & torch.isfinite(master_after_fp32)
+            & torch.isfinite(applied_before_fp32)
+            & torch.isfinite(applied_after_fp32)
+        )
+        master_delta_fp32 = master_after_fp32 - master_before_fp32
+        applied_delta_fp32 = applied_after_fp32 - applied_before_fp32
+        clean_master_delta = torch.where(
+            finite, master_delta_fp32, torch.zeros_like(master_delta_fp32)
+        ).to(dtype=torch.float64)
+        clean_applied_delta = torch.where(
+            finite, applied_delta_fp32, torch.zeros_like(applied_delta_fp32)
+        ).to(dtype=torch.float64)
+        clean_applied_before = torch.where(
+            finite, applied_before_fp32, torch.zeros_like(applied_before_fp32)
+        ).to(dtype=torch.float64)
+        scale = replication_multiplicity
+
+        count = finite.sum(dtype=torch.float64) / scale
+        master_sumsq = clean_master_delta.square().sum() / scale
+        applied_sumsq = clean_applied_delta.square().sum() / scale
+        applied_pre_sumsq = clean_applied_before.square().sum() / scale
+        master_nonzero = (finite & (master_delta_fp32 != 0)).sum(
+            dtype=torch.float64
+        ) / scale
+        applied_nonzero = (
+            finite & (master_delta_fp32 != 0) & (applied_delta_fp32 != 0)
+        ).sum(dtype=torch.float64) / scale
+        cast_zero = (finite & (master_delta_fp32 != 0) & (applied_delta_fp32 == 0)).sum(
+            dtype=torch.float64
+        ) / scale
+        nonfinite = (~finite).sum(dtype=torch.float64) / scale
+        (
+            count,
+            master_sumsq,
+            applied_sumsq,
+            applied_pre_sumsq,
+            master_nonzero,
+            applied_nonzero,
+            cast_zero,
+            nonfinite,
+        ) = self._finite_contributions(
+            slots,
+            count,
+            master_sumsq,
+            applied_sumsq,
+            applied_pre_sumsq,
+            master_nonzero,
+            applied_nonzero,
+            cast_zero,
+            nonfinite,
+        )
+
+        self.sum_pack[slots.count].add_(count)
+        self.sum_pack[slots.sumsq].add_(master_sumsq)
+        self.sum_pack[slots.lhs_sumsq].add_(applied_sumsq)
+        self.sum_pack[slots.rhs_sumsq].add_(applied_pre_sumsq)
+        self.sum_pack[slots.sum].add_(master_nonzero)
+        self.sum_pack[slots.dot].add_(applied_nonzero)
+        self.sum_pack[slots.zero].add_(cast_zero)
+        self.sum_pack[slots.nonfinite].add_(nonfinite)
+
+        candidate_max = torch.where(
+            finite,
+            applied_delta_fp32,
+            torch.full_like(applied_delta_fp32, -torch.inf),
+        ).amax()
+        candidate_min = torch.where(
+            finite,
+            applied_delta_fp32,
+            torch.full_like(applied_delta_fp32, torch.inf),
+        ).amin()
+        self.max_pack[slots.maximum] = torch.maximum(
+            self.max_pack[slots.maximum], candidate_max
+        )
+        self.min_pack[slots.minimum] = torch.minimum(
+            self.min_pack[slots.minimum], candidate_min
+        )
+
     def reduce_(self) -> "PackedSufficientStatistics":
         """Reduce the three fixed packs with SUM, MAX, and MIN.
 
@@ -778,6 +907,54 @@ class PackedSufficientStatistics:
         slots = self._derived_slots(slot)
         ratio = self._ratio(self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.rhs_sumsq], slots)
         return self._safe_sqrt(ratio)
+
+    def master_delta_rms(self, slot: str | int) -> DerivedStatistic:
+        """Derive authoritative master-delta RMS after global pooling."""
+
+        slots = self._derived_slots(slot)
+        return self._safe_sqrt(
+            self._ratio(self.sum_pack[slots.sumsq], self.sum_pack[slots.count], slots)
+        )
+
+    def applied_delta_rms(self, slot: str | int) -> DerivedStatistic:
+        """Derive applied BF16 delta RMS after global pooling."""
+
+        slots = self._derived_slots(slot)
+        return self._safe_sqrt(
+            self._ratio(
+                self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.count], slots
+            )
+        )
+
+    def norm_retention(self, slot: str | int) -> DerivedStatistic:
+        """Derive ``sqrt(sum(applied_delta^2) / sum(master_delta^2))``."""
+
+        slots = self._derived_slots(slot)
+        return self._safe_sqrt(
+            self._ratio(
+                self.sum_pack[slots.lhs_sumsq],
+                self.sum_pack[slots.sumsq],
+                slots,
+            )
+        )
+
+    def master_nonzero_fraction(self, slot: str | int) -> DerivedStatistic:
+        """Derive the fraction of coordinates with a nonzero master delta."""
+
+        slots = self._derived_slots(slot)
+        return self._ratio(self.sum_pack[slots.sum], self.sum_pack[slots.count], slots)
+
+    def applied_nonzero_fraction(self, slot: str | int) -> DerivedStatistic:
+        """Derive applied-update survival among nonzero master-delta coordinates."""
+
+        slots = self._derived_slots(slot)
+        return self._ratio(self.sum_pack[slots.dot], self.sum_pack[slots.sum], slots)
+
+    def cast_zero_fraction(self, slot: str | int) -> DerivedStatistic:
+        """Derive cast-to-zero rate among coordinates with nonzero master delta."""
+
+        slots = self._derived_slots(slot)
+        return self._ratio(self.sum_pack[slots.zero], self.sum_pack[slots.sum], slots)
 
     def zero_fraction(self, slot: str | int) -> DerivedStatistic:
         """Derive the zero fraction among selected finite elements.

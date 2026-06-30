@@ -468,6 +468,42 @@ class MetricRegistry:
                 in (MaskKind.TOKEN, MaskKind.SEQUENCE_PARALLEL_TOKEN),
             )
 
+    def add_applied_update(
+        self,
+        accumulator: PackedSufficientStatistics,
+        logical_name: str,
+        master_before: torch.Tensor,
+        master_after: torch.Tensor,
+        applied_before: torch.Tensor,
+        applied_after: torch.Tensor,
+    ) -> None:
+        """Accumulate owned master/applied update-retention sufficient statistics.
+
+        Args:
+            accumulator: Registry-bound packed accumulator.
+            logical_name: Registered update descriptor name.
+            master_before: Pre-step authoritative FP32 owner shard.
+            master_after: Post-step authoritative FP32 owner shard.
+            applied_before: Pre-step BF16 applied owner shard.
+            applied_after: Post-materialization BF16 applied owner shard.
+
+        Raises:
+            ValueError: If the accumulator or operation conflicts with the descriptor.
+        """
+
+        index, descriptor = self._operation(
+            accumulator, logical_name, StatisticKind.UPDATE, None
+        )
+        if self.local_owners[index]:
+            accumulator.add_applied_update(
+                index,
+                master_before,
+                master_after,
+                applied_before,
+                applied_after,
+                replication_multiplicity=descriptor.replication_multiplicity,
+            )
+
     def mark_mask_error(
         self,
         accumulator: PackedSufficientStatistics,

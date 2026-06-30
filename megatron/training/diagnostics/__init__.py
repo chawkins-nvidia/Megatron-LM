@@ -24,6 +24,18 @@ from .capture import (
     unpack_valid_token_mask_sideband,
 )
 from .normalization import CanonicalDgradNormalizer
+from .distributed_optimizer import (
+    Bf16DistributedOptimizerDiagnosticAdapter,
+    DeviceMemoryState,
+    DistributedOptimizerCapabilityReport,
+    DistributedOptimizerDiagnosticReason,
+    DistributedOptimizerDiagnosticUnsupportedError,
+    SnapshotMemoryError,
+    SnapshotMemoryEstimate,
+    SnapshotMemoryMeasurement,
+    SnapshotMemoryPreflight,
+    SnapshotMemoryReason,
+)
 from .registry import (
     DenominatorKind,
     MaskKind,
@@ -50,10 +62,15 @@ from .schema import (
 )
 
 __all__ = [
+    "Bf16DistributedOptimizerDiagnosticAdapter",
     "CanonicalDgradNormalizer",
     "CaptureTopology",
+    "DeviceMemoryState",
     "DerivedStatistic",
     "DenominatorKind",
+    "DistributedOptimizerCapabilityReport",
+    "DistributedOptimizerDiagnosticReason",
+    "DistributedOptimizerDiagnosticUnsupportedError",
     "LayerCaptureTarget",
     "MaskKind",
     "MetricDescriptor",
@@ -71,6 +88,11 @@ __all__ = [
     "ReplicationAxis",
     "SCHEMA_PREFIX",
     "SCHEMA_VERSION",
+    "SnapshotMemoryError",
+    "SnapshotMemoryEstimate",
+    "SnapshotMemoryMeasurement",
+    "SnapshotMemoryPreflight",
+    "SnapshotMemoryReason",
     "StagedTokenMask",
     "StatisticKind",
     "TIER0_KEYS",
