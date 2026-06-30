@@ -275,6 +275,9 @@ class LoggerConfig:
     diagnostic_event_id: int = field(init=False, default=0)
     """Checkpointed next diagnostic event identifier."""
 
+    diagnostic_cumulative_artifact_bytes: int = field(init=False, default=0)
+    """Checkpointed cumulative compressed Tier-0 artifact bytes."""
+
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 

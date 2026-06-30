@@ -2,12 +2,15 @@
 
 """Tier-0 heartbeat orchestration and runtime-contract tests."""
 
+import inspect
 import io
 import json
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +23,14 @@ from megatron.core.pipeline_parallel.schedules import forward_step
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config.training_config import LoggerConfig
 from megatron.training.diagnostics import tier0 as tier0_module
-from megatron.training.diagnostics.tier0 import Tier0Cadence, Tier0Heartbeat
+from megatron.training.diagnostics.artifact import Tier0ArtifactWriter
+from megatron.training.diagnostics.tier0 import (
+    Tier0Cadence,
+    Tier0Heartbeat,
+    mark_tier0_mask_producer,
+    tier0_reservation_bytes,
+)
+from megatron.training.global_vars import wandb_writer_rank
 
 from megatron.training.diagnostics.accumulator import (  # isort: skip
     PackedSufficientStatistics,
@@ -29,7 +39,13 @@ from megatron.training.diagnostics.accumulator import (  # isort: skip
 from megatron.training.diagnostics.capability import (  # isort: skip
     capability_payload,
     contract_hash,
+    diagnostic_schema_hash,
+    load_static_capability,
+    materialize_capability,
     schema_hash,
+    sha256_file,
+    static_capability_path,
+    verified_source_commit,
 )
 from megatron.training.diagnostics.schema import (  # isort: skip
     TIER0_KEYS,
@@ -45,6 +61,7 @@ def _status_only_args() -> SimpleNamespace:
         diagnostic_unsupported_policy="status-only",
         diagnostic_successful_updates=0,
         diagnostic_event_id=0,
+        diagnostic_cumulative_artifact_bytes=0,
     )
 
 
@@ -108,6 +125,7 @@ def test_logger_config_exposes_checkpointed_heartbeat_contract() -> None:
         ({"overlap_param_gather": True}, "param_gather_overlap"),
         ({"virtual_pipeline_model_parallel_size": 2}, "virtual_pipeline"),
         ({"calculate_per_token_loss": False}, "per_token_loss"),
+        ({"num_layers": 10_001}, "capability_bounds"),
     ),
 )
 def test_narrow_backend_capability_rejects_unsupported_modes(
@@ -131,6 +149,25 @@ def test_narrow_backend_capability_rejects_unsupported_modes(
     args = SimpleNamespace(**values)
     reasons = tier0_module._local_capability_reasons(args, [nn.Linear(1, 1)], object())
     assert reason in reasons
+
+
+def test_forward_function_requires_marker_and_registration_bytecode() -> None:
+    def permissive(_iterator, _model, *, diagnostic_heartbeat=None):
+        return diagnostic_heartbeat
+
+    @mark_tier0_mask_producer
+    def marked_but_nonregistering(_iterator, _model, *, diagnostic_heartbeat=None):
+        return diagnostic_heartbeat
+
+    @mark_tier0_mask_producer
+    def canonical(_iterator, _model, *, diagnostic_heartbeat=None):
+        microbatch_id = get_diagnostic_microbatch_id()
+        diagnostic_heartbeat.register_local_loss_mask(microbatch_id, None)
+
+    assert not tier0_module._verified_mask_producer(None)
+    assert not tier0_module._verified_mask_producer(permissive)
+    assert not tier0_module._verified_mask_producer(marked_but_nonregistering)
+    assert tier0_module._verified_mask_producer(canonical)
 
 
 def test_status_only_retries_overflow_then_writes_one_exact_payload() -> None:
@@ -173,6 +210,15 @@ def test_status_only_retries_overflow_then_writes_one_exact_payload() -> None:
         assert len(payload) == 75
         assert payload["diag/v2/status/valid"] == 0
         assert payload["diag/v2/event/successful_update"] == 1
+        assert all(
+            isinstance(payload[key], int)
+            for key in (
+                "diag/v2/event/successful_update",
+                "diag/v2/event/valid_positions",
+                "diag/v2/status/valid",
+                "diag/v2/perf/peak_hbm_bytes_max_rank",
+            )
+        )
         assert all(
             math_value != math_value
             for key, math_value in payload.items()
@@ -258,44 +304,51 @@ def test_checkpoint_runtime_fields_round_trip() -> None:
     args = _status_only_args()
     args.diagnostic_successful_updates = 123
     args.diagnostic_event_id = 9
+    args.diagnostic_cumulative_artifact_bytes = 4567
     buffer = io.BytesIO()
     torch.save({"args": args}, buffer)
     buffer.seek(0)
     restored = torch.load(buffer, weights_only=False)["args"]
     assert restored.diagnostic_successful_updates == 123
     assert restored.diagnostic_event_id == 9
+    assert restored.diagnostic_cumulative_artifact_bytes == 4567
 
 
 def test_capability_probe_contract_and_cpu_only_subprocess() -> None:
-    payload = capability_payload(
-        source_commit="abc123", build_identity="image@sha256:def"
-    )
-    assert payload["contract_hash"] == contract_hash()
+    payload = capability_payload()
+    static = load_static_capability()
+    assert payload["static_capability_sha256"] == contract_hash()
     assert payload["schema_hash"] == schema_hash()
-    assert payload["schema_key_count"] == 75
+    assert payload["schema"] == "diag/v2/runtime-capabilities"
     assert payload["supported_max_tier"] == 0
     assert payload["runtime_contract_present"]
-    assert payload["heartbeat_consumer"] == (
-        "megatron.training.diagnostics.tier0.Tier0Heartbeat"
+    assert payload["integrated_heartbeat_consumer"]
+    assert payload["runtime_fields"] == list(
+        tier0_module.CONSUMED_DIAGNOSTIC_CONFIG_FIELDS
+        if hasattr(tier0_module, "CONSUMED_DIAGNOSTIC_CONFIG_FIELDS")
+        else static["runtime_fields"]
     )
-    assert payload["config_consumer"] == (
-        "megatron.training.config.training_config.LoggerConfig"
+    assert payload["source_commit"] == verified_source_commit()
+    assert payload["build_identity"] == (
+        f"capability-file-sha256:{sha256_file(static_capability_path())}"
     )
-    assert payload["source_commit"] == "abc123"
-    assert payload["build_identity"] == "image@sha256:def"
-    assert payload["writer_policy"] == {
-        "wandb_rank": 0,
-        "wandb_calls_per_event": 1,
-        "wandb_step": "iteration_plus_one",
-        "tensorboard_ownership": "existing",
-    }
+    assert payload["topology_bounds"]["world_size"]["maximum"] == 1024
+    assert payload["artifact_support"]["exact_files"] == [
+        "manifest.json",
+        "layer_metrics.npz",
+        "rank_perf.npz",
+    ]
+    assert (
+        diagnostic_schema_hash()
+        == "7b7e156949da5370cccf5fd825784dfcc4de79b19ee4eca1d79d976783b5b28a"
+    )
     assert set(TIER0_METADATA_KEYS).issubset(TIER0_KEYS)
 
     code = (
         "import json,sys; "
         "from megatron.training.diagnostics.capability import capability_payload; "
         "print(json.dumps({'torch_loaded': 'torch' in sys.modules, "
-        "'payload': capability_payload(source_commit='commit', build_identity='build')}))"
+        "'payload': capability_payload()}))"
     )
     completed = subprocess.run(
         [sys.executable, "-c", code],
@@ -306,8 +359,7 @@ def test_capability_probe_contract_and_cpu_only_subprocess() -> None:
     )
     result = json.loads(completed.stdout)
     assert not result["torch_loaded"]
-    assert result["payload"]["source_commit"] == "commit"
-    assert result["payload"]["build_identity"] == "build"
+    assert result["payload"]["source_commit"] == verified_source_commit()
 
     completed = subprocess.run(
         [
@@ -315,10 +367,6 @@ def test_capability_probe_contract_and_cpu_only_subprocess() -> None:
             "-m",
             "megatron.training.diagnostics.capability",
             "--json",
-            "--source-commit",
-            "commit",
-            "--build-identity",
-            "build",
         ],
         check=True,
         capture_output=True,
@@ -327,8 +375,194 @@ def test_capability_probe_contract_and_cpu_only_subprocess() -> None:
     )
     cli_payload = json.loads(completed.stdout)
     assert cli_payload["runtime_contract_present"]
-    assert cli_payload["source_commit"] == "commit"
-    assert cli_payload["build_identity"] == "build"
+    assert cli_payload["source_commit"] == verified_source_commit()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "capability.json"
+        materialize_capability(path, static)
+        first = path.read_bytes()
+        materialize_capability(path, static)
+        assert path.read_bytes() == first
+
+
+def test_zero_extra_bytes_rejects_before_event_allocation() -> None:
+    args = _status_only_args()
+    args.diagnostic_max_extra_bytes = 0
+    with pytest.raises(RuntimeError, match="reservation rejected globally"):
+        Tier0Heartbeat(args, [nn.Linear(2, 2)], object())
+
+
+def test_pure_startup_reservation_is_bounded_at_world_size_1024() -> None:
+    requested = tier0_reservation_bytes(
+        num_layers=96,
+        num_microbatches=16,
+        micro_batch_size=4,
+        local_sequence_length=4096,
+        owner_elements=100_000_000,
+        world_size=1024,
+    )
+    repeated = tier0_reservation_bytes(
+        num_layers=96,
+        num_microbatches=16,
+        micro_batch_size=4,
+        local_sequence_length=4096,
+        owner_elements=100_000_000,
+        world_size=1024,
+    )
+    assert requested == repeated
+    assert requested > 600_000_000
+    assert requested < 700_000_000
+
+
+def test_multirank_wandb_ownership_keeps_validation_on_the_single_owner() -> None:
+    args = SimpleNamespace(diagnostic_heartbeat=True, world_size=8)
+    owners = [
+        rank for rank in range(args.world_size) if rank == wandb_writer_rank(args)
+    ]
+    tensorboard_owners = [args.world_size - 1]
+    validation_wandb_owners = list(owners)
+    assert owners == [0]
+    assert tensorboard_owners == [7]
+    assert validation_wandb_owners == [0]
+    source = Path(tier0_module.__file__).parents[1] / "training.py"
+    validation_source = source.read_text(encoding="utf-8")
+    assert "if wandb_writer and is_last_rank()" not in validation_source
+
+
+def test_full_event_orchestrator_has_only_one_sink_host_transfer() -> None:
+    forbidden = (".item(", ".cpu(", ".tolist(")
+    for method_name in (
+        "finish_optimizer_event",
+        "_gather_latency_ms",
+        "_derive_payload",
+        "_updates_valid",
+        "_derive_capture_metrics",
+        "_derive_update_metrics",
+        "_derive_nonfinite_health",
+    ):
+        source = inspect.getsource(getattr(Tier0Heartbeat, method_name))
+        assert not any(token in source for token in forbidden), method_name
+    sink_source = inspect.getsource(Tier0Heartbeat._emit)
+    assert sink_source.count(".cpu()") == 1
+    assert ".item(" not in sink_source
+
+
+def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> None:
+    class Artifact:
+        def __init__(self, *, name: str, type: str) -> None:
+            self.name = name
+            self.type = type
+            self.directory = None
+
+        def add_dir(self, directory: str) -> None:
+            self.directory = directory
+
+    class Run:
+        def __init__(self) -> None:
+            self.calls: list[Artifact] = []
+
+        def log_artifact(self, artifact: Artifact) -> None:
+            self.calls.append(artifact)
+
+    class Wandb:
+        def __init__(self) -> None:
+            self.run = Run()
+            self.Artifact = Artifact
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wandb = Wandb()
+        writer = Tier0ArtifactWriter(
+            Path(tmpdir),
+            run_id="run-209",
+            job_name="job-209",
+            repro={
+                "scaling_commit": "a" * 40,
+                "megatron_commit": "b" * 40,
+                "resolved_config_sha256": "c" * 64,
+                "scaling_bundle_sha256": "d" * 64,
+                "megatron_bundle_sha256": "e" * 64,
+            },
+            wandb_writer=wandb,
+        )
+        directory, compressed = writer.write(
+            event_id=1,
+            successful_update=1,
+            consumed_tokens=1024,
+            valid_positions=4,
+            valid=True,
+            topology={
+                "dp": 1,
+                "tp": 1,
+                "pp": 1,
+                "cp": 1,
+                "ep": 1,
+                "vpp": 1,
+                "num_layers": 2,
+            },
+            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120]],
+            capability_hash="f" * 64,
+            schema_hash=diagnostic_schema_hash(),
+        )
+        assert {path.name for path in directory.iterdir()} == {
+            "manifest.json",
+            "layer_metrics.npz",
+            "rank_perf.npz",
+        }
+        assert compressed == writer.cumulative_bytes
+        assert len(wandb.run.calls) == 1
+        assert wandb.run.calls[0].name == "diag-v2-run-209"
+        second_writer = Tier0ArtifactWriter(
+            Path(tmpdir) / "second",
+            run_id="run-209",
+            job_name="job-209",
+            repro=writer.repro,
+            wandb_writer=None,
+        )
+        second_directory, _ = second_writer.write(
+            event_id=1,
+            successful_update=1,
+            consumed_tokens=1024,
+            valid_positions=4,
+            valid=True,
+            topology={
+                "dp": 1,
+                "tp": 1,
+                "pp": 1,
+                "cp": 1,
+                "ep": 1,
+                "vpp": 1,
+                "num_layers": 2,
+            },
+            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120]],
+            capability_hash="f" * 64,
+            schema_hash=diagnostic_schema_hash(),
+        )
+        assert {
+            name: sha256_file(directory / name)
+            for name in ("manifest.json", "layer_metrics.npz", "rank_perf.npz")
+        } == {
+            name: sha256_file(second_directory / name)
+            for name in ("manifest.json", "layer_metrics.npz", "rank_perf.npz")
+        }
+        scaling_root = Path(
+            "/home/chawkins/src/scaling-worktrees/issue-209-scalable-diagnostics"
+        )
+        completed = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "from analysis.diagnostics.validate_wandb import validate_artifact; "
+                    f"validate_artifact({str(directory)!r})"
+                ),
+            ],
+            cwd=scaling_root,
+            env={**os.environ, "PYTHONPATH": str(scaling_root)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
 
 
 @pytest.fixture(scope="module")
@@ -352,7 +586,9 @@ def test_one_rank_update_failure_retries_with_fixed_world_collectives(
     )
 
     assert heartbeat.prepare_attempt(num_microbatches=1)
-    assert not heartbeat.finish_optimizer_event(dist.get_rank() == 0, iteration=0)
+    success = torch.tensor(int(dist.get_rank() == 0))
+    dist.all_reduce(success, op=dist.ReduceOp.MIN)
+    assert not heartbeat.finish_optimizer_event(bool(success.item()), iteration=0)
     assert heartbeat.successful_updates == 0
     assert heartbeat.event_id == 0
     assert not calls
@@ -362,6 +598,60 @@ def test_one_rank_update_failure_retries_with_fixed_world_collectives(
     assert heartbeat.successful_updates == 1
     assert heartbeat.event_id == 1
     assert len(calls) == (1 if dist.get_rank() == 0 else 0)
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_pp2_incompatible_forward_function_is_rejected_globally_before_p2p(
+    gloo_world: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parameter = nn.Parameter(torch.ones(1))
+    distributed_optimizer = SimpleNamespace(
+        grad_scaler=None, optimizer=torch.optim.Adam([parameter])
+    )
+    monkeypatch.setattr(tier0_module, "GPTModel", nn.Linear)
+    monkeypatch.setattr(
+        tier0_module, "_distributed_optimizer", lambda _optimizer: distributed_optimizer
+    )
+
+    @mark_tier0_mask_producer
+    def canonical(_iterator, _model, *, diagnostic_heartbeat=None):
+        microbatch_id = get_diagnostic_microbatch_id()
+        diagnostic_heartbeat.register_local_loss_mask(microbatch_id, None)
+
+    def nonregistering(_iterator, _model, *, diagnostic_heartbeat=None):
+        return diagnostic_heartbeat
+
+    args = SimpleNamespace(
+        bf16=True,
+        fp16=False,
+        calculate_per_token_loss=True,
+        transformer_impl="local",
+    )
+    forward_function = canonical if dist.get_rank() == 0 else nonregistering
+    capability = tier0_module.negotiate_tier0_capability(
+        args, [nn.Linear(1, 1)], object(), forward_function
+    )
+    assert not capability.supported
+    assert "canonical_mask_producer" in capability.reasons
+    assert "rank_inconsistent" in capability.reasons
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_one_rank_startup_allocation_failure_is_agreed_before_training(
+    gloo_world: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_empty = tier0_module.torch.empty
+
+    def injected_empty(*args, **kwargs):
+        if dist.get_rank() == 1 and kwargs.get("dtype") == torch.uint8:
+            raise torch.OutOfMemoryError("injected startup allocation failure")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(tier0_module.torch, "empty", injected_empty)
+    with pytest.raises(RuntimeError, match="startup allocation failed"):
+        Tier0Heartbeat(_status_only_args(), [nn.Linear(2, 2)], object())
     dist.barrier()
 
 

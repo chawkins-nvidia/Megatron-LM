@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitlab-master.nvidia.com/chawkins/scaling/schemas/diag_v2.metrics.json",
+  "schema": "diag/v2",
+  "description": "Declarative expansion source for the fixed diag/v2 history namespace. Any expansion not listed here is forbidden.",
+  "budgets": {
+    "dense": 122,
+    "dense_moe": 130
+  },
+  "expansions": {
+    "D8": ["first", "q1", "middle", "q3", "last", "p10", "p50", "p90"],
+    "Q3": ["p10", "p50", "p90"],
+    "module_families": ["qkv", "attn_out", "fc1", "fc2"],
+    "layered_update_families": ["qkv", "attn_out", "fc1", "fc2", "norm"],
+    "matrix_families": ["embedding", "qkv", "attn_out", "fc1", "fc2", "output"]
+  },
+  "groups": [
+    {"template": "diag/v2/t0/activation/residual/rms/{D8}", "count": 8},
+    {"template": "diag/v2/t0/dgrad/residual/rms/{D8}", "count": 8},
+    {"template": "diag/v2/t0/dgrad/{module_families}/{p10,p50,zero_fraction}", "count": 12},
+    {"template": "diag/v2/t0/update/{layered_update_families}/{p10,p50,p90,starved_fraction}", "count": 20},
+    {"keys": ["diag/v2/t0/update/embedding/relative_rms", "diag/v2/t0/update/output/relative_rms"], "count": 2},
+    {"template": "diag/v2/t0/retention/{matrix_families}/{median,zero_fraction}", "count": 12},
+    {"template": "diag/v2/t0/activation/{qkv,attn_out,fc1,fc2,residual}/max_abs", "count": 5},
+    {"name": "tier0_metadata", "keys": [
+      "diag/v2/event/successful_update",
+      "diag/v2/event/valid_positions",
+      "diag/v2/health/nonfinite_fraction",
+      "diag/v2/health/underflow_fraction",
+      "diag/v2/status/valid",
+      "diag/v2/perf/peak_hbm_bytes_max_rank",
+      "diag/v2/perf/latency_ms_median_rank",
+      "diag/v2/perf/latency_ms_max_rank"
+    ], "count": 8},
+    {"template": "diag/v2/t1/response/residual/dy_rel/{D8}", "count": 8},
+    {"template": "diag/v2/t1/response/{module_families}/dy_rel/{Q3}", "count": 12},
+    {"template": "diag/v2/t1/response/{qkv,attn_out,fc1,fc2,residual}/starved_fraction", "count": 5},
+    {"name": "tier1_attention", "keys": [
+      "diag/v2/t1/attention/logit_abs_p50",
+      "diag/v2/t1/attention/logit_abs_p90",
+      "diag/v2/t1/attention/entropy_p10",
+      "diag/v2/t1/attention/entropy_p50",
+      "diag/v2/t1/attention/collapse_fraction"
+    ], "count": 5},
+    {"template": "diag/v2/t2/{true_response,secant_error,secant_cosine,realized_midpoint_fraction,replay_floor}/{Q3}", "count": 15},
+    {"keys": ["diag/v2/t2/unresolved_fraction", "diag/v2/t2/valid"], "count": 2},
+    {"name": "moe_extension", "keys": [
+      "diag/v2/moe/load_cv",
+      "diag/v2/moe/min_token_share",
+      "diag/v2/moe/starved_expert_count",
+      "diag/v2/moe/drop_fraction",
+      "diag/v2/moe/router_logit_max",
+      "diag/v2/moe/expert_bias_range",
+      "diag/v2/moe/update_starved_fraction",
+      "diag/v2/moe/valid"
+    ], "count": 8}
+  ]
+}

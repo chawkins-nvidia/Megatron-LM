@@ -119,6 +119,31 @@ class SnapshotMemoryEstimate:
     finish_chunk_elements: int
 
 
+def snapshot_memory_estimate(
+    owner_elements: int, *, finish_chunk_elements: int = 65_536
+) -> SnapshotMemoryEstimate:
+    """Calculate the exact optimizer event reservation without allocating tensors."""
+
+    if owner_elements < 0 or finish_chunk_elements <= 0:
+        raise ValueError("snapshot reservation dimensions are invalid")
+    chunk_elements = min(owner_elements, finish_chunk_elements)
+    fp32_master_bytes = owner_elements * 4
+    bf16_applied_bytes = owner_elements * 2
+    layout = _scratch_layout(chunk_elements)
+    snapshot_bytes = fp32_master_bytes + bf16_applied_bytes
+    return SnapshotMemoryEstimate(
+        fp32_master_bytes=fp32_master_bytes,
+        bf16_applied_bytes=bf16_applied_bytes,
+        finish_elementwise_bytes=layout.elementwise_bytes,
+        finish_scalar_bytes=layout.scalar_bytes,
+        finish_scratch_bytes=layout.total_bytes,
+        snapshot_bytes=snapshot_bytes,
+        total_bytes=snapshot_bytes + layout.total_bytes,
+        owner_elements=owner_elements,
+        finish_chunk_elements=chunk_elements,
+    )
+
+
 @dataclass(frozen=True)
 class DeviceMemoryState:
     """Device allocator and driver memory state used by event preflight."""
@@ -448,6 +473,9 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         self.capability_report = report
         self.memory_state_provider = memory_state_provider
         self._snapshot: _SnapshotState | None = None
+        self._master_before_buffer: torch.Tensor | None = None
+        self._applied_before_buffer: torch.Tensor | None = None
+        self._finish_scratch: _FinishScratch | None = None
         self._last_memory_reason = SnapshotMemoryReason.NONE
         self._status = torch.zeros(
             1, dtype=torch.int64, device=_negotiation_device(distributed_optimizer, process_group)
@@ -579,23 +607,27 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         """Return exact retained and bounded peak bytes through accumulation."""
 
         owner_elements = sum(shard.main_shard.numel() for shard in self._bound_shards)
-        chunk_elements = min(owner_elements, self.finish_chunk_elements)
-        fp32_master_bytes = owner_elements * 4
-        bf16_applied_bytes = owner_elements * 2
-        layout = _scratch_layout(chunk_elements)
-        finish_scratch_bytes = layout.total_bytes
-        snapshot_bytes = fp32_master_bytes + bf16_applied_bytes
-        return SnapshotMemoryEstimate(
-            fp32_master_bytes=fp32_master_bytes,
-            bf16_applied_bytes=bf16_applied_bytes,
-            finish_elementwise_bytes=layout.elementwise_bytes,
-            finish_scalar_bytes=layout.scalar_bytes,
-            finish_scratch_bytes=finish_scratch_bytes,
-            snapshot_bytes=snapshot_bytes,
-            total_bytes=snapshot_bytes + finish_scratch_bytes,
-            owner_elements=owner_elements,
-            finish_chunk_elements=chunk_elements,
+        return snapshot_memory_estimate(
+            owner_elements, finish_chunk_elements=self.finish_chunk_elements
         )
+
+    def allocate_event_buffers(self) -> None:
+        """Allocate every optimizer event buffer once during startup."""
+
+        if self._master_before_buffer is not None:
+            return
+        estimate = self.estimate_snapshot_memory()
+        device = (
+            self._bound_shards[0].main_shard.device
+            if self._bound_shards
+            else self._status.device
+        )
+        master = torch.empty(estimate.owner_elements, dtype=torch.float32, device=device)
+        applied = torch.empty(estimate.owner_elements, dtype=torch.bfloat16, device=device)
+        scratch = self._allocate_finish_scratch(device)
+        self._master_before_buffer = master
+        self._applied_before_buffer = applied
+        self._finish_scratch = scratch
 
     def preflight_snapshot_memory(
         self, *, additional_bytes: int = 0
@@ -702,37 +734,40 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         if len(devices) != 1:
             self._set_status(DistributedOptimizerEventStatus.BEGIN_DEVICE_MISMATCH)
             return None
-        preflight = self.preflight_snapshot_memory(additional_bytes=additional_bytes)
-        if not preflight.accepted:
-            self._last_memory_reason = preflight.reason
-            self._set_status(DistributedOptimizerEventStatus.BEGIN_PREFLIGHT_REJECTED)
-            return None
+        estimate = self.estimate_snapshot_memory()
+        if self._master_before_buffer is None or self._applied_before_buffer is None:
+            preflight = self.preflight_snapshot_memory(additional_bytes=additional_bytes)
+            if not preflight.accepted:
+                self._last_memory_reason = preflight.reason
+                self._set_status(DistributedOptimizerEventStatus.BEGIN_PREFLIGHT_REJECTED)
+                return None
+            estimate = preflight.estimate
 
         device = next(iter(devices))
         allocator_ok, allocator_before = self._sample_allocator_bytes(device)
         if not allocator_ok:
             return None
-        master_before: torch.Tensor | None = None
-        applied_before: torch.Tensor | None = None
-        try:
-            master_before = torch.empty(
-                preflight.estimate.owner_elements, dtype=torch.float32, device=device
-            )
-        except Exception:
-            master_before = None
-            self._last_memory_reason = SnapshotMemoryReason.ALLOCATION_FAILED
-            self._set_status(DistributedOptimizerEventStatus.BEGIN_FIRST_ALLOCATION_FAILED)
-            return None
-        try:
-            applied_before = torch.empty(
-                preflight.estimate.owner_elements, dtype=torch.bfloat16, device=device
-            )
-        except Exception:
-            applied_before = None
-            master_before = None
-            self._last_memory_reason = SnapshotMemoryReason.ALLOCATION_FAILED
-            self._set_status(DistributedOptimizerEventStatus.BEGIN_SECOND_ALLOCATION_FAILED)
-            return None
+        master_before = self._master_before_buffer
+        applied_before = self._applied_before_buffer
+        if master_before is None:
+            try:
+                master_before = torch.empty(
+                    estimate.owner_elements, dtype=torch.float32, device=device
+                )
+            except Exception:
+                self._last_memory_reason = SnapshotMemoryReason.ALLOCATION_FAILED
+                self._set_status(DistributedOptimizerEventStatus.BEGIN_FIRST_ALLOCATION_FAILED)
+                return None
+        if applied_before is None:
+            try:
+                applied_before = torch.empty(
+                    estimate.owner_elements, dtype=torch.bfloat16, device=device
+                )
+            except Exception:
+                master_before = None
+                self._last_memory_reason = SnapshotMemoryReason.ALLOCATION_FAILED
+                self._set_status(DistributedOptimizerEventStatus.BEGIN_SECOND_ALLOCATION_FAILED)
+                return None
 
         offsets: list[tuple[int, int]] = []
         try:
@@ -758,9 +793,9 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             return None
         allocator_delta = self._allocator_delta(allocator_before, allocator_after)
         measurement = SnapshotMemoryMeasurement(
-            estimated_bytes=preflight.estimate.total_bytes,
-            payload_bytes=preflight.estimate.snapshot_bytes,
-            finish_scratch_bytes=preflight.estimate.finish_scratch_bytes,
+            estimated_bytes=estimate.total_bytes,
+            payload_bytes=estimate.snapshot_bytes,
+            finish_scratch_bytes=estimate.finish_scratch_bytes,
             allocator_delta_bytes=allocator_delta,
             allocator_peak_delta_bytes=allocator_delta,
         )
@@ -836,14 +871,17 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             return None
 
         device = snapshot.master_before.device
-        scratch: _FinishScratch | None = None
+        scratch = self._finish_scratch
         try:
-            try:
-                scratch = self._allocate_finish_scratch(device)
-            except Exception:
-                self._last_memory_reason = SnapshotMemoryReason.ALLOCATION_FAILED
-                self._set_status(DistributedOptimizerEventStatus.FINISH_SCRATCH_ALLOCATION_FAILED)
-                return None
+            if scratch is None:
+                try:
+                    scratch = self._allocate_finish_scratch(device)
+                except Exception:
+                    self._last_memory_reason = SnapshotMemoryReason.ALLOCATION_FAILED
+                    self._set_status(
+                        DistributedOptimizerEventStatus.FINISH_SCRATCH_ALLOCATION_FAILED
+                    )
+                    return None
 
             measurement = self._measurement_with_peak(snapshot, device)
             if measurement is None:
@@ -874,7 +912,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
                 self._invalidate_bound_metrics(accumulator)
             return measurement
         finally:
-            if scratch is not None:
+            if scratch is not None and scratch is not self._finish_scratch:
                 self._clear_finish_scratch(scratch)
 
     def abort_event(self) -> None:

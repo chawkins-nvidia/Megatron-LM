@@ -238,11 +238,17 @@ class _NoOpWandbWriter:  # CHAWKINS-NOOP-WANDB
     def __repr__(self): return "<_NoOpWandbWriter>"
 
 
+def wandb_writer_rank(args):
+    """Return the sole world rank that owns the W&B run."""
+
+    return 0 if getattr(args, 'diagnostic_heartbeat', False) else args.world_size - 1
+
+
 def _set_wandb_writer(args):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
-    writer_rank = 0 if getattr(args, 'diagnostic_heartbeat', False) else args.world_size - 1
+    writer_rank = wandb_writer_rank(args)
     if getattr(args, 'wandb_project', '') and args.rank == writer_rank:
         if args.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")

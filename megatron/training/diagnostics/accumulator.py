@@ -309,6 +309,16 @@ class PackedSufficientStatistics:
 
         return self._reduced
 
+    def reset_(self) -> "PackedSufficientStatistics":
+        """Reset preallocated event packs to their neutral values."""
+
+        self.sum_pack.zero_()
+        self.max_pack.fill_(-torch.inf)
+        self.min_pack.fill_(torch.inf)
+        self._peak_scratch_bytes = 0
+        self._reduced = False
+        return self
+
     @property
     def process_group_identity(self) -> ProcessGroupIdentity:
         """Return the process-group identity carried by the runtime binding."""
@@ -946,8 +956,25 @@ class PackedSufficientStatistics:
         )
 
     @staticmethod
+    def allocate_reduction_arenas(
+        accumulators: Iterable["PackedSufficientStatistics"],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Allocate the fixed combined SUM/MAX/MIN arenas once."""
+
+        packed = tuple(accumulators)
+        if not packed:
+            raise ValueError("packed event reduction requires at least one accumulator")
+        device = packed[0].sum_pack.device
+        return (
+            torch.empty(sum(item.sum_pack.numel() for item in packed), dtype=torch.float64, device=device),
+            torch.empty(sum(item.max_pack.numel() for item in packed), dtype=torch.float32, device=device),
+            torch.empty(sum(item.min_pack.numel() for item in packed), dtype=torch.float32, device=device),
+        )
+
+    @staticmethod
     def reduce_many_(
         accumulators: Iterable["PackedSufficientStatistics"],
+        arenas: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple["PackedSufficientStatistics", ...]:
         """Reduce multiple registries with one packed SUM/MAX/MIN sequence."""
 
@@ -964,9 +991,28 @@ class PackedSufficientStatistics:
                     "packed event accumulators must share one reduction binding"
                 )
 
-        sum_arena = torch.cat(tuple(accumulator.sum_pack for accumulator in packed))
-        max_arena = torch.cat(tuple(accumulator.max_pack for accumulator in packed))
-        min_arena = torch.cat(tuple(accumulator.min_pack for accumulator in packed))
+        if arenas is None:
+            sum_arena, max_arena, min_arena = PackedSufficientStatistics.allocate_reduction_arenas(
+                packed
+            )
+        else:
+            sum_arena, max_arena, min_arena = arenas
+        if (
+            sum_arena.numel() != sum(item.sum_pack.numel() for item in packed)
+            or max_arena.numel() != sum(item.max_pack.numel() for item in packed)
+            or min_arena.numel() != sum(item.min_pack.numel() for item in packed)
+        ):
+            raise ValueError("packed event reduction arenas have the wrong fixed size")
+
+        sum_offset = max_offset = min_offset = 0
+        for accumulator in packed:
+            next_sum = sum_offset + accumulator.sum_pack.numel()
+            next_max = max_offset + accumulator.max_pack.numel()
+            next_min = min_offset + accumulator.min_pack.numel()
+            sum_arena[sum_offset:next_sum].copy_(accumulator.sum_pack)
+            max_arena[max_offset:next_max].copy_(accumulator.max_pack)
+            min_arena[min_offset:next_min].copy_(accumulator.min_pack)
+            sum_offset, max_offset, min_offset = next_sum, next_max, next_min
         binding = first.reduction_binding
         reduce_call = _torch_all_reduce if binding.reducer is None else binding.reducer
         reduce_call(sum_arena, op=dist.ReduceOp.SUM, group=binding.group)

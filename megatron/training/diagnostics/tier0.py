@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -25,7 +28,10 @@ from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 from .accumulator import PackedSlots, PackedSufficientStatistics, ReductionBinding
-from .capability import SUPPORT_SIGNATURE
+from .artifact import Tier0ArtifactWriter, writer_from_runtime
+from .capability import SUPPORT_SIGNATURE, diagnostic_schema_hash
+from .capability import sha256_file as capability_sha256_file
+from .capability import static_capability_path
 from .capture import (
     CaptureTopology,
     StagedTokenMask,
@@ -36,8 +42,8 @@ from .capture import (
 )
 from .distributed_optimizer import (
     Bf16DistributedOptimizerDiagnosticAdapter,
-    DistributedOptimizerDiagnosticUnsupportedError,
     SnapshotMemoryPreflight,
+    snapshot_memory_estimate,
 )
 from .normalization import CanonicalDgradNormalizer
 from .registry import (
@@ -85,6 +91,7 @@ _CONTROL_NAMES = (
     "control/adapter_status",
     "control/peak_hbm_bytes",
 )
+_MASK_PRODUCER_MARKER = "megatron.tier0.canonical-gpt-mask-producer.v1"
 
 
 @dataclass(frozen=True)
@@ -140,6 +147,58 @@ class Tier0Capability:
     support_signature: str
 
 
+@dataclass(frozen=True)
+class Tier0Reservation:
+    """Pure startup reservation and measured allocation evidence."""
+
+    requested_bytes: int
+    max_extra_bytes: int
+    accepted: bool
+    measured_allocated_bytes: int = 0
+
+
+def tier0_reservation_bytes(
+    *,
+    num_layers: int,
+    num_microbatches: int,
+    micro_batch_size: int,
+    local_sequence_length: int,
+    owner_elements: int,
+    world_size: int,
+) -> int:
+    """Calculate the exact worst-case event reservation without allocating."""
+
+    dimensions = (
+        num_layers,
+        num_microbatches,
+        micro_batch_size,
+        local_sequence_length,
+        world_size,
+    )
+    if any(value <= 0 for value in dimensions) or owner_elements < 0:
+        raise ValueError("Tier-0 reservation dimensions are invalid")
+    capture_slots = 2 + 10 * num_layers
+    update_slots = 5 * num_layers + 2
+    control_slots = len(_CONTROL_NAMES)
+    pack_bytes = (capture_slots + update_slots + control_slots) * (11 * 8 + 4 + 4)
+    sideband_bytes = (
+        2 * num_microbatches * (micro_batch_size * local_sequence_length + 1) * 4
+    )
+    optimizer_bytes = snapshot_memory_estimate(owner_elements).total_bytes
+    capture_scratch = PackedSufficientStatistics.scratch_bytes_for_capacity()
+    rank_evidence_bytes = (world_size + 1) * 9 * 8
+    sink_staging_bytes = (75 + 9 * world_size + 13 * (capture_slots + update_slots)) * 8
+    return (
+        2 * pack_bytes
+        + sideband_bytes
+        + optimizer_bytes
+        + capture_scratch
+        + rank_evidence_bytes
+        + sink_staging_bytes
+        + 24
+    )
+
+
 def _unwrap_module(module: nn.Module) -> nn.Module:
     while hasattr(module, "module") and isinstance(module.module, nn.Module):
         module = module.module
@@ -156,8 +215,50 @@ def _distributed_optimizer(optimizer: object) -> DistributedOptimizer | None:
     return child if isinstance(child, DistributedOptimizer) else None
 
 
+def mark_tier0_mask_producer(
+    forward_step_func: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Mark a mechanically verifiable forward function as a Tier-0 mask producer."""
+
+    setattr(
+        forward_step_func, "__megatron_tier0_mask_producer__", _MASK_PRODUCER_MARKER
+    )
+    return forward_step_func
+
+
+def _verified_mask_producer(forward_step_func: Callable[..., Any] | None) -> bool:
+    """Require both the positive marker and the canonical registration operations."""
+
+    if forward_step_func is None:
+        return False
+    candidate = (
+        forward_step_func.func
+        if isinstance(forward_step_func, functools.partial)
+        else forward_step_func
+    )
+    candidate = inspect.unwrap(candidate)
+    if (
+        getattr(candidate, "__megatron_tier0_mask_producer__", None)
+        != _MASK_PRODUCER_MARKER
+    ):
+        return False
+    try:
+        parameters = inspect.signature(candidate).parameters
+        names = set(candidate.__code__.co_names)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return (
+        "diagnostic_heartbeat" in parameters
+        and "register_local_loss_mask" in names
+        and "get_diagnostic_microbatch_id" in names
+    )
+
+
 def _local_capability_reasons(
-    args: Any, model: Sequence[nn.Module], optimizer: object
+    args: Any,
+    model: Sequence[nn.Module],
+    optimizer: object,
+    forward_step_func: Callable[..., Any] | None = None,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     chunks = tuple(_unwrap_module(chunk) for chunk in model)
@@ -213,18 +314,44 @@ def _local_capability_reasons(
         reasons.append("packed_micro_batch_size")
     if getattr(args, "variable_seq_lengths", False):
         reasons.append("variable_sequence_lengths")
+    world_size = (
+        dist.get_world_size()
+        if dist.is_initialized()
+        else int(getattr(args, "world_size", 1))
+    )
+    bounded_values = (
+        (world_size, 1, 1024),
+        (int(getattr(args, "data_parallel_size", 1)), 1, 1024),
+        (int(getattr(args, "tensor_model_parallel_size", 1)), 1, 1024),
+        (int(getattr(args, "pipeline_model_parallel_size", 1)), 1, 1024),
+        (int(getattr(args, "context_parallel_size", 1)), 1, 1024),
+        (int(getattr(args, "num_layers", 1)), 1, 10_000),
+        (int(getattr(args, "micro_batch_size", 1)), 1, 1_048_576),
+        (int(getattr(args, "seq_length", 1)), 1, 16_777_216),
+    )
+    if any(
+        value < minimum or value > maximum for value, minimum, maximum in bounded_values
+    ):
+        reasons.append("capability_bounds")
+    if not _verified_mask_producer(forward_step_func):
+        reasons.append("canonical_mask_producer")
     return tuple(sorted(set(reasons)))
 
 
 def negotiate_tier0_capability(
-    args: Any, model: Sequence[nn.Module], optimizer: object
+    args: Any,
+    model: Sequence[nn.Module],
+    optimizer: object,
+    forward_step_func: Callable[..., Any] | None = None,
 ) -> Tier0Capability:
     """Collectively fail closed for the first supported runtime signature."""
 
-    local_reasons = _local_capability_reasons(args, model, optimizer)
+    local_reasons = _local_capability_reasons(args, model, optimizer, forward_step_func)
     known = (
         "adam_optimizer",
         "bf16",
+        "capability_bounds",
+        "canonical_mask_producer",
         "cuda_graph",
         "custom_pipeline_layout",
         "dense_local_mcore_gpt",
@@ -386,10 +513,14 @@ class Tier0Heartbeat:
         args: Any,
         model: Sequence[nn.Module],
         optimizer: object,
+        forward_step_func: Callable[..., Any] | None = None,
         *,
         wandb_log: Callable[..., None] | None = None,
+        wandb_writer: object | None = None,
+        artifact_writer: Tier0ArtifactWriter | None = None,
         tensorboard_writer: object | None = None,
         reduction_binding: ReductionBinding | None = None,
+        num_microbatches: int = 1,
     ) -> None:
         """Collectively negotiate support and construct dormant run state."""
 
@@ -408,7 +539,10 @@ class Tier0Heartbeat:
             raise ValueError(
                 "diagnostic unsupported policy must be error or status-only"
             )
-        self.capability = negotiate_tier0_capability(args, self.model, optimizer)
+        self.capability = negotiate_tier0_capability(
+            args, self.model, optimizer, forward_step_func
+        )
+        self.forward_step_func = forward_step_func
         if not self.capability.supported and self.unsupported_policy == "error":
             raise RuntimeError(
                 "Tier-0 heartbeat unsupported on every rank: "
@@ -417,7 +551,12 @@ class Tier0Heartbeat:
 
         self.successful_updates = int(getattr(args, "diagnostic_successful_updates", 0))
         self.event_id = int(getattr(args, "diagnostic_event_id", 0))
+        self.cumulative_artifact_bytes = int(
+            getattr(args, "diagnostic_cumulative_artifact_bytes", 0)
+        )
         self.wandb_log = wandb_log
+        self.wandb_writer = wandb_writer
+        self.artifact_writer = artifact_writer
         self.tensorboard_writer = tensorboard_writer
         self.capture: Tier0CaptureSession | None = None
         self.capture_accumulator: PackedSufficientStatistics | None = None
@@ -429,35 +568,225 @@ class Tier0Heartbeat:
         self.preflight: SnapshotMemoryPreflight | None = None
         self._attempt_due = False
         self._attempt_started = 0.0
+        self._step_started = 0.0
+        self._ordinary_step_latency_ms = 0.0
         self._expected_num_microbatches = 0
         self._sideband_payloads: dict[int, torch.Tensor] = {}
+        self._local_sideband_payloads: dict[int, torch.Tensor] = {}
+        self._received_sidebands: set[int] = set()
+        self._reduction_arenas: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
+        self._capture_scratch: torch.Tensor | None = None
+        self._rank_evidence: torch.Tensor | None = None
+        self._local_rank_evidence: torch.Tensor | None = None
+        self._sink_staging: torch.Tensor | None = None
+        self._startup_num_microbatches = int(num_microbatches)
+        if not 1 <= self._startup_num_microbatches <= 1_048_576:
+            raise ValueError("Tier-0 startup microbatch bound is out of range")
 
-        if self.capability.supported:
-            try:
-                self._construct_update_registry()
-            except Exception:
-                registry_failed = torch.ones((), dtype=torch.int64, device=self.device)
-            else:
-                registry_failed = torch.zeros((), dtype=torch.int64, device=self.device)
-            if dist.is_initialized() and dist.get_world_size() > 1:
-                dist.all_reduce(registry_failed, op=dist.ReduceOp.MAX)
-            if bool(registry_failed.item()):
-                self._set_startup_unsupported(("optimizer_registry",))
+        self.reservation = self._startup_reservation()
+        self._allocate_startup_state()
+        self._initialize_artifact_writer()
 
-        if self.capability.supported:
+    def _initialize_artifact_writer(self) -> None:
+        """Construct the sole rank-0 artifact owner and agree setup before training."""
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        failed = False
+        if self.capability.supported and rank == 0 and self.artifact_writer is None:
             try:
-                self._construct_optimizer_adapter()
-            except DistributedOptimizerDiagnosticUnsupportedError as error:
-                self._set_startup_unsupported((f"optimizer_adapter:{error}",))
-            else:
-                assert self.adapter is not None
-                construction_failed = (self.adapter.local_status != 0).to(
-                    dtype=torch.int64
+                if self.wandb_writer is None:
+                    raise RuntimeError("Tier-0 requires a rank-0 W&B writer")
+                self.artifact_writer = writer_from_runtime(
+                    self.args,
+                    self.wandb_writer,
+                    cumulative_bytes=self.cumulative_artifact_bytes,
                 )
-                if dist.is_initialized() and dist.get_world_size() > 1:
-                    dist.all_reduce(construction_failed, op=dist.ReduceOp.MAX)
-                if bool(construction_failed.item()):
-                    self._set_startup_unsupported(("optimizer_binding",))
+            except Exception:
+                failed = True
+        status = torch.tensor(int(failed), dtype=torch.int64, device=self.device)
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(status, op=dist.ReduceOp.MAX)
+        if bool(status.cpu().item()):
+            raise RuntimeError(
+                "Tier-0 artifact ownership/provenance setup failed globally"
+            )
+
+    def _startup_reservation(self) -> Tier0Reservation:
+        """Calculate and globally agree the complete peak before event allocation."""
+
+        max_extra = getattr(self.args, "diagnostic_max_extra_bytes", None)
+        max_extra_bytes = 2**63 - 1 if max_extra is None else int(max_extra)
+        num_layers = int(getattr(self.args, "num_layers", 1))
+        local_sequence = int(getattr(self.args, "seq_length", 1)) // max(
+            1,
+            int(getattr(self.args, "context_parallel_size", 1)),
+        )
+        owner_elements = 0
+        distributed_optimizer = _distributed_optimizer(self.optimizer)
+        if self.capability.supported and distributed_optimizer is not None:
+            owner_elements = sum(
+                shard.main_shard.numel()
+                for shard in distributed_optimizer.iter_model_main_param_shards()
+            )
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        requested = tier0_reservation_bytes(
+            num_layers=num_layers,
+            num_microbatches=self._startup_num_microbatches,
+            micro_batch_size=int(getattr(self.args, "micro_batch_size", 1)),
+            local_sequence_length=local_sequence,
+            owner_elements=owner_elements,
+            world_size=world_size,
+        )
+
+        locally_accepted = requested <= max_extra_bytes
+        if self.device.type == "cuda":
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+                reserved = torch.cuda.memory_reserved(self.device)
+                allocated = torch.cuda.memory_allocated(self.device)
+                reusable = max(0, reserved - allocated)
+                driver_need = max(0, requested - reusable)
+                locally_accepted = locally_accepted and driver_need <= free_bytes
+                locally_accepted = locally_accepted and (
+                    reserved + driver_need <= int(total_bytes * 0.90)
+                )
+            except Exception:
+                locally_accepted = False
+
+        control = torch.tensor(
+            [requested, max_extra_bytes, int(locally_accepted)],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            maximum = control.clone()
+            minimum = control.clone()
+            dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+            dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+            maximum_host = maximum.cpu().tolist()
+            minimum_host = minimum.cpu().tolist()
+            globally_accepted = minimum_host[2] == 1
+            requested = int(maximum_host[0])
+            max_extra_bytes = int(minimum_host[1])
+        else:
+            globally_accepted = locally_accepted
+        if not globally_accepted:
+            raise RuntimeError(
+                "Tier-0 startup reservation rejected globally before event allocation "
+                f"(requested={requested}, max_extra={max_extra_bytes})"
+            )
+        return Tier0Reservation(requested, max_extra_bytes, True)
+
+    def _allocate_startup_state(self) -> None:
+        """Allocate all persistent/event buffers and globally agree measured success."""
+
+        before = (
+            torch.cuda.memory_allocated(self.device)
+            if self.device.type == "cuda"
+            else 0
+        )
+        allocation_failed = False
+        try:
+            self.control_accumulator = PackedSufficientStatistics(
+                _CONTROL_NAMES,
+                self.device,
+                descriptor_hash="tier0_control_v1",
+                reduction_binding=self.reduction_binding,
+            )
+            if self.capability.supported:
+                self._construct_update_registry()
+                self.update_accumulator = self.update_registry.new_accumulator(
+                    self.device
+                )
+                self._construct_optimizer_adapter()
+                assert self.adapter is not None
+                self.adapter.allocate_event_buffers()
+                self.capture = self._construct_capture_session()
+                self.capture_accumulator = self.capture.registry.new_accumulator(
+                    self.device
+                )
+            accumulators = tuple(
+                accumulator
+                for accumulator in (
+                    self.capture_accumulator,
+                    self.update_accumulator,
+                    self.control_accumulator,
+                )
+                if accumulator is not None
+            )
+            self._reduction_arenas = (
+                PackedSufficientStatistics.allocate_reduction_arenas(accumulators)
+            )
+            self._capture_scratch = torch.empty(
+                PackedSufficientStatistics.scratch_bytes_for_capacity(),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            local_length = int(getattr(self.args, "seq_length", 1)) // max(
+                1, int(getattr(self.args, "context_parallel_size", 1))
+            )
+            payload_elements = (
+                int(getattr(self.args, "micro_batch_size", 1)) * local_length + 1
+            )
+            self._sideband_payloads = {
+                index: torch.empty(
+                    payload_elements, dtype=torch.float32, device=self.device
+                )
+                for index in range(self._startup_num_microbatches)
+            }
+            self._local_sideband_payloads = {
+                index: torch.empty(
+                    payload_elements, dtype=torch.float32, device=self.device
+                )
+                for index in range(self._startup_num_microbatches)
+            }
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            self._rank_evidence = torch.empty(
+                (world_size, 9), dtype=torch.float64, device=self.device
+            )
+            self._local_rank_evidence = torch.empty(
+                9, dtype=torch.float64, device=self.device
+            )
+            sink_pack_elements = sum(
+                accumulator.sum_pack.numel()
+                + accumulator.max_pack.numel()
+                + accumulator.min_pack.numel()
+                for accumulator in (
+                    self.capture_accumulator,
+                    self.update_accumulator,
+                )
+                if accumulator is not None
+            )
+            self._sink_staging = torch.empty(
+                75 + world_size * 9 + sink_pack_elements,
+                dtype=torch.float64,
+                device=self.device,
+            )
+        except Exception:
+            allocation_failed = True
+
+        measured = (
+            max(0, torch.cuda.memory_allocated(self.device) - before)
+            if self.device.type == "cuda"
+            else 0
+        )
+        failed = torch.tensor(
+            int(allocation_failed or measured > self.reservation.requested_bytes),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if bool(failed.cpu().item()):
+            raise RuntimeError("Tier-0 startup allocation failed on at least one rank")
+        self.reservation = Tier0Reservation(
+            self.reservation.requested_bytes,
+            self.reservation.max_extra_bytes,
+            True,
+            measured,
+        )
 
     @property
     def armed(self) -> bool:
@@ -500,57 +829,16 @@ class Tier0Heartbeat:
             max_memory_fraction=0.90,
         )
 
-    def _set_startup_unsupported(self, reasons: tuple[str, ...]) -> None:
-        self.capability = Tier0Capability(
-            supported=False,
-            reasons=tuple(sorted(set((*self.capability.reasons, *reasons)))),
-            support_signature=self.capability.support_signature,
-        )
-        self.adapter = None
-        self.update_registry = None
-        self._update_bindings = {}
-        if self.unsupported_policy == "error":
-            raise RuntimeError(
-                "Tier-0 heartbeat unsupported on every rank: "
-                + ", ".join(self.capability.reasons)
-            )
+    def _construct_capture_session(self) -> Tier0CaptureSession:
+        """Construct dormant hooks against startup-preallocated event state."""
 
-    def prepare_attempt(self, *, num_microbatches: int) -> bool:
-        """Replace prior rerun state and arm capture when the next success is due."""
-
-        self.abort_attempt()
-        set_diagnostic_global_valid_tokens(None)
-        self._attempt_due = self.cadence.is_due(self.next_successful_update)
-        if not self._attempt_due:
-            return False
-        self._attempt_started = time.perf_counter()
-        self._expected_num_microbatches = num_microbatches
-        self.control_accumulator = PackedSufficientStatistics(
-            _CONTROL_NAMES,
-            self.device,
-            descriptor_hash="tier0_control_v1",
-            reduction_binding=self.reduction_binding,
-        )
-        if not self.capability.supported:
-            return True
-        assert self.update_registry is not None
-        self.update_accumulator = self.update_registry.new_accumulator(self.device)
-        return True
-
-    def install_capture(self) -> None:
-        """Install capture hooks immediately before the forward/backward schedule."""
-
-        if not self._attempt_due or not self.capability.supported:
-            return
-        if self.capture is not None:
-            raise RuntimeError("Tier-0 capture hooks are already installed")
         normalizer = CanonicalDgradNormalizer.from_grad_scaler(
             getattr(_distributed_optimizer(self.optimizer), "grad_scaler", None)
         )
         local_sequence_length = int(self.args.seq_length) // max(
             1, parallel_state.get_context_parallel_world_size()
         )
-        self.capture = Tier0CaptureSession(
+        return Tier0CaptureSession(
             self.model,
             num_layers=int(self.args.num_layers),
             topology=CaptureTopology.from_parallel_state(
@@ -563,8 +851,56 @@ class Tier0Heartbeat:
             dgrad_normalizer=normalizer,
             reduction_binding=self.reduction_binding,
         )
+
+    def prepare_attempt(self, *, num_microbatches: int) -> bool:
+        """Replace prior rerun state and arm capture when the next success is due."""
+
+        self.abort_attempt()
+        set_diagnostic_global_valid_tokens(None)
+        self._step_started = time.perf_counter()
+        self._attempt_due = self.cadence.is_due(self.next_successful_update)
+        if not self._attempt_due:
+            return False
+        self._attempt_started = time.perf_counter()
+        self._expected_num_microbatches = num_microbatches
+        if (
+            self.capability.supported
+            and num_microbatches > self._startup_num_microbatches
+        ):
+            raise RuntimeError("Tier-0 microbatch count exceeds the startup bound")
+        assert self.control_accumulator is not None
+        self.control_accumulator.reset_()
+        self._received_sidebands.clear()
+        assert self._local_rank_evidence is not None
+        self._local_rank_evidence.zero_()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        self._local_rank_evidence[0].fill_(rank)
+        if self.device.type == "cuda":
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+            del free_bytes
+            self._local_rank_evidence[3].fill_(total_bytes)
+            self._local_rank_evidence[4].fill_(torch.cuda.memory_allocated(self.device))
+            self._local_rank_evidence[5].fill_(torch.cuda.memory_reserved(self.device))
+        else:
+            self._local_rank_evidence[3].fill_(1)
+        self._local_rank_evidence[6].fill_(self.reservation.requested_bytes)
+        if not self.capability.supported:
+            return True
+        assert self.update_registry is not None
+        assert self.update_accumulator is not None
+        self.update_accumulator.reset_()
+        return True
+
+    def install_capture(self) -> None:
+        """Install capture hooks immediately before the forward/backward schedule."""
+
+        if not self._attempt_due or not self.capability.supported:
+            return
+        if self.capture is None or self.capture_accumulator is None:
+            raise RuntimeError("Tier-0 startup capture allocation is absent")
         self.capture.arm(
-            expected_microbatch_ids=tuple(range(self._expected_num_microbatches))
+            expected_microbatch_ids=tuple(range(self._expected_num_microbatches)),
+            accumulator=self.capture_accumulator,
         )
 
     def seal_capture(self) -> None:
@@ -572,10 +908,7 @@ class Tier0Heartbeat:
 
         if self.capture is None:
             return
-        try:
-            self.capture_accumulator = self.capture.seal()
-        finally:
-            self.capture.close()
+        self.capture_accumulator = self.capture.seal()
 
     def begin_microbatch(self, microbatch_id: int) -> None:
         """Begin one centrally identified schedule microbatch."""
@@ -584,8 +917,9 @@ class Tier0Heartbeat:
             return
         self.capture.begin_microbatch(microbatch_id)
         payload = self._sideband_payloads.get(microbatch_id)
-        if payload is not None and not parallel_state.is_pipeline_last_stage(
-            ignore_virtual=True
+        if (
+            microbatch_id in self._received_sidebands
+            and not parallel_state.is_pipeline_last_stage(ignore_virtual=True)
         ):
             staged = unpack_valid_token_mask_sideband(
                 payload,
@@ -617,6 +951,7 @@ class Tier0Heartbeat:
             micro_batch_size=int(self.args.micro_batch_size),
             sequence_length=local_length,
             device=self.device,
+            out=self._local_sideband_payloads[microbatch_id],
         )
         staged = unpack_valid_token_mask_sideband(
             local_payload,
@@ -626,7 +961,7 @@ class Tier0Heartbeat:
         )
         if (
             parallel_state.is_pipeline_last_stage(ignore_virtual=True)
-            and microbatch_id in self._sideband_payloads
+            and microbatch_id in self._received_sidebands
         ):
             received = self._sideband_payloads[microbatch_id]
             staged = StagedTokenMask(
@@ -654,17 +989,13 @@ class Tier0Heartbeat:
         local_length = int(self.args.seq_length) // max(
             1, parallel_state.get_context_parallel_world_size()
         )
-        payload = torch.empty(
-            int(self.args.micro_batch_size) * local_length + 1,
-            dtype=torch.float32,
-            device=self.device,
-        )
+        payload = self._sideband_payloads[microbatch_id]
         dist.recv(
             payload,
             src=parallel_state.get_pipeline_model_parallel_prev_rank(),
             group=parallel_state.get_pipeline_model_parallel_group(),
         )
-        self._sideband_payloads[microbatch_id] = payload
+        self._received_sidebands.add(microbatch_id)
 
     def forward_mask_sideband(self, microbatch_id: int) -> None:
         """Forward an ordered mask before intermediate-stage model compute."""
@@ -683,40 +1014,16 @@ class Tier0Heartbeat:
         )
 
     def begin_optimizer_event(self) -> SnapshotMemoryPreflight | None:
-        """Run exact HBM preflight, then snapshot immediately before the step."""
+        """Snapshot into buffers admitted and allocated during startup."""
 
         if not self._attempt_due or self.adapter is None:
             return None
-        if (
-            self.capture_accumulator is None
-            or self.update_accumulator is None
-            or self.control_accumulator is None
-        ):
+        if self.capture_accumulator is None or self.update_accumulator is None:
             raise RuntimeError(
-                "diagnostic capture must be sealed before optimizer preflight"
+                "diagnostic capture must be sealed before the optimizer snapshot"
             )
-        accumulators = (
-            self.capture_accumulator,
-            self.update_accumulator,
-            self.control_accumulator,
-        )
-        persistent = sum(
-            accumulator.sum_pack.nbytes
-            + accumulator.max_pack.nbytes
-            + accumulator.min_pack.nbytes
-            for accumulator in accumulators
-        )
-        mask_arena = self._retained_storage_bytes(
-            (*self.capture.retained_event_tensors, *self._sideband_payloads.values())
-        )
-        capture_scratch = self.capture_accumulator.maximum_scratch_bytes
-        reduction_arena = PackedSufficientStatistics.reduction_arena_bytes(accumulators)
-        additional = persistent + mask_arena + capture_scratch + reduction_arena
-        self.preflight = self.adapter.preflight_snapshot_memory(
-            additional_bytes=additional
-        )
-        self.adapter.begin_event(additional_bytes=additional)
-        return self.preflight
+        self.adapter.begin_event()
+        return None
 
     def finish_optimizer_event(
         self, update_successful: bool, *, iteration: int
@@ -726,6 +1033,9 @@ class Tier0Heartbeat:
         if not self._attempt_due:
             if update_successful:
                 self._commit_successful_update()
+                self._ordinary_step_latency_ms = (
+                    time.perf_counter() - self._step_started
+                ) * 1000.0
             return update_successful
         assert self.control_accumulator is not None
         if self.adapter is not None and self.update_accumulator is not None:
@@ -752,7 +1062,14 @@ class Tier0Heartbeat:
             else torch.zeros((), dtype=torch.int64, device=self.device)
         )
         self._add_control("control/adapter_status", adapter_status)
-        peak_hbm = self.preflight.requested_bytes if self.preflight is not None else 0
+        peak_hbm = (
+            max(
+                torch.cuda.max_memory_allocated(self.device),
+                torch.cuda.max_memory_reserved(self.device),
+            )
+            if self.device.type == "cuda"
+            else 0
+        )
         self._add_control("control/peak_hbm_bytes", peak_hbm)
 
         accumulators = tuple(
@@ -764,26 +1081,23 @@ class Tier0Heartbeat:
             )
             if accumulator is not None
         )
-        PackedSufficientStatistics.reduce_many_(accumulators)
-        global_update_success = not bool(
-            self.control_accumulator.maximum("control/update_failure").value.item()
-        )
+        PackedSufficientStatistics.reduce_many_(accumulators, self._reduction_arenas)
         latencies = self._gather_latency_ms()
-        if not global_update_success:
+        if not update_successful:
             self.abort_attempt()
             return False
 
         self._commit_successful_update()
-        payload, diagnostic_valid = self._derive_payload(latencies)
-        if not diagnostic_valid and self.unsupported_policy == "error":
-            self.abort_attempt()
-            raise RuntimeError(
-                "Tier-0 heartbeat event failed collectively after optimizer step"
-            )
-        self._emit(payload, iteration=iteration)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        diagnostic_valid = True
+        if rank == 0:
+            payload = self._derive_payload(latencies)
+            diagnostic_valid = self._emit(payload, iteration=iteration)
         self.event_id += 1
         self.args.diagnostic_event_id = self.event_id
         self.abort_attempt()
+        if rank == 0 and not diagnostic_valid and self.unsupported_policy == "error":
+            raise RuntimeError("Tier-0 heartbeat event failed after sink validation")
         return True
 
     def _add_control(self, name: str, value: int | bool | torch.Tensor) -> None:
@@ -792,26 +1106,35 @@ class Tier0Heartbeat:
         self.control_accumulator.add_masked_tensor(name, tensor)
 
     def _gather_latency_ms(self) -> torch.Tensor:
-        local = torch.tensor(
-            (time.perf_counter() - self._attempt_started) * 1000.0,
-            dtype=torch.float64,
-            device=self.device,
-        )
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        gathered = torch.empty(world_size, dtype=torch.float64, device=self.device)
-        if world_size == 1:
-            gathered.copy_(local.reshape(1))
+        assert self._local_rank_evidence is not None
+        assert self._rank_evidence is not None
+        elapsed = (time.perf_counter() - self._attempt_started) * 1000.0
+        self._local_rank_evidence[1].fill_(elapsed)
+        self._local_rank_evidence[2].fill_(self._ordinary_step_latency_ms or elapsed)
+        if self.device.type == "cuda":
+            self._local_rank_evidence[7].fill_(
+                torch.cuda.max_memory_allocated(self.device)
+            )
+            self._local_rank_evidence[8].fill_(
+                torch.cuda.max_memory_reserved(self.device)
+            )
         else:
-            dist.all_gather_into_tensor(gathered, local.reshape(1))
-        return gathered
+            self._local_rank_evidence[7].copy_(self._local_rank_evidence[4])
+            self._local_rank_evidence[8].copy_(self._local_rank_evidence[5])
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if world_size == 1:
+            self._rank_evidence[0].copy_(self._local_rank_evidence)
+        else:
+            dist.all_gather_into_tensor(
+                self._rank_evidence.reshape(-1), self._local_rank_evidence
+            )
+        return self._rank_evidence[:, 1]
 
     def _commit_successful_update(self) -> None:
         self.successful_updates += 1
         self.args.diagnostic_successful_updates = self.successful_updates
 
-    def _derive_payload(
-        self, latencies: torch.Tensor
-    ) -> tuple[dict[str, torch.Tensor], bool]:
+    def _derive_payload(self, latencies: torch.Tensor) -> dict[str, torch.Tensor]:
         nan = torch.full((), torch.nan, dtype=torch.float64, device=self.device)
         payload = {key: nan.clone() for key in TIER0_KEYS}
         if (
@@ -827,26 +1150,30 @@ class Tier0Heartbeat:
             capture_result = self.capture.derive_result(
                 self.capture_accumulator, global_valid_tokens=global_valid_tokens
             )
-            valid = bool(capture_result.valid.item()) and self._updates_valid()
+            valid = capture_result.valid & self._updates_valid()
             self.capture_result = capture_result
             self._derive_capture_metrics(payload, capture_result)
             self._derive_update_metrics(payload)
             self._derive_nonfinite_health(payload)
 
         assert self.control_accumulator is not None
-        control_failure = any(
-            self.control_accumulator.maximum(name).value.item() != 0
-            for name in (
-                "control/unsupported",
-                "control/preflight_failure",
-                "control/runtime_failure",
-                "control/adapter_status",
+        control_failure = torch.stack(
+            tuple(
+                self.control_accumulator.maximum(name).value != 0
+                for name in (
+                    "control/unsupported",
+                    "control/preflight_failure",
+                    "control/runtime_failure",
+                    "control/adapter_status",
+                )
             )
+        ).any()
+        valid = (
+            torch.as_tensor(valid, dtype=torch.bool, device=self.device)
+            & ~control_failure
         )
-        valid = valid and not control_failure
-        if not valid:
-            for key in TIER0_METRIC_KEYS:
-                payload[key] = nan.clone()
+        for key in TIER0_METRIC_KEYS:
+            payload[key] = torch.where(valid, payload[key], nan)
         payload["diag/v2/event/successful_update"] = torch.tensor(
             self.successful_updates, dtype=torch.float64, device=self.device
         )
@@ -854,8 +1181,12 @@ class Tier0Heartbeat:
             payload["diag/v2/event/valid_positions"] = (
                 capture_result.global_valid_tokens
             )
+        else:
+            payload["diag/v2/event/valid_positions"] = torch.zeros(
+                (), dtype=torch.float64, device=self.device
+            )
         payload["diag/v2/status/valid"] = torch.tensor(
-            float(valid), dtype=torch.float64, device=self.device
+            valid, dtype=torch.float64, device=self.device
         )
         payload["diag/v2/perf/peak_hbm_bytes_max_rank"] = (
             self.control_accumulator.maximum("control/peak_hbm_bytes").value
@@ -869,9 +1200,9 @@ class Tier0Heartbeat:
         payload["diag/v2/perf/latency_ms_median_rank"] = median
         payload["diag/v2/perf/latency_ms_max_rank"] = sorted_latency[-1]
         assert_payload_schema(payload)
-        return payload, valid
+        return payload
 
-    def _updates_valid(self) -> bool:
+    def _updates_valid(self) -> torch.Tensor:
         """Return reduced update-pack validity, allowing tied output absence."""
 
         assert self.update_registry is not None
@@ -899,7 +1230,7 @@ class Tier0Heartbeat:
             if tied_output and descriptor.family == MetricFamily.OUTPUT:
                 has_contributors = torch.ones_like(has_contributors)
             valid &= (errors == 0) & has_contributors
-        return bool(valid.item())
+        return valid
 
     def _capture_layer_values(
         self,
@@ -1082,31 +1413,200 @@ class Tier0Heartbeat:
             torch.full_like(nonfinite, torch.nan),
         )
 
-    def _emit(self, payload: Mapping[str, torch.Tensor], *, iteration: int) -> None:
+    def _emit(self, payload: Mapping[str, torch.Tensor], *, iteration: int) -> bool:
+        """Perform the sink's sole consolidated device-to-host transfer and log once."""
+
         assert_payload_schema(payload)
         rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank == 0 and self.wandb_log is not None:
-            values = torch.stack(
-                tuple(payload[key].to(dtype=torch.float64) for key in TIER0_KEYS)
-            )
-            host_values = values.cpu().tolist()
-            host_payload = dict(zip(TIER0_KEYS, host_values))
-            assert_payload_schema(host_payload)
+        if rank != 0:
+            raise RuntimeError("only the global Tier-0 sink may emit an event")
+        assert self._rank_evidence is not None
+        assert self._sink_staging is not None
+        for index, key in enumerate(TIER0_KEYS):
+            self._sink_staging[index].copy_(payload[key])
+        offset = len(TIER0_KEYS)
+        rank_elements = self._rank_evidence.numel()
+        self._sink_staging[offset : offset + rank_elements].copy_(
+            self._rank_evidence.reshape(-1)
+        )
+        offset += rank_elements
+        pack_ranges: list[tuple[PackedSufficientStatistics, int, int]] = []
+        for accumulator in (self.capture_accumulator, self.update_accumulator):
+            if accumulator is None:
+                continue
+            start = offset
+            for tensor in (
+                accumulator.sum_pack,
+                accumulator.max_pack,
+                accumulator.min_pack,
+            ):
+                end = offset + tensor.numel()
+                self._sink_staging[offset:end].copy_(tensor)
+                offset = end
+            pack_ranges.append((accumulator, start, offset))
+        host_combined = self._sink_staging.cpu().tolist()
+        host_values = host_combined[: len(TIER0_KEYS)]
+        rank_values = host_combined[len(TIER0_KEYS) : len(TIER0_KEYS) + rank_elements]
+        rank_evidence = [
+            rank_values[offset : offset + 9] for offset in range(0, len(rank_values), 9)
+        ]
+        host_payload: dict[str, float | int] = dict(zip(TIER0_KEYS, host_values))
+        for key in (
+            "diag/v2/event/successful_update",
+            "diag/v2/event/valid_positions",
+            "diag/v2/status/valid",
+            "diag/v2/perf/peak_hbm_bytes_max_rank",
+        ):
+            host_payload[key] = int(host_payload[key])
+        assert_payload_schema(host_payload)
+        host_packs: dict[str, dict[str, Sequence[Any]]] = {}
+        for accumulator, start, end in pack_ranges:
+            packed = host_combined[start:end]
+            sum_count = accumulator.sum_pack.numel()
+            max_count = accumulator.max_pack.numel()
+            host_packs[accumulator.descriptor_hash] = {
+                "names": accumulator.slot_names,
+                "sum": tuple(packed[:sum_count]),
+                "max": tuple(packed[sum_count : sum_count + max_count]),
+                "min": tuple(packed[sum_count + max_count :]),
+            }
+        if self.wandb_log is not None:
             self.wandb_log(host_payload, step=iteration + 1)
+        if self.artifact_writer is not None:
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            tp = int(getattr(self.args, "tensor_model_parallel_size", 1))
+            pp = int(getattr(self.args, "pipeline_model_parallel_size", 1))
+            cp = int(getattr(self.args, "context_parallel_size", 1))
+            denominator = tp * pp * cp
+            if world_size % denominator:
+                raise RuntimeError("Tier-0 topology does not divide world size")
+            topology = {
+                "dp": world_size // denominator,
+                "tp": tp,
+                "pp": pp,
+                "cp": cp,
+                "ep": 1,
+                "vpp": 1,
+                "num_layers": int(self.args.num_layers),
+            }
+            _, artifact_bytes = self.artifact_writer.write(
+                event_id=self.event_id + 1,
+                successful_update=self.successful_updates,
+                consumed_tokens=int(getattr(self.args, "consumed_train_samples", 0))
+                * int(getattr(self.args, "seq_length", 1)),
+                valid_positions=int(host_payload["diag/v2/event/valid_positions"]),
+                valid=host_payload["diag/v2/status/valid"] == 1,
+                topology=topology,
+                rank_evidence=rank_evidence,
+                capability_hash=capability_sha256_file(static_capability_path()),
+                schema_hash=diagnostic_schema_hash(),
+                layer_evidence=self._host_layer_evidence(host_packs),
+            )
+            self.cumulative_artifact_bytes += artifact_bytes
+            self.args.diagnostic_cumulative_artifact_bytes = (
+                self.cumulative_artifact_bytes
+            )
         if self.tensorboard_writer is not None:
-            assert_payload_schema(payload)
             for key in (*TIER0_METRIC_KEYS, *TIER0_METADATA_KEYS):
-                self.tensorboard_writer.add_scalar(key, payload[key], iteration + 1)
+                self.tensorboard_writer.add_scalar(
+                    key, host_payload[key], iteration + 1
+                )
+        return host_payload["diag/v2/status/valid"] == 1
 
-    @staticmethod
-    def _retained_storage_bytes(tensors: Sequence[torch.Tensor]) -> int:
-        """Count unique live tensor storages exactly once."""
+    def _host_layer_evidence(
+        self, host_packs: Mapping[str, Mapping[str, Sequence[Any]]]
+    ) -> dict[tuple[int, str, str], dict[str, float | int]]:
+        """Derive O(layers) artifact rows from the consolidated sink transfer."""
 
-        storages: dict[tuple[torch.device, int], int] = {}
-        for tensor in tensors:
-            storage = tensor.untyped_storage()
-            storages[(tensor.device, storage.data_ptr())] = storage.nbytes()
-        return sum(storages.values())
+        if self.capture_accumulator is None or self.update_accumulator is None:
+            raise RuntimeError(
+                "valid Tier-0 artifact requires capture and update packs"
+            )
+        capture = host_packs[self.capture_accumulator.descriptor_hash]
+        update = host_packs[self.update_accumulator.descriptor_hash]
+
+        def fields(
+            pack: Mapping[str, Sequence[Any]], name: str
+        ) -> tuple[list[float], float, float]:
+            index = pack["names"].index(name)
+            values = [
+                float(value) for value in pack["sum"][index * 11 : (index + 1) * 11]
+            ]
+            return values, float(pack["max"][index]), float(pack["min"][index])
+
+        def row(
+            pack: Mapping[str, Sequence[Any]],
+            name: str,
+            metric: str,
+        ) -> dict[str, float | int]:
+            values, maximum, minimum = fields(pack, name)
+            count = values[1]
+            if metric in ("activation_rms", "dgrad_rms"):
+                numerator, denominator = values[2], count
+                value = (
+                    math.sqrt(numerator / denominator) if denominator > 0 else math.nan
+                )
+            elif metric == "activation_max_abs":
+                numerator, denominator = values[2], count
+                value = max(abs(maximum), abs(minimum))
+            elif metric == "update_relative_rms":
+                numerator, denominator = values[4], values[5]
+                value = (
+                    math.sqrt(numerator / denominator) if denominator > 0 else math.nan
+                )
+            elif metric == "retention":
+                numerator, denominator = values[4], values[2]
+                value = (
+                    math.sqrt(numerator / denominator) if denominator > 0 else math.nan
+                )
+            else:
+                raise AssertionError(f"unknown Tier-0 layer metric {metric}")
+            valid = (
+                count > 0
+                and denominator > 0
+                and values[7] == 0
+                and values[8] == 0
+                and values[9] == 0
+                and values[10] == 0
+                and math.isfinite(value)
+            )
+            return {
+                "value": value,
+                "valid": int(valid),
+                "count": int(count),
+                "sum": values[0],
+                "sum_sq": numerator,
+                "denominator_sum_sq": denominator,
+                "zero_count": int(values[6]),
+                "nonfinite_count": int(values[7]),
+            }
+
+        evidence: dict[tuple[int, str, str], dict[str, float | int]] = {}
+        for layer in range(int(self.args.num_layers)):
+            for family, metric, observation in (
+                ("residual", "activation_rms", "activation"),
+                ("residual", "activation_max_abs", "activation"),
+                ("residual", "dgrad_rms", "dgrad"),
+            ):
+                evidence[(layer, family, metric)] = row(
+                    capture, f"{observation}/{family}/layer_{layer}", metric
+                )
+            evidence[(layer, "norm", "update_relative_rms")] = row(
+                update, f"update/norm/layer_{layer}", "update_relative_rms"
+            )
+            for family in ("qkv", "attn_out", "fc1", "fc2"):
+                for metric, observation in (
+                    ("activation_max_abs", "activation"),
+                    ("dgrad_rms", "dgrad"),
+                ):
+                    evidence[(layer, family, metric)] = row(
+                        capture, f"{observation}/{family}/layer_{layer}", metric
+                    )
+                for metric in ("update_relative_rms", "retention"):
+                    evidence[(layer, family, metric)] = row(
+                        update, f"update/{family}/layer_{layer}", metric
+                    )
+        return evidence
 
     def abort_attempt(self) -> None:
         """Release all attempt-local state without changing cadence counters."""
@@ -1114,13 +1614,9 @@ class Tier0Heartbeat:
         if self.adapter is not None:
             self.adapter.abort_event()
         if self.capture is not None:
-            self.capture.close()
-        self.capture = None
-        self.capture_accumulator = None
+            self.capture.abort()
         self.capture_result = None
-        self.update_accumulator = None
-        self.control_accumulator = None
         self.preflight = None
-        self._sideband_payloads.clear()
+        self._received_sidebands.clear()
         self._attempt_due = False
         self._expected_num_microbatches = 0

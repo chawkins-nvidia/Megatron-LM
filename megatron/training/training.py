@@ -3170,8 +3170,11 @@ def train(
             args,
             model,
             optimizer,
+            forward_step_func,
             wandb_log=getattr(diagnostic_wandb_writer, "log", None),
+            wandb_writer=diagnostic_wandb_writer,
             tensorboard_writer=get_tensorboard_writer(),
+            num_microbatches=get_num_microbatches(),
         )
     config.diagnostic_heartbeat = diagnostic_heartbeat
 
@@ -3962,10 +3965,10 @@ def evaluate_and_print_results(
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
                     )
-                if wandb_writer and is_last_rank():
-                    wandb_writer.log(
-                        {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
-                    )
+            if wandb_writer:
+                wandb_writer.log(
+                    {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
+                )
 
         if process_non_loss_data_func is not None and writer and is_last_rank():
             process_non_loss_data_func(collected_non_loss_data, iteration, writer)

@@ -173,6 +173,7 @@ def pack_valid_token_mask_sideband(
     micro_batch_size: int,
     sequence_length: int,
     device: torch.device | str,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pack one fixed-shape mask/status payload without communication.
 
@@ -192,15 +193,27 @@ def pack_valid_token_mask_sideband(
 
     target_device = torch.device(device)
     num_mask_values = micro_batch_size * sequence_length
-    payload = torch.zeros(num_mask_values + 1, dtype=torch.float32, device=target_device)
-    staged = stage_valid_token_mask(
-        loss_mask,
-        micro_batch_size=micro_batch_size,
-        sequence_length=sequence_length,
-        device=target_device,
-    )
-    payload[:-1].copy_(staged.values.reshape(-1))
-    payload[-1].copy_(staged.valid.to(dtype=payload.dtype))
+    payload = out
+    if (
+        payload is None
+        or payload.device != target_device
+        or payload.dtype != torch.float32
+        or payload.numel() != num_mask_values + 1
+    ):
+        if out is not None:
+            raise ValueError("preallocated mask payload has the wrong layout")
+        payload = torch.empty(num_mask_values + 1, dtype=torch.float32, device=target_device)
+    payload.zero_()
+    if (
+        loss_mask is not None
+        and loss_mask.device == target_device
+        and not loss_mask.is_complex()
+        and tuple(loss_mask.shape) == (micro_batch_size, sequence_length)
+    ):
+        payload[:-1].view(sequence_length, micro_batch_size).copy_(
+            loss_mask.detach().transpose(0, 1)
+        )
+        payload[-1].fill_(1)
     return payload
 
 
@@ -444,7 +457,12 @@ class Tier0CaptureSession:
             tensors.extend((staged.values, staged.valid))
         return tuple(tensors)
 
-    def arm(self, *, expected_microbatch_ids: Sequence[int] | None = None) -> None:
+    def arm(
+        self,
+        *,
+        expected_microbatch_ids: Sequence[int] | None = None,
+        accumulator: PackedSufficientStatistics | None = None,
+    ) -> None:
         """Allocate neutral event packs and arm dormant hooks.
 
         Args:
@@ -455,7 +473,11 @@ class Tier0CaptureSession:
 
         if self._armed:
             raise RuntimeError("Tier-0 capture session is already armed")
-        self._accumulator = self.registry.new_accumulator(self.device)
+        self._accumulator = (
+            self.registry.new_accumulator(self.device)
+            if accumulator is None
+            else accumulator.reset_()
+        )
         self._begun.clear()
         self._ended.clear()
         self._masks.clear()
@@ -637,6 +659,18 @@ class Tier0CaptureSession:
             handle.remove()
         self._hook_handles = ()
         self._armed = False
+        set_diagnostic_microbatch_id(None)
+
+    def abort(self) -> None:
+        """Disarm one attempt while retaining startup-allocated hooks and buffers."""
+
+        self._armed = False
+        self._begun.clear()
+        self._ended.clear()
+        self._masks.clear()
+        self._activation_seen.clear()
+        self._dgrad_registered.clear()
+        self._dgrad_seen.clear()
         set_diagnostic_microbatch_id(None)
 
     def _build_descriptors(

@@ -75,10 +75,12 @@ def test_cp_token_shards_pool_masks_and_canonical_dgrad_once(gloo_world: None) -
     expected_activation_rms = selected_residuals.square().mean().sqrt().double()
     torch.testing.assert_close(result.global_valid_tokens, torch.tensor(4.0).double())
     torch.testing.assert_close(
-        result.accumulator.rms("activation/residual/layer_0").value, expected_activation_rms
+        result.accumulator.rms("activation/residual/layer_0").value,
+        expected_activation_rms,
     )
     torch.testing.assert_close(
-        result.accumulator.rms("dgrad/residual/layer_0").value, torch.tensor(0.25).double()
+        result.accumulator.rms("dgrad/residual/layer_0").value,
+        torch.tensor(0.25).double(),
     )
     assert result.status == Tier0Status.OK
     session.close()
@@ -94,8 +96,13 @@ def test_fixed_shape_pp_mask_sideband_preserves_order_without_broadcast(
 
     rank = dist.get_rank()
     sequence_length = 8
+    source_phases: list[tuple[str, int]] = []
+    receiver_phases: list[tuple[str, int]] = []
     for microbatch_id in range(8):
         if rank == 0:
+            source_phases.append(
+                ("warmup" if microbatch_id == 0 else "steady", microbatch_id)
+            )
             mask = torch.full(
                 (micro_batch_size, sequence_length), float(microbatch_id + 1)
             )
@@ -107,6 +114,9 @@ def test_fixed_shape_pp_mask_sideband_preserves_order_without_broadcast(
             )
             dist.send(payload, dst=1)
         else:
+            receiver_phases.append(
+                ("pre-steady" if microbatch_id == 0 else "steady-next", microbatch_id)
+            )
             payload = torch.empty(micro_batch_size * sequence_length + 1)
             dist.recv(payload, src=0)
             staged = unpack_valid_token_mask_sideband(
@@ -122,6 +132,18 @@ def test_fixed_shape_pp_mask_sideband_preserves_order_without_broadcast(
                     (sequence_length, micro_batch_size, 1), float(microbatch_id + 1)
                 ),
             )
+    if rank == 0:
+        assert source_phases == [
+            ("warmup", 0),
+            *[("steady", index) for index in range(1, 8)],
+        ]
+    else:
+        assert receiver_phases == [
+            ("pre-steady", 0),
+            *[("steady-next", index) for index in range(1, 8)],
+        ]
+    # The PP=2 cooldown contains only backward traffic; it must not add masks.
+    assert len(source_phases if rank == 0 else receiver_phases) == 8
     dist.barrier()
 
 
@@ -181,7 +203,9 @@ def test_real_mcore_tp_sp_module_shapes_use_typed_token_layout(
             parameter.fill_(0.03125)
         layer.train()
 
-        topology = CaptureTopology.from_parallel_state(sequence_parallel=sequence_parallel)
+        topology = CaptureTopology.from_parallel_state(
+            sequence_parallel=sequence_parallel
+        )
         session = Tier0CaptureSession(
             layer,
             num_layers=1,
@@ -193,11 +217,15 @@ def test_real_mcore_tp_sp_module_shapes_use_typed_token_layout(
             dgrad_normalizer=CanonicalDgradNormalizer(),
             reduction_binding=ReductionBinding.flat_world(None),
         )
-        layouts = {target.family.value: target.token_layout for target in session.targets}
+        layouts = {
+            target.family.value: target.token_layout for target in session.targets
+        }
         assert layouts["qkv"] == TokenLayout.CP_LOCAL_SEQUENCE
         assert layouts["fc1"] == TokenLayout.CP_LOCAL_SEQUENCE
         expected_row_layout = (
-            TokenLayout.TP_SEQUENCE_SHARD if sequence_parallel else TokenLayout.CP_LOCAL_SEQUENCE
+            TokenLayout.TP_SEQUENCE_SHARD
+            if sequence_parallel
+            else TokenLayout.CP_LOCAL_SEQUENCE
         )
         assert layouts["attn_out"] == expected_row_layout
         assert layouts["fc2"] == expected_row_layout
@@ -222,7 +250,8 @@ def test_real_mcore_tp_sp_module_shapes_use_typed_token_layout(
             requires_grad=True,
         )
         attention_mask = torch.triu(
-            torch.ones(1, 1, sequence_length, sequence_length, dtype=torch.bool), diagonal=1
+            torch.ones(1, 1, sequence_length, sequence_length, dtype=torch.bool),
+            diagonal=1,
         )
         output = layer(hidden_states, attention_mask=attention_mask)[0]
         session.end_microbatch(0)
@@ -233,7 +262,11 @@ def test_real_mcore_tp_sp_module_shapes_use_typed_token_layout(
             if sequence_parallel
             else full_mask
         )
-        assert tuple(output.shape) == (local_input_sequence, micro_batch_size, hidden_size)
+        assert tuple(output.shape) == (
+            local_input_sequence,
+            micro_batch_size,
+            hidden_size,
+        )
         loss = (output * row_mask).sum()
         loss.backward()
         result = session.finalize()

@@ -279,6 +279,10 @@ def test_load_checkpoint(
         optimizer = MockState({"optimizer": "optimizer_state"})
         opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
         num_floating_point_operations_so_far = 456
+        args.diagnostic_heartbeat = True
+        args.diagnostic_successful_updates = 123
+        args.diagnostic_event_id = 9
+        args.diagnostic_cumulative_artifact_bytes = 4567
 
         save_checkpoint(
             iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
@@ -288,6 +292,9 @@ def test_load_checkpoint(
         new_model = MockModel(config)
         new_optimizer = MockState({"optimizer": "dummy1"})
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
+        args.diagnostic_successful_updates = 0
+        args.diagnostic_event_id = 0
+        args.diagnostic_cumulative_artifact_bytes = 0
 
         # Load checkpoint
         loaded_iter, loaded_flops = load_checkpoint(
@@ -296,6 +303,9 @@ def test_load_checkpoint(
 
         assert loaded_iter == iteration
         assert loaded_flops == num_floating_point_operations_so_far
+        assert args.diagnostic_successful_updates == 123
+        assert args.diagnostic_event_id == 9
+        assert args.diagnostic_cumulative_artifact_bytes == 4567
 
         for k in model.state_dict():
             assert torch.equal(model.state_dict()[k], new_model.state_dict()[k])
