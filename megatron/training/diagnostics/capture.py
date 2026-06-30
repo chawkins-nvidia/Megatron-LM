@@ -435,6 +435,15 @@ class Tier0CaptureSession:
 
         return self._armed
 
+    @property
+    def retained_event_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return tensors retained until event reduction for exact preflight accounting."""
+
+        tensors = [self._runtime_status]
+        for staged in self._masks.values():
+            tensors.extend((staged.values, staged.valid))
+        return tuple(tensors)
+
     def arm(self, *, expected_microbatch_ids: Sequence[int] | None = None) -> None:
         """Allocate neutral event packs and arm dormant hooks.
 
@@ -541,6 +550,13 @@ class Tier0CaptureSession:
     def finalize(self) -> Tier0CaptureResult:
         """Reduce fixed packs, canonicalize dgrad, and derive event validity."""
 
+        accumulator = self.seal()
+        accumulator.reduce_()
+        return self.derive_result(accumulator)
+
+    def seal(self) -> PackedSufficientStatistics:
+        """Finish local capture without launching diagnostic collectives."""
+
         if not self._armed:
             raise RuntimeError("Tier-0 capture session is not armed")
         accumulator = self._require_accumulator()
@@ -548,9 +564,27 @@ class Tier0CaptureSession:
             self._set_runtime_error()
         self._mark_incomplete_observations(accumulator)
         self.registry.add_masked_tensor(accumulator, _EVENT_RUNTIME_STATUS, self._runtime_status)
-        accumulator.reduce_()
+        self._armed = False
+        set_diagnostic_microbatch_id(None)
+        return accumulator
+
+    def derive_result(
+        self,
+        accumulator: PackedSufficientStatistics,
+        *,
+        global_valid_tokens: torch.Tensor | None = None,
+    ) -> Tier0CaptureResult:
+        """Canonicalize and validate capture packs after combined reduction."""
+
+        if not accumulator.reduced:
+            raise RuntimeError("Tier-0 capture derivation requires reduced packs")
         token_slots = accumulator.slots(_EVENT_VALID_TOKENS)
-        global_valid_tokens = accumulator.sum_pack[token_slots.sum]
+        packed_valid_tokens = accumulator.sum_pack[token_slots.sum]
+        global_valid_tokens = (
+            packed_valid_tokens
+            if global_valid_tokens is None
+            else global_valid_tokens.to(dtype=torch.float64, device=packed_valid_tokens.device)
+        )
         self.registry.apply_normalizations_(accumulator, global_valid_tokens=global_valid_tokens)
 
         runtime_slots = accumulator.slots(_EVENT_RUNTIME_STATUS)
@@ -589,8 +623,6 @@ class Tier0CaptureSession:
                 torch.full_like(runtime_status, Tier0Status.OK),
             ),
         )
-        self._armed = False
-        set_diagnostic_microbatch_id(None)
         return Tier0CaptureResult(
             accumulator=accumulator,
             global_valid_tokens=global_valid_tokens,

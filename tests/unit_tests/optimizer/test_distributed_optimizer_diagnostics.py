@@ -1055,6 +1055,44 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
     )
 
 
+def test_preflight_uses_exact_reusable_driver_and_projected_reserved_boundaries() -> None:
+    optimizer, parameters = _fake_optimizer()
+    accepted, _ = _adapter(
+        optimizer,
+        parameters,
+        max_extra_bytes=446,
+        memory_state_provider=lambda device: DeviceMemoryState(600, 800, 246, 1200),
+    )
+    preflight = accepted.preflight_snapshot_memory(additional_bytes=100)
+    assert preflight.requested_bytes == 446
+    assert preflight.reusable_bytes == 200
+    assert preflight.driver_need_bytes == 246
+    assert preflight.projected_reserved_bytes == 1046
+    assert preflight.accepted
+
+    no_driver_headroom, _ = _adapter(
+        optimizer,
+        parameters,
+        max_extra_bytes=446,
+        memory_state_provider=lambda device: DeviceMemoryState(600, 800, 245, 1200),
+    )
+    assert (
+        no_driver_headroom.preflight_snapshot_memory(additional_bytes=100).reason
+        == SnapshotMemoryReason.DEVICE_HEADROOM
+    )
+
+    projected_over_90_percent, _ = _adapter(
+        optimizer,
+        parameters,
+        max_extra_bytes=446,
+        memory_state_provider=lambda device: DeviceMemoryState(640, 840, 300, 1200),
+    )
+    projected = projected_over_90_percent.preflight_snapshot_memory(additional_bytes=100)
+    assert projected.driver_need_bytes == 246
+    assert projected.projected_reserved_bytes == 1086
+    assert projected.reason == SnapshotMemoryReason.DEVICE_MEMORY_FRACTION
+
+
 @pytest.mark.parametrize(
     ("failure_dtype", "expected_status"),
     (

@@ -138,6 +138,10 @@ class SnapshotMemoryPreflight:
     max_extra_bytes: int
     max_memory_fraction: float
     available_bytes: int | None
+    requested_bytes: int
+    reusable_bytes: int | None
+    driver_need_bytes: int | None
+    projected_reserved_bytes: int | None
     accepted: bool
     reason: SnapshotMemoryReason
 
@@ -593,10 +597,16 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             finish_chunk_elements=chunk_elements,
         )
 
-    def preflight_snapshot_memory(self) -> SnapshotMemoryPreflight:
-        """Evaluate the true event peak through finish against HBM limits."""
+    def preflight_snapshot_memory(
+        self, *, additional_bytes: int = 0
+    ) -> SnapshotMemoryPreflight:
+        """Evaluate the complete event peak against allocator and driver limits."""
+
+        if additional_bytes < 0:
+            raise ValueError("additional diagnostic bytes must be nonnegative")
 
         estimate = self.estimate_snapshot_memory()
+        requested_bytes = estimate.total_bytes + additional_bytes
         device = (
             self._bound_shards[0].main_shard.device if self._bound_shards else self._status.device
         )
@@ -615,40 +625,52 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
 
         reason = SnapshotMemoryReason.NONE
         available_bytes: int | None = None
+        reusable_bytes: int | None = None
+        driver_need_bytes: int | None = None
+        projected_reserved_bytes: int | None = None
         if memory_query_failed:
             reason = SnapshotMemoryReason.ALLOCATION_FAILED
-        elif estimate.total_bytes > self.diagnostic_max_extra_bytes:
+        elif requested_bytes > self.diagnostic_max_extra_bytes:
             reason = SnapshotMemoryReason.MAX_EXTRA_BYTES
         elif memory is not None:
-            available_bytes = memory.free_bytes + max(
-                0, memory.reserved_bytes - memory.allocated_bytes
-            )
+            reusable_bytes = max(0, memory.reserved_bytes - memory.allocated_bytes)
+            driver_need_bytes = max(0, requested_bytes - reusable_bytes)
+            projected_reserved_bytes = memory.reserved_bytes + driver_need_bytes
+            available_bytes = memory.free_bytes + reusable_bytes
             fraction_limit = int(memory.total_bytes * self.max_memory_fraction)
-            if memory.allocated_bytes + estimate.total_bytes > fraction_limit:
-                reason = SnapshotMemoryReason.DEVICE_MEMORY_FRACTION
-            elif estimate.total_bytes > available_bytes:
+            if driver_need_bytes > memory.free_bytes:
                 reason = SnapshotMemoryReason.DEVICE_HEADROOM
+            elif projected_reserved_bytes > fraction_limit:
+                reason = SnapshotMemoryReason.DEVICE_MEMORY_FRACTION
         return SnapshotMemoryPreflight(
             estimate=estimate,
             memory=memory,
             max_extra_bytes=self.diagnostic_max_extra_bytes,
             max_memory_fraction=self.max_memory_fraction,
             available_bytes=available_bytes,
+            requested_bytes=requested_bytes,
+            reusable_bytes=reusable_bytes,
+            driver_need_bytes=driver_need_bytes,
+            projected_reserved_bytes=projected_reserved_bytes,
             accepted=reason == SnapshotMemoryReason.NONE,
             reason=reason,
         )
 
-    def begin_event(self) -> SnapshotMemoryMeasurement | None:
+    def begin_event(
+        self, *, additional_bytes: int = 0
+    ) -> SnapshotMemoryMeasurement | None:
         """Capture pre-state or expose a typed local status with no retained partial state."""
 
         try:
-            return self._begin_event()
+            return self._begin_event(additional_bytes=additional_bytes)
         except Exception:
             self.abort_event()
             self._set_status(DistributedOptimizerEventStatus.BEGIN_UNEXPECTED_FAILED)
             return None
 
-    def _begin_event(self) -> SnapshotMemoryMeasurement | None:
+    def _begin_event(
+        self, *, additional_bytes: int = 0
+    ) -> SnapshotMemoryMeasurement | None:
         """Implement begin under the nonthrowing public lifecycle boundary."""
 
         if self._snapshot is not None:
@@ -680,7 +702,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         if len(devices) != 1:
             self._set_status(DistributedOptimizerEventStatus.BEGIN_DEVICE_MISMATCH)
             return None
-        preflight = self.preflight_snapshot_memory()
+        preflight = self.preflight_snapshot_memory(additional_bytes=additional_bytes)
         if not preflight.accepted:
             self._last_memory_reason = preflight.reason
             self._set_status(DistributedOptimizerEventStatus.BEGIN_PREFLIGHT_REJECTED)

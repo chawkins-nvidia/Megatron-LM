@@ -379,7 +379,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
     """
     kwargs = {}
     for f in fields(cls):
-        if hasattr(args, f.name):
+        if f.init and hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
 
     if return_instance:

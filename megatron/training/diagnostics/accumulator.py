@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Iterator, Protocol
+from typing import Iterable, Iterator, Protocol
 
 import torch
 import torch.distributed as dist
@@ -931,6 +931,59 @@ class PackedSufficientStatistics:
         reduce_call(self.min_pack, op=dist.ReduceOp.MIN, group=binding.group)
         self._reduced = True
         return self
+
+    @staticmethod
+    def reduction_arena_bytes(
+        accumulators: Iterable["PackedSufficientStatistics"],
+    ) -> int:
+        """Return exact temporary bytes used by :meth:`reduce_many_`."""
+
+        return sum(
+            accumulator.sum_pack.nbytes
+            + accumulator.max_pack.nbytes
+            + accumulator.min_pack.nbytes
+            for accumulator in accumulators
+        )
+
+    @staticmethod
+    def reduce_many_(
+        accumulators: Iterable["PackedSufficientStatistics"],
+    ) -> tuple["PackedSufficientStatistics", ...]:
+        """Reduce multiple registries with one packed SUM/MAX/MIN sequence."""
+
+        packed = tuple(accumulators)
+        if not packed:
+            raise ValueError("packed event reduction requires at least one accumulator")
+        first = packed[0]
+        for accumulator in packed:
+            accumulator._ensure_accumulating()
+            if accumulator.sum_pack.device != first.sum_pack.device:
+                raise ValueError("packed event accumulators must share one device")
+            if accumulator.reduction_binding is not first.reduction_binding:
+                raise ValueError(
+                    "packed event accumulators must share one reduction binding"
+                )
+
+        sum_arena = torch.cat(tuple(accumulator.sum_pack for accumulator in packed))
+        max_arena = torch.cat(tuple(accumulator.max_pack for accumulator in packed))
+        min_arena = torch.cat(tuple(accumulator.min_pack for accumulator in packed))
+        binding = first.reduction_binding
+        reduce_call = _torch_all_reduce if binding.reducer is None else binding.reducer
+        reduce_call(sum_arena, op=dist.ReduceOp.SUM, group=binding.group)
+        reduce_call(max_arena, op=dist.ReduceOp.MAX, group=binding.group)
+        reduce_call(min_arena, op=dist.ReduceOp.MIN, group=binding.group)
+
+        sum_offset = max_offset = min_offset = 0
+        for accumulator in packed:
+            next_sum = sum_offset + accumulator.sum_pack.numel()
+            next_max = max_offset + accumulator.max_pack.numel()
+            next_min = min_offset + accumulator.min_pack.numel()
+            accumulator.sum_pack.copy_(sum_arena[sum_offset:next_sum])
+            accumulator.max_pack.copy_(max_arena[max_offset:next_max])
+            accumulator.min_pack.copy_(min_arena[min_offset:next_min])
+            accumulator._reduced = True
+            sum_offset, max_offset, min_offset = next_sum, next_max, next_min
+        return packed
 
     def finalize_local_(self) -> "PackedSufficientStatistics":
         """Finish deliberate single-contributor accumulation without collectives.

@@ -73,7 +73,9 @@ except Exception:
 stimer = StragglerDetector()
 
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+def get_batch(
+    data_iterator, vp_stage: Optional[int] = None, *, diagnostic_loss_mask: bool = False
+):
     """Generate a batch.
 
     Packed sequence support (SFT / ``--sft`` flag):
@@ -134,7 +136,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
         data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        diagnostic_loss_mask=diagnostic_loss_mask,
         )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
@@ -255,7 +258,13 @@ def loss_func(
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
+def forward_step(
+    data_iterator,
+    model: GPTModel,
+    return_schedule_plan: bool = False,
+    *,
+    diagnostic_heartbeat=None,
+):
     """Forward training step.
 
     Args:
@@ -271,8 +280,28 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(
+            data_iterator,
+            vp_stage,
+            diagnostic_loss_mask=bool(
+                diagnostic_heartbeat is not None and diagnostic_heartbeat.armed
+            ),
+        )
     timers('batch-generator').stop()
+
+    if (
+        diagnostic_heartbeat is not None
+        and diagnostic_heartbeat.armed
+        and is_first_or_last_pipeline_stage(vp_stage)
+    ):
+        from megatron.core.diagnostics import get_diagnostic_microbatch_id
+
+        microbatch_id = get_diagnostic_microbatch_id()
+        if microbatch_id is None:
+            raise RuntimeError(
+                "armed Tier-0 heartbeat requires schedule microbatch identity"
+            )
+        diagnostic_heartbeat.register_local_loss_mask(microbatch_id, loss_mask)
 
     with stimer:
         if return_schedule_plan:

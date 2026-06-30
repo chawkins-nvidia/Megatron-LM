@@ -521,7 +521,9 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
+def get_batch_on_this_tp_rank(
+    data_iterator, mtp_on_this_rank: bool = False, diagnostic_loss_mask: bool = False
+):
 
     args = get_args()
 
@@ -595,6 +597,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
+            if diagnostic_loss_mask:
+                _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
@@ -688,9 +692,12 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         elif mpu.is_pipeline_first_stage():
             labels = None
-            loss_mask = None
+            if not diagnostic_loss_mask:
+                loss_mask = None
 
             _broadcast(tokens)
+            if diagnostic_loss_mask:
+                _broadcast(loss_mask)
             _broadcast(attention_mask)
             _broadcast(position_ids)
             cu_seqlens = _broadcast_cu_seqlens()

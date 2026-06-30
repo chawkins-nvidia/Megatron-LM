@@ -321,6 +321,41 @@ def forward_step_calc_loss(
     return output_tensor, num_tokens
 
 
+def _with_diagnostic_microbatch_identity(forward_impl):
+    """Set and reliably clear diagnostic identity around one schedule forward."""
+
+    def wrapped(*args, **kwargs):
+        config = kwargs["config"] if "config" in kwargs else args[6]
+        current_microbatch = kwargs.get(
+            "current_microbatch", args[11] if len(args) > 11 else None
+        )
+        if current_microbatch is None:
+            return forward_impl(*args, **kwargs)
+
+        from megatron.core.diagnostics import set_diagnostic_microbatch_id
+
+        heartbeat = getattr(config, "diagnostic_heartbeat", None)
+        heartbeat_begun = False
+        set_diagnostic_microbatch_id(current_microbatch)
+        try:
+            if heartbeat is not None:
+                heartbeat.begin_microbatch(current_microbatch)
+                heartbeat_begun = True
+            return forward_impl(*args, **kwargs)
+        finally:
+            try:
+                if heartbeat_begun:
+                    heartbeat.end_microbatch(current_microbatch)
+            finally:
+                set_diagnostic_microbatch_id(None)
+
+    wrapped.__name__ = forward_impl.__name__
+    wrapped.__doc__ = forward_impl.__doc__
+    wrapped.__wrapped__ = forward_impl
+    return wrapped
+
+
+@_with_diagnostic_microbatch_identity
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -2063,6 +2098,7 @@ def forward_backward_pipelining_without_interleaving(
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
+    diagnostic_heartbeat = getattr(config, "diagnostic_heartbeat", None)
     if config.overlap_p2p_comm:
         raise ValueError(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
@@ -2231,9 +2267,13 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        if diagnostic_heartbeat is not None:
+            diagnostic_heartbeat.receive_mask_sideband(i)
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
+        if diagnostic_heartbeat is not None:
+            diagnostic_heartbeat.forward_mask_sideband(i)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -2261,6 +2301,8 @@ def forward_backward_pipelining_without_interleaving(
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
+        if diagnostic_heartbeat is not None:
+            diagnostic_heartbeat.receive_mask_sideband(num_warmup_microbatches)
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
@@ -2268,6 +2310,9 @@ def forward_backward_pipelining_without_interleaving(
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
+        current_microbatch = i + num_warmup_microbatches
+        if diagnostic_heartbeat is not None:
+            diagnostic_heartbeat.forward_mask_sideband(current_microbatch)
 
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
@@ -2291,7 +2336,7 @@ def forward_backward_pipelining_without_interleaving(
             is_first_microbatch=check_first_val_step(
                 first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
             ),
-            current_microbatch=i + num_warmup_microbatches,
+            current_microbatch=current_microbatch,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
         total_num_tokens += num_tokens
@@ -2299,6 +2344,8 @@ def forward_backward_pipelining_without_interleaving(
         if forward_only:
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
+                if diagnostic_heartbeat is not None:
+                    diagnostic_heartbeat.receive_mask_sideband(current_microbatch + 1)
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
@@ -2333,6 +2380,8 @@ def forward_backward_pipelining_without_interleaving(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
             else:
+                if diagnostic_heartbeat is not None:
+                    diagnostic_heartbeat.receive_mask_sideband(current_microbatch + 1)
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )

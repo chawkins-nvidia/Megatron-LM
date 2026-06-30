@@ -553,6 +553,9 @@ def finalize_model_grads(
 
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+        from megatron.core.diagnostics import set_diagnostic_global_valid_tokens
+
+        set_diagnostic_global_valid_tokens(num_tokens)
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens

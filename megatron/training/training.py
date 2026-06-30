@@ -2033,7 +2033,7 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, diagnostic_heartbeat=None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -2058,6 +2058,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         (iteration + 1) % args.save_linearization_interval == 0
     )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        if diagnostic_heartbeat is not None:
+            diagnostic_heartbeat.prepare_attempt(num_microbatches=get_num_microbatches())
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2102,18 +2104,33 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save, args)
         if save_dead_neuron_in_this_iteration:
             enable_dead_neuron_logging(model, args.save)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
+        heartbeat_forward_step = (
+            functools.partial(forward_step_func, diagnostic_heartbeat=diagnostic_heartbeat)
+            if diagnostic_heartbeat is not None and diagnostic_heartbeat.capability.supported
+            else forward_step_func
         )
+        if diagnostic_heartbeat is not None:
+            diagnostic_heartbeat.install_capture()
+        try:
+            losses_reduced = forward_backward_func(
+                forward_step_func=heartbeat_forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+            )
+        except Exception:
+            if diagnostic_heartbeat is not None:
+                diagnostic_heartbeat.abort_attempt()
+            raise
+        finally:
+            if diagnostic_heartbeat is not None and diagnostic_heartbeat.armed:
+                diagnostic_heartbeat.seal_capture()
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2151,6 +2168,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
+        if diagnostic_heartbeat is not None:
+            diagnostic_heartbeat.abort_attempt()
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
 
     # Empty unused memory.
@@ -2181,7 +2200,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if diagnostic_heartbeat is not None:
+        diagnostic_heartbeat.begin_optimizer_event()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    # Freezing sub-models can mix successful and unsuccessful model-parallel ranks.
+    update_successful = logical_and_across_model_parallel_group(update_successful)
+    if diagnostic_heartbeat is not None:
+        update_successful = diagnostic_heartbeat.finish_optimizer_event(
+            update_successful, iteration=iteration
+        )
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2200,9 +2228,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if save_params_in_this_iteration:
         _save_state_dict(attr_name="data", label="params")
 
-    # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
-    # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
@@ -3136,6 +3161,20 @@ def train(
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
+    diagnostic_heartbeat = None
+    if args.diagnostic_heartbeat:
+        from megatron.training.diagnostics.tier0 import Tier0Heartbeat
+
+        diagnostic_wandb_writer = get_wandb_writer()
+        diagnostic_heartbeat = Tier0Heartbeat(
+            args,
+            model,
+            optimizer,
+            wandb_log=getattr(diagnostic_wandb_writer, "log", None),
+            tensorboard_writer=get_tensorboard_writer(),
+        )
+    config.diagnostic_heartbeat = diagnostic_heartbeat
+
     if args.log_energy:
         energy_monitor.setup()
         energy_monitor.resume()
@@ -3404,7 +3443,7 @@ def train(
                 num_zeros_in_grad,
                 max_attention_logit,
             ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
+                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration, diagnostic_heartbeat=diagnostic_heartbeat
             )
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:

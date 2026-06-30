@@ -4,12 +4,18 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    import torch
 
 _DIAGNOSTIC_MICROBATCH_ID: ContextVar[int | None] = ContextVar(
     "diagnostic_microbatch_id", default=None
 )
 _DIAGNOSTIC_RECOMPUTE: ContextVar[bool] = ContextVar("diagnostic_recompute", default=False)
+_DIAGNOSTIC_GLOBAL_VALID_TOKENS: ContextVar["torch.Tensor | None"] = ContextVar(
+    "diagnostic_global_valid_tokens", default=None
+)
 
 
 def set_diagnostic_microbatch_id(index: int | None) -> None:
@@ -56,3 +62,19 @@ def is_diagnostic_recompute() -> bool:
     """Return whether execution is a backward activation recomputation."""
 
     return _DIAGNOSTIC_RECOMPUTE.get()
+
+
+def set_diagnostic_global_valid_tokens(tokens: "torch.Tensor | None") -> None:
+    """Retain the token scalar finalized by the normal gradient path.
+
+    Args:
+        tokens: Globally pooled valid-token tensor, or ``None`` between attempts.
+    """
+
+    _DIAGNOSTIC_GLOBAL_VALID_TOKENS.set(tokens)
+
+
+def get_diagnostic_global_valid_tokens() -> "torch.Tensor | None":
+    """Return the globally pooled valid-token tensor from gradient finalization."""
+
+    return _DIAGNOSTIC_GLOBAL_VALID_TOKENS.get()

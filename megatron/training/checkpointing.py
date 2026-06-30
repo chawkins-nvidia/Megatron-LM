@@ -1874,6 +1874,24 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         check_checkpoint_args(checkpoint_args)
         args.consumed_train_samples = getattr(checkpoint_args,
                                               'consumed_train_samples', 0)
+        diagnostic_state_present = all(
+            hasattr(checkpoint_args, field)
+            for field in ("diagnostic_successful_updates", "diagnostic_event_id")
+        )
+        args.diagnostic_successful_updates = getattr(
+            checkpoint_args, "diagnostic_successful_updates", 0
+        )
+        args.diagnostic_event_id = getattr(checkpoint_args, "diagnostic_event_id", 0)
+        if (
+            getattr(args, "diagnostic_heartbeat", False)
+            and not diagnostic_state_present
+            and not getattr(args, "_diagnostic_checkpoint_migration_warned", False)
+        ):
+            print_rank_0(
+                "WARNING: checkpoint predates Tier-0 heartbeat runtime state; "
+                "diagnostic_successful_updates and diagnostic_event_id start at zero"
+            )
+            args._diagnostic_checkpoint_migration_warned = True
         args.skipped_train_samples = getattr(checkpoint_args,
                                              'skipped_train_samples', 0)
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)

@@ -11,6 +11,7 @@ Run with::
 
 import os
 from contextlib import nullcontext
+from datetime import timedelta
 
 import pytest
 import torch
@@ -21,7 +22,13 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.diagnostics.accumulator import ReductionBinding
-from megatron.training.diagnostics.capture import CaptureTopology, Tier0CaptureSession, TokenLayout
+from megatron.training.diagnostics.capture import (
+    CaptureTopology,
+    Tier0CaptureSession,
+    TokenLayout,
+    pack_valid_token_mask_sideband,
+    unpack_valid_token_mask_sideband,
+)
 from megatron.training.diagnostics.normalization import CanonicalDgradNormalizer
 from megatron.training.diagnostics.schema import Tier0Status
 from tests.unit_tests.diagnostics.test_capture import _FakeModel, _FakeTransformerLayer
@@ -34,7 +41,7 @@ def gloo_world() -> None:
     if int(os.environ.get("WORLD_SIZE", "1")) != 2:
         pytest.skip("requires torch.distributed.run with exactly two ranks")
     if not dist.is_initialized():
-        dist.init_process_group(backend="gloo")
+        dist.init_process_group(backend="gloo", timeout=timedelta(seconds=30))
 
 
 @pytest.mark.distributed
@@ -75,6 +82,46 @@ def test_cp_token_shards_pool_masks_and_canonical_dgrad_once(gloo_world: None) -
     )
     assert result.status == Tier0Status.OK
     session.close()
+    dist.barrier()
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("micro_batch_size", (1, 4))
+def test_fixed_shape_pp_mask_sideband_preserves_order_without_broadcast(
+    gloo_world: None, micro_batch_size: int
+) -> None:
+    """Exercise timeout-protected point-to-point mask transport in microbatch order."""
+
+    rank = dist.get_rank()
+    sequence_length = 8
+    for microbatch_id in range(8):
+        if rank == 0:
+            mask = torch.full(
+                (micro_batch_size, sequence_length), float(microbatch_id + 1)
+            )
+            payload = pack_valid_token_mask_sideband(
+                mask,
+                micro_batch_size=micro_batch_size,
+                sequence_length=sequence_length,
+                device="cpu",
+            )
+            dist.send(payload, dst=1)
+        else:
+            payload = torch.empty(micro_batch_size * sequence_length + 1)
+            dist.recv(payload, src=0)
+            staged = unpack_valid_token_mask_sideband(
+                payload,
+                micro_batch_size=micro_batch_size,
+                sequence_length=sequence_length,
+                device="cpu",
+            )
+            assert staged.valid
+            torch.testing.assert_close(
+                staged.values,
+                torch.full(
+                    (sequence_length, micro_batch_size, 1), float(microbatch_id + 1)
+                ),
+            )
     dist.barrier()
 
 

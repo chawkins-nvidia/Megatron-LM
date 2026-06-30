@@ -248,6 +248,33 @@ class LoggerConfig:
     log_interval: int = 100
     """Report loss and timing interval."""
 
+    diagnostic_heartbeat: bool = False
+    """Enable the capability-gated Tier-0 successful-update heartbeat."""
+
+    diagnostic_interval: int = 1000
+    """Emit Tier-0 after each configured number of successful optimizer updates."""
+
+    diagnostic_early_updates: str = "1,10,100"
+    """Comma-separated early successful-update indices."""
+
+    diagnostic_unsupported_policy: Literal["error", "status-only"] = "error"
+    """Fail before training or emit invalid fixed-schema status events when unsupported."""
+
+    diagnostic_max_extra_bytes: int | None = None
+    """Optional hard cap for the complete incremental Tier-0 event allocation."""
+
+    diagnostic_dgrad_starvation_threshold: float = 0.0
+    """Canonical dgrad RMS at or below which a layer is starved."""
+
+    diagnostic_update_starvation_threshold: float = 0.0
+    """Applied relative update at or below which a layer is starved."""
+
+    diagnostic_successful_updates: int = field(init=False, default=0)
+    """Checkpointed runtime count of successful optimizer updates."""
+
+    diagnostic_event_id: int = field(init=False, default=0)
+    """Checkpointed next diagnostic event identifier."""
+
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
