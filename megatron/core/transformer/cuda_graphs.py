@@ -2569,6 +2569,10 @@ def set_current_microbatch(model, microbatch_id):
     correct graph index.  This helper is called from the pipeline-parallel
     schedule before each forward step.
     """
+    from megatron.core.diagnostics import set_diagnostic_microbatch_id
+
+    set_diagnostic_microbatch_id(microbatch_id)
+
     decoder_exists = True
     model_with_decoder = None
     try:

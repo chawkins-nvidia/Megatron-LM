@@ -574,6 +574,10 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
 
+        from megatron.core.diagnostics import get_diagnostic_microbatch_id
+
+        ctx.diagnostic_microbatch_id = get_diagnostic_microbatch_id()
+
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
 
@@ -618,7 +622,13 @@ class CheckpointFunction(torch.autograd.Function):
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
             with torch.enable_grad():
-                outputs = ctx.run_function(*detached_inputs)
+                if ctx.diagnostic_microbatch_id is None:
+                    outputs = ctx.run_function(*detached_inputs)
+                else:
+                    from megatron.core.diagnostics import diagnostic_recompute
+
+                    with diagnostic_recompute(ctx.diagnostic_microbatch_id):
+                        outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -663,6 +673,9 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
+        from megatron.core.diagnostics import get_diagnostic_microbatch_id
+
+        ctx.diagnostic_microbatch_id = get_diagnostic_microbatch_id()
         if checkpoint_without_output_obj.fp8:
             fp8 = FP8GlobalStateManager.is_fp8_enabled()
             ctx.fp8 = fp8
@@ -779,7 +792,13 @@ class CheckpointWithoutOutput(object):
 
             inputs = tuple(detach(t) for t in inputs)
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
-                outputs = self.run_function(*inputs)
+                if self.ctx.diagnostic_microbatch_id is None:
+                    outputs = self.run_function(*inputs)
+                else:
+                    from megatron.core.diagnostics import diagnostic_recompute
+
+                    with diagnostic_recompute(self.ctx.diagnostic_microbatch_id):
+                        outputs = self.run_function(*inputs)
 
         self.run_function = None
         self.rng_states = None
