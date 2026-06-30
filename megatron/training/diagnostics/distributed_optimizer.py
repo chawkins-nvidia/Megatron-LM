@@ -63,6 +63,9 @@ class DistributedOptimizerEventStatus(IntEnum):
     FINISH_SCRATCH_ALLOCATION_FAILED = 18
     MATERIALIZATION_MISMATCH = 19
     ACCUMULATION_FAILED = 20
+    ALLOCATOR_QUERY_FAILED = 21
+    BEGIN_UNEXPECTED_FAILED = 22
+    FINISH_UNEXPECTED_FAILED = 23
 
 
 class SnapshotMemoryReason(IntEnum):
@@ -107,6 +110,8 @@ class SnapshotMemoryEstimate:
 
     fp32_master_bytes: int
     bf16_applied_bytes: int
+    finish_elementwise_bytes: int
+    finish_scalar_bytes: int
     finish_scratch_bytes: int
     snapshot_bytes: int
     total_bytes: int
@@ -184,6 +189,13 @@ class _FinishScratchLayout:
     work_fp64: tuple[int, int]
     finite: tuple[int, int]
     auxiliary: tuple[int, int]
+    moment_fp64: tuple[int, int]
+    moment_fp32: tuple[int, int]
+    materialization_valid: tuple[int, int]
+    scalar_bool: tuple[int, int]
+    status_int64: tuple[int, int]
+    elementwise_bytes: int
+    scalar_bytes: int
     total_bytes: int
 
 
@@ -198,6 +210,11 @@ class _FinishScratch:
     work_fp64: torch.Tensor
     finite: torch.Tensor
     auxiliary: torch.Tensor
+    moment_fp64: torch.Tensor
+    moment_fp32: torch.Tensor
+    materialization_valid: torch.Tensor
+    scalar_bool: torch.Tensor
+    status_int64: torch.Tensor
 
 
 MemoryStateProvider = Callable[[torch.device], DeviceMemoryState]
@@ -309,21 +326,31 @@ def _align(offset: int, alignment: int) -> int:
 def _scratch_layout(elements: int) -> _FinishScratchLayout:
     offset = 0
 
-    def reserve(bytes_per_element: int, alignment: int) -> tuple[int, int]:
+    def reserve(count: int, bytes_per_element: int, alignment: int) -> tuple[int, int]:
         nonlocal offset
         offset = _align(offset, alignment)
         start = offset
-        offset += elements * bytes_per_element
+        offset += count * bytes_per_element
         return start, offset
 
-    expected_bf16 = reserve(2, 2)
-    applied_before_fp32 = reserve(4, 4)
-    applied_after_fp32 = reserve(4, 4)
-    master_delta_fp32 = reserve(4, 4)
-    applied_delta_fp32 = reserve(4, 4)
-    work_fp64 = reserve(8, 8)
-    finite = reserve(1, 1)
-    auxiliary = reserve(1, 1)
+    expected_bf16 = reserve(elements, 2, 2)
+    applied_before_fp32 = reserve(elements, 4, 4)
+    applied_after_fp32 = reserve(elements, 4, 4)
+    master_delta_fp32 = reserve(elements, 4, 4)
+    applied_delta_fp32 = reserve(elements, 4, 4)
+    work_fp64 = reserve(elements, 8, 8)
+    finite = reserve(elements, 1, 1)
+    auxiliary = reserve(elements, 1, 1)
+    elementwise_bytes = offset
+
+    # Ten FP64 moment/error scalars, two FP32 extrema, and the boolean/int64
+    # lifecycle scalars remain live through the accumulator update. Keeping all
+    # of them in this storage makes the preflight bound complete and exact.
+    moment_fp64 = reserve(10, 8, 8)
+    moment_fp32 = reserve(2, 4, 4)
+    materialization_valid = reserve(1, 1, 1)
+    scalar_bool = reserve(1, 1, 1)
+    status_int64 = reserve(1, 8, 8)
     return _FinishScratchLayout(
         expected_bf16=expected_bf16,
         applied_before_fp32=applied_before_fp32,
@@ -333,6 +360,13 @@ def _scratch_layout(elements: int) -> _FinishScratchLayout:
         work_fp64=work_fp64,
         finite=finite,
         auxiliary=auxiliary,
+        moment_fp64=moment_fp64,
+        moment_fp32=moment_fp32,
+        materialization_valid=materialization_valid,
+        scalar_bool=scalar_bool,
+        status_int64=status_int64,
+        elementwise_bytes=elementwise_bytes,
+        scalar_bytes=offset - elementwise_bytes,
         total_bytes=offset,
     )
 
@@ -538,17 +572,20 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         return self._bound_shards
 
     def estimate_snapshot_memory(self) -> SnapshotMemoryEstimate:
-        """Return exact retained and bounded finish-scratch bytes."""
+        """Return exact retained and bounded peak bytes through accumulation."""
 
         owner_elements = sum(shard.main_shard.numel() for shard in self._bound_shards)
         chunk_elements = min(owner_elements, self.finish_chunk_elements)
         fp32_master_bytes = owner_elements * 4
         bf16_applied_bytes = owner_elements * 2
-        finish_scratch_bytes = _scratch_layout(chunk_elements).total_bytes
+        layout = _scratch_layout(chunk_elements)
+        finish_scratch_bytes = layout.total_bytes
         snapshot_bytes = fp32_master_bytes + bf16_applied_bytes
         return SnapshotMemoryEstimate(
             fp32_master_bytes=fp32_master_bytes,
             bf16_applied_bytes=bf16_applied_bytes,
+            finish_elementwise_bytes=layout.elementwise_bytes,
+            finish_scalar_bytes=layout.scalar_bytes,
             finish_scratch_bytes=finish_scratch_bytes,
             snapshot_bytes=snapshot_bytes,
             total_bytes=snapshot_bytes + finish_scratch_bytes,
@@ -604,6 +641,16 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
     def begin_event(self) -> SnapshotMemoryMeasurement | None:
         """Capture pre-state or expose a typed local status with no retained partial state."""
 
+        try:
+            return self._begin_event()
+        except Exception:
+            self.abort_event()
+            self._set_status(DistributedOptimizerEventStatus.BEGIN_UNEXPECTED_FAILED)
+            return None
+
+    def _begin_event(self) -> SnapshotMemoryMeasurement | None:
+        """Implement begin under the nonthrowing public lifecycle boundary."""
+
         if self._snapshot is not None:
             self.abort_event()
             self._set_status(DistributedOptimizerEventStatus.BEGIN_ALREADY_ARMED)
@@ -640,7 +687,9 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             return None
 
         device = next(iter(devices))
-        allocator_before = self._allocator_bytes(device)
+        allocator_ok, allocator_before = self._sample_allocator_bytes(device)
+        if not allocator_ok:
+            return None
         master_before: torch.Tensor | None = None
         applied_before: torch.Tensor | None = None
         try:
@@ -679,7 +728,12 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             self._set_status(DistributedOptimizerEventStatus.BEGIN_COPY_FAILED)
             return None
 
-        allocator_after = self._allocator_bytes(device)
+        allocator_ok, allocator_after = self._sample_allocator_bytes(device)
+        if not allocator_ok:
+            master_before = None
+            applied_before = None
+            offsets.clear()
+            return None
         allocator_delta = self._allocator_delta(allocator_before, allocator_after)
         measurement = SnapshotMemoryMeasurement(
             estimated_bytes=preflight.estimate.total_bytes,
@@ -723,59 +777,83 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         if self._snapshot is None:
             self._set_status(DistributedOptimizerEventStatus.FINISH_NOT_ARMED)
             return None
-        snapshot = self._snapshot
-        if not update_successful:
+
+        try:
+            return self._finish_event(accumulator, update_successful=update_successful)
+        except Exception:
+            self._invalidate_bound_metrics(accumulator)
+            self._set_status(DistributedOptimizerEventStatus.FINISH_UNEXPECTED_FAILED)
+            return None
+        finally:
             self.abort_event()
+
+    def _finish_event(
+        self, accumulator: PackedSufficientStatistics, *, update_successful: bool
+    ) -> SnapshotMemoryMeasurement | None:
+        """Implement finish under the nonthrowing public lifecycle boundary."""
+
+        snapshot = self._snapshot
+        assert snapshot is not None
+        if not update_successful:
             self._set_status(DistributedOptimizerEventStatus.UPDATE_SKIPPED)
             return None
 
         try:
             current_shards = tuple(self.optimizer.iter_model_main_param_shards())
         except Exception:
-            self.abort_event()
             self._set_status(DistributedOptimizerEventStatus.FINISH_ITERATOR_FAILED)
             return None
         if len(current_shards) != len(snapshot.shards):
-            self.abort_event()
             self._set_status(DistributedOptimizerEventStatus.FINISH_SHARD_COUNT_CHANGED)
             return None
         if any(
             self._shard_identity(original) != self._shard_identity(current)
             for original, current in zip(snapshot.shards, current_shards)
         ):
-            self.abort_event()
             self._set_status(DistributedOptimizerEventStatus.FINISH_SHARD_IDENTITY_CHANGED)
             return None
 
         device = snapshot.master_before.device
+        scratch: _FinishScratch | None = None
         try:
-            scratch = self._allocate_finish_scratch(device)
-        except Exception:
-            self.abort_event()
-            self._last_memory_reason = SnapshotMemoryReason.ALLOCATION_FAILED
-            self._set_status(DistributedOptimizerEventStatus.FINISH_SCRATCH_ALLOCATION_FAILED)
-            return None
-        measurement = self._measurement_with_peak(snapshot, device)
-        snapshot.measurement = measurement
+            try:
+                scratch = self._allocate_finish_scratch(device)
+            except Exception:
+                self._last_memory_reason = SnapshotMemoryReason.ALLOCATION_FAILED
+                self._set_status(DistributedOptimizerEventStatus.FINISH_SCRATCH_ALLOCATION_FAILED)
+                return None
 
-        try:
-            self._verify_materialization(current_shards, scratch)
-            materialization_valid = (self._status == DistributedOptimizerEventStatus.OK).squeeze(0)
-            self._accumulate_update_moments(
-                accumulator, snapshot, current_shards, scratch, materialization_valid
-            )
             measurement = self._measurement_with_peak(snapshot, device)
-        except Exception:
-            self._invalidate_bound_metrics(accumulator)
-            self._set_status(DistributedOptimizerEventStatus.ACCUMULATION_FAILED)
-            measurement = self._measurement_with_peak(snapshot, device)
-            self._clear_finish_scratch(scratch)
-            self.abort_event()
-            return None
+            if measurement is None:
+                return None
+            snapshot.measurement = measurement
 
-        self._clear_finish_scratch(scratch)
-        self.abort_event()
-        return measurement
+            try:
+                self._verify_materialization(current_shards, scratch)
+                torch.eq(
+                    self._status,
+                    int(DistributedOptimizerEventStatus.OK),
+                    out=scratch.materialization_valid,
+                )
+                self._accumulate_update_moments(
+                    accumulator,
+                    snapshot,
+                    current_shards,
+                    scratch,
+                    scratch.materialization_valid.squeeze(0),
+                )
+            except Exception:
+                self._invalidate_bound_metrics(accumulator)
+                self._set_status(DistributedOptimizerEventStatus.ACCUMULATION_FAILED)
+                return None
+
+            measurement = self._measurement_with_peak(snapshot, device)
+            if measurement is None:
+                self._invalidate_bound_metrics(accumulator)
+            return measurement
+        finally:
+            if scratch is not None:
+                self._clear_finish_scratch(scratch)
 
     def abort_event(self) -> None:
         """Release all retained pre-state without launching a collective."""
@@ -804,20 +882,29 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             work_fp64=_typed_view(storage, layout.work_fp64, torch.float64),
             finite=_typed_view(storage, layout.finite, torch.bool),
             auxiliary=_typed_view(storage, layout.auxiliary, torch.bool),
+            moment_fp64=_typed_view(storage, layout.moment_fp64, torch.float64),
+            moment_fp32=_typed_view(storage, layout.moment_fp32, torch.float32),
+            materialization_valid=_typed_view(storage, layout.materialization_valid, torch.bool),
+            scalar_bool=_typed_view(storage, layout.scalar_bool, torch.bool),
+            status_int64=_typed_view(storage, layout.status_int64, torch.int64),
         )
 
     @staticmethod
     def _clear_finish_scratch(scratch: _FinishScratch) -> None:
-        empty = torch.empty(0, dtype=torch.uint8, device="cpu")
-        scratch.expected_bf16 = empty
-        scratch.applied_before_fp32 = empty
-        scratch.applied_after_fp32 = empty
-        scratch.master_delta_fp32 = empty
-        scratch.applied_delta_fp32 = empty
-        scratch.work_fp64 = empty
-        scratch.finite = empty
-        scratch.auxiliary = empty
-        scratch.storage = empty
+        del scratch.expected_bf16
+        del scratch.applied_before_fp32
+        del scratch.applied_after_fp32
+        del scratch.master_delta_fp32
+        del scratch.applied_delta_fp32
+        del scratch.work_fp64
+        del scratch.finite
+        del scratch.auxiliary
+        del scratch.moment_fp64
+        del scratch.moment_fp32
+        del scratch.materialization_valid
+        del scratch.scalar_bool
+        del scratch.status_int64
+        del scratch.storage
 
     def _verify_materialization(
         self, shards: tuple[ModelMainParamShard, ...], scratch: _FinishScratch
@@ -832,9 +919,12 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
                 mismatch = scratch.auxiliary[:size]
                 expected.copy_(main[start:end])
                 torch.ne(expected, applied[start:end], out=mismatch)
-                mismatch_status = torch.any(mismatch).to(dtype=self._status.dtype)
-                mismatch_status.mul_(int(DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH))
-                torch.maximum(self._status, mismatch_status.view_as(self._status), out=self._status)
+                torch.any(mismatch, dim=(0,), out=scratch.scalar_bool.squeeze(0))
+                scratch.status_int64.copy_(scratch.scalar_bool)
+                scratch.status_int64.mul_(
+                    int(DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH)
+                )
+                torch.maximum(self._status, scratch.status_int64, out=self._status)
 
     def _accumulate_update_moments(
         self,
@@ -860,6 +950,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
                     main_after[start:end],
                     applied_before[start:end],
                     applied_after[start:end],
+                    materialization_valid,
                 )
                 self.registry.add_applied_update_moments(
                     accumulator,
@@ -875,6 +966,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         master_after: torch.Tensor,
         applied_before: torch.Tensor,
         applied_after: torch.Tensor,
+        materialization_valid: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         size = master_after.numel()
         applied_before_fp32 = scratch.applied_before_fp32[:size]
@@ -884,6 +976,20 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         work = scratch.work_fp64[:size]
         finite = scratch.finite[:size]
         auxiliary = scratch.auxiliary[:size]
+        moment_fp64 = scratch.moment_fp64
+        moment_fp32 = scratch.moment_fp32
+        count = moment_fp64[0]
+        master_sumsq = moment_fp64[1]
+        applied_sumsq = moment_fp64[2]
+        applied_pre_sumsq = moment_fp64[3]
+        master_nonzero = moment_fp64[4]
+        applied_nonzero = moment_fp64[5]
+        cast_zero = moment_fp64[6]
+        nonfinite = moment_fp64[7]
+        arithmetic_error = moment_fp64[8]
+        materialization_error = moment_fp64[9]
+        maximum = moment_fp32[0]
+        minimum = moment_fp32[1]
 
         applied_before_fp32.copy_(applied_before)
         applied_after_fp32.copy_(applied_after)
@@ -900,35 +1006,55 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         Bf16DistributedOptimizerDiagnosticAdapter._and_finite_mask(
             applied_after_fp32, finite, auxiliary
         )
-        count = finite.sum(dtype=torch.float64)
-        nonfinite = torch.full_like(count, size) - count
+        torch.sum(finite, dim=(0,), dtype=torch.float64, out=count)
+        nonfinite.fill_(size).sub_(count)
         torch.logical_not(finite, out=auxiliary)
 
         work.copy_(master_delta)
         work.masked_fill_(auxiliary, 0)
         work.square_()
-        master_sumsq = work.sum()
+        torch.sum(work, dim=(0,), out=master_sumsq)
         work.copy_(applied_delta)
         work.masked_fill_(auxiliary, 0)
         work.square_()
-        applied_sumsq = work.sum()
+        torch.sum(work, dim=(0,), out=applied_sumsq)
         work.copy_(applied_before_fp32)
         work.masked_fill_(auxiliary, 0)
         work.square_()
-        applied_pre_sumsq = work.sum()
+        torch.sum(work, dim=(0,), out=applied_pre_sumsq)
 
         applied_delta.masked_fill_(auxiliary, -torch.inf)
-        maximum = applied_delta.amax()
+        torch.amax(applied_delta, dim=(0,), out=maximum)
         applied_delta.masked_fill_(auxiliary, torch.inf)
-        minimum = applied_delta.amin()
+        torch.amin(applied_delta, dim=(0,), out=minimum)
 
         torch.ne(master_delta, 0, out=auxiliary)
         torch.logical_and(auxiliary, finite, out=auxiliary)
-        master_nonzero = auxiliary.sum(dtype=torch.float64)
+        torch.sum(auxiliary, dim=(0,), dtype=torch.float64, out=master_nonzero)
         torch.eq(applied_delta, 0, out=finite)
         torch.logical_and(finite, auxiliary, out=finite)
-        cast_zero = finite.sum(dtype=torch.float64)
-        applied_nonzero = master_nonzero - cast_zero
+        torch.sum(finite, dim=(0,), dtype=torch.float64, out=cast_zero)
+        applied_nonzero.copy_(master_nonzero).sub_(cast_zero)
+
+        numeric = moment_fp64[:8]
+        arithmetic_valid = finite[0]
+        scalar_auxiliary = scratch.scalar_bool.squeeze(0)
+        Bf16DistributedOptimizerDiagnosticAdapter._initialize_finite_mask(
+            numeric[0], arithmetic_valid, scalar_auxiliary
+        )
+        for contribution in numeric[1:]:
+            Bf16DistributedOptimizerDiagnosticAdapter._and_finite_mask(
+                contribution, arithmetic_valid, scalar_auxiliary
+            )
+        arithmetic_error.copy_(arithmetic_valid).mul_(-1).add_(1)
+        torch.logical_not(arithmetic_valid, out=scalar_auxiliary)
+        numeric.masked_fill_(scalar_auxiliary, 0)
+
+        materialization_error.copy_(materialization_valid).mul_(-1).add_(1)
+        torch.logical_not(materialization_valid, out=scalar_auxiliary)
+        numeric.masked_fill_(scalar_auxiliary, 0)
+        maximum.masked_fill_(scalar_auxiliary, -torch.inf)
+        minimum.masked_fill_(scalar_auxiliary, torch.inf)
         return {
             "count": count,
             "master_sumsq": master_sumsq,
@@ -940,6 +1066,8 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             "nonfinite": nonfinite,
             "maximum": maximum,
             "minimum": minimum,
+            "arithmetic_error": arithmetic_error,
+            "materialization_error": materialization_error,
         }
 
     @staticmethod
@@ -980,8 +1108,10 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
 
     def _measurement_with_peak(
         self, snapshot: _SnapshotState, device: torch.device
-    ) -> SnapshotMemoryMeasurement:
-        allocator_now = self._allocator_bytes(device)
+    ) -> SnapshotMemoryMeasurement | None:
+        allocator_ok, allocator_now = self._sample_allocator_bytes(device)
+        if not allocator_ok:
+            return None
         allocator_peak = self._allocator_delta(snapshot.allocator_before, allocator_now)
         previous_peak = snapshot.measurement.allocator_peak_delta_bytes
         if allocator_peak is not None and previous_peak is not None:
@@ -997,6 +1127,15 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             ),
             allocator_peak_delta_bytes=allocator_peak,
         )
+
+    def _sample_allocator_bytes(self, device: torch.device) -> tuple[bool, int | None]:
+        """Sample optional allocator telemetry without crossing the event boundary."""
+
+        try:
+            return True, self._allocator_bytes(device)
+        except Exception:
+            self._set_status(DistributedOptimizerEventStatus.ALLOCATOR_QUERY_FAILED)
+            return False, None
 
     @staticmethod
     def _allocator_bytes(device: torch.device) -> int | None:

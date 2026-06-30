@@ -2,7 +2,10 @@
 
 """Tests for authoritative BF16 distributed-optimizer diagnostics."""
 
+import gc
+import inspect
 import os
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -15,7 +18,11 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer, Range
 from megatron.core.optimizer.optimizer import ChainedOptimizer
-from megatron.training.diagnostics.accumulator import PackedSlots, ReductionBinding
+from megatron.training.diagnostics.accumulator import (
+    PackedSlots,
+    PackedSufficientStatistics,
+    ReductionBinding,
+)
 from megatron.training.diagnostics.distributed_optimizer import (
     Bf16DistributedOptimizerDiagnosticAdapter,
     DeviceMemoryState,
@@ -460,6 +467,23 @@ def test_every_unsupported_first_backend_capability_has_a_stable_reason(
 def test_wrong_optimizer_type_fails_closed() -> None:
     report = Bf16DistributedOptimizerDiagnosticAdapter.negotiate_capabilities(object())
     assert report.reasons == (DistributedOptimizerDiagnosticReason.OPTIMIZER_TYPE,)
+    assert report.startup_host_sync
+
+
+def test_only_startup_negotiation_contains_an_accepted_host_synchronization() -> None:
+    event_sources = (
+        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter.begin_event),
+        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter.finish_event),
+        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._begin_event),
+        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._finish_event),
+        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._verify_materialization),
+        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._accumulate_update_moments),
+        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._chunk_moments),
+        inspect.getsource(PackedSufficientStatistics.add_applied_update_moments),
+    )
+    prohibited = (".item(", ".cpu(", ".tolist(", ".numpy(")
+
+    assert not any(operation in source for source in event_sources for operation in prohibited)
 
 
 def test_overlapping_local_owner_shards_become_typed_constructor_status() -> None:
@@ -759,17 +783,22 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
     assert estimate.fp32_master_bytes == 28
     assert estimate.bf16_applied_bytes == 14
     assert estimate.snapshot_bytes == 42
-    assert estimate.finish_scratch_bytes == 198
-    assert estimate.total_bytes == 240
+    assert estimate.finish_elementwise_bytes == 198
+    assert estimate.finish_scalar_bytes == 106
+    assert estimate.finish_scratch_bytes == 304
+    assert estimate.total_bytes == 346
     measurement = adapter.begin_event()
     assert measurement is not None
-    assert measurement.estimated_bytes == 240
+    assert measurement.estimated_bytes == 346
     assert measurement.payload_bytes == 42
     adapter.abort_event()
 
-    exact, _ = _adapter(optimizer, parameters, max_extra_bytes=240)
+    rereview_cap, _ = _adapter(optimizer, parameters, max_extra_bytes=240)
+    assert not rereview_cap.preflight_snapshot_memory().accepted
+    assert rereview_cap.preflight_snapshot_memory().reason == SnapshotMemoryReason.MAX_EXTRA_BYTES
+    exact, _ = _adapter(optimizer, parameters, max_extra_bytes=346)
     assert exact.preflight_snapshot_memory().accepted
-    capped, _ = _adapter(optimizer, parameters, max_extra_bytes=239)
+    capped, _ = _adapter(optimizer, parameters, max_extra_bytes=345)
     assert capped.preflight_snapshot_memory().reason == SnapshotMemoryReason.MAX_EXTRA_BYTES
     assert capped.begin_event() is None
     assert capped.last_memory_reason == SnapshotMemoryReason.MAX_EXTRA_BYTES
@@ -788,7 +817,7 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
     headroom, _ = _adapter(
         optimizer,
         parameters,
-        memory_state_provider=lambda device: DeviceMemoryState(100, 100, 239, 1000),
+        memory_state_provider=lambda device: DeviceMemoryState(100, 100, 345, 1000),
     )
     assert headroom.preflight_snapshot_memory().reason == SnapshotMemoryReason.DEVICE_HEADROOM
 
@@ -875,7 +904,137 @@ def test_allocator_peak_is_tracked_through_finish(monkeypatch: pytest.MonkeyPatc
 
     assert finish_measurement is not None
     assert finish_measurement.allocator_peak_delta_bytes == 240
-    assert finish_measurement.payload_bytes == finish_measurement.estimated_bytes == 240
+    assert finish_measurement.payload_bytes == finish_measurement.estimated_bytes == 346
+
+
+def test_finish_allocator_query_failure_is_typed_and_releases_all_event_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    optimizer, parameters = _fake_optimizer()
+    adapter, registry = _adapter(optimizer, parameters)
+    accumulator = registry.new_accumulator("cpu")
+    allocator_calls = 0
+
+    def fail_after_finish_scratch(device):
+        nonlocal allocator_calls
+        allocator_calls += 1
+        if allocator_calls == 1:
+            return 100
+        if allocator_calls == 2:
+            return 142
+        raise RuntimeError("injected finish allocator query failure")
+
+    scratch_storage_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    original_allocate = adapter._allocate_finish_scratch
+
+    def capture_scratch(device):
+        scratch = original_allocate(device)
+        scratch_storage_refs.append(weakref.ref(scratch.storage))
+        return scratch
+
+    monkeypatch.setattr(adapter, "_allocator_bytes", fail_after_finish_scratch)
+    monkeypatch.setattr(adapter, "_allocate_finish_scratch", capture_scratch)
+    assert adapter.begin_event() is not None
+    assert adapter._snapshot is not None
+    snapshot_refs = (
+        weakref.ref(adapter._snapshot.master_before),
+        weakref.ref(adapter._snapshot.applied_before),
+    )
+    optimizer._copy_main_params_to_model_params()
+
+    assert adapter.finish_event(accumulator, update_successful=True) is None
+    gc.collect()
+
+    assert allocator_calls == 3
+    assert adapter.local_status.item() == DistributedOptimizerEventStatus.ALLOCATOR_QUERY_FAILED
+    assert not adapter.armed
+    assert scratch_storage_refs and scratch_storage_refs[0]() is None
+    assert all(reference() is None for reference in snapshot_refs)
+
+
+@pytest.mark.parametrize("failure_call", (1, 2))
+def test_begin_allocator_query_failures_are_typed_and_release_partial_snapshots(
+    monkeypatch: pytest.MonkeyPatch, failure_call: int
+) -> None:
+    optimizer, parameters = _fake_optimizer()
+    adapter, _ = _adapter(optimizer, parameters)
+    allocator_calls = 0
+    snapshot_refs = []
+    original_empty = adapter_module.torch.empty
+
+    def fail_allocator_query(device):
+        nonlocal allocator_calls
+        allocator_calls += 1
+        if allocator_calls == failure_call:
+            raise RuntimeError("injected begin allocator query failure")
+        return 100
+
+    def capture_snapshot(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if kwargs.get("dtype") in (torch.float32, torch.bfloat16):
+            snapshot_refs.append(weakref.ref(tensor))
+        return tensor
+
+    monkeypatch.setattr(adapter, "_allocator_bytes", fail_allocator_query)
+    monkeypatch.setattr(adapter_module.torch, "empty", capture_snapshot)
+
+    assert adapter.begin_event() is None
+    gc.collect()
+
+    assert allocator_calls == failure_call
+    assert adapter.local_status.item() == DistributedOptimizerEventStatus.ALLOCATOR_QUERY_FAILED
+    assert not adapter.armed
+    assert all(reference() is None for reference in snapshot_refs)
+
+
+@pytest.mark.parametrize("finish_chunk_elements", (1, 2, 3, 7, 11))
+def test_preflight_estimate_covers_independently_enumerated_peak_live_storages(
+    monkeypatch: pytest.MonkeyPatch, finish_chunk_elements: int
+) -> None:
+    optimizer, parameters = _fake_optimizer()
+    adapter, registry = _adapter(optimizer, parameters, finish_chunk_elements=finish_chunk_elements)
+    accumulator = registry.new_accumulator("cpu")
+    estimate = adapter.estimate_snapshot_memory()
+    scratch_box = []
+    observed_peak_bytes = []
+    original_allocate = adapter._allocate_finish_scratch
+    original_add = registry.add_applied_update_moments
+
+    def storage_key(tensor: torch.Tensor) -> tuple[str, int, int]:
+        storage = tensor.untyped_storage()
+        return str(tensor.device), storage.data_ptr(), storage.nbytes()
+
+    def capture_scratch(device):
+        scratch = original_allocate(device)
+        scratch_box.append(scratch)
+        return scratch
+
+    def enumerate_live_storages(accumulator_arg, logical_name, **moments):
+        assert adapter._snapshot is not None
+        scratch = scratch_box[-1]
+        tensors = (
+            adapter._snapshot.master_before,
+            adapter._snapshot.applied_before,
+            scratch.storage,
+            *moments.values(),
+        )
+        storages = {storage_key(tensor) for tensor in tensors}
+        observed_peak_bytes.append(sum(nbytes for _, _, nbytes in storages))
+        assert {storage_key(moment) for moment in moments.values()} == {
+            storage_key(scratch.storage)
+        }
+        return original_add(accumulator_arg, logical_name, **moments)
+
+    monkeypatch.setattr(adapter, "_allocate_finish_scratch", capture_scratch)
+    monkeypatch.setattr(registry, "add_applied_update_moments", enumerate_live_storages)
+    assert adapter.begin_event() is not None
+    optimizer._copy_main_params_to_model_params()
+
+    assert adapter.finish_event(accumulator, update_successful=True) is not None
+
+    assert observed_peak_bytes
+    assert max(observed_peak_bytes) == estimate.total_bytes
+    assert max(observed_peak_bytes) <= estimate.total_bytes
 
 
 @pytest.fixture(scope="module")
@@ -916,6 +1075,7 @@ def test_real_gloo_capability_negotiation_fails_every_rank_on_one_rank_mismatch(
         ("oom", DistributedOptimizerEventStatus.BEGIN_FIRST_ALLOCATION_FAILED),
         ("identity", DistributedOptimizerEventStatus.FINISH_SHARD_IDENTITY_CHANGED),
         ("materialization", DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH),
+        ("telemetry", DistributedOptimizerEventStatus.ALLOCATOR_QUERY_FAILED),
     ),
 )
 def test_real_two_rank_one_rank_runtime_failure_reaches_one_fixed_consensus_and_releases(
@@ -953,6 +1113,17 @@ def test_real_two_rank_one_rank_runtime_failure_reaches_one_fixed_consensus_and_
         )
 
     accumulator = registry.new_accumulator("cpu")
+    if failure == "telemetry" and rank == 1:
+        allocator_calls = 0
+
+        def rank_local_allocator_failure(device):
+            nonlocal allocator_calls
+            allocator_calls += 1
+            if allocator_calls <= 2:
+                return None
+            raise RuntimeError("injected finish allocator query failure")
+
+        adapter._allocator_bytes = rank_local_allocator_failure
     if failure == "oom":
         original_empty = adapter_module.torch.empty
 
@@ -966,7 +1137,7 @@ def test_real_two_rank_one_rank_runtime_failure_reaches_one_fixed_consensus_and_
             adapter.begin_event()
         finally:
             adapter_module.torch.empty = original_empty
-    elif failure in ("identity", "materialization"):
+    elif failure in ("identity", "materialization", "telemetry"):
         assert adapter.begin_event() is not None
         with torch.no_grad():
             if failure == "identity" and rank == 1:
@@ -981,6 +1152,9 @@ def test_real_two_rank_one_rank_runtime_failure_reaches_one_fixed_consensus_and_
             else:
                 optimizer._copy_main_params_to_model_params()
         adapter.finish_event(accumulator, update_successful=True)
+
+    if failure == "telemetry":
+        assert not adapter.armed
 
     # This test-only standalone consensus is exactly one MAX reduction in the
     # same order on every rank; production consensus remains heartbeat-owned.

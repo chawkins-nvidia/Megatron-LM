@@ -835,6 +835,8 @@ class PackedSufficientStatistics:
         nonfinite: torch.Tensor,
         maximum: torch.Tensor,
         minimum: torch.Tensor,
+        arithmetic_error: torch.Tensor,
+        materialization_error: torch.Tensor,
         materialization_valid: torch.Tensor,
         replication_multiplicity: int = 1,
     ) -> None:
@@ -859,6 +861,8 @@ class PackedSufficientStatistics:
             nonfinite: Nonfinite input count.
             maximum: Maximum finite applied delta.
             minimum: Minimum finite applied delta.
+            arithmetic_error: Precomputed nonfinite-arithmetic indicator.
+            materialization_error: Precomputed materialization-failure indicator.
             materialization_valid: Device boolean for exact post-step materialization.
             replication_multiplicity: Number of identical logical replicas.
 
@@ -881,54 +885,33 @@ class PackedSufficientStatistics:
             nonfinite,
             maximum,
             minimum,
+            arithmetic_error,
+            materialization_error,
             materialization_valid,
         )
         if any(contribution.numel() != 1 for contribution in contributions):
             raise ValueError("precomputed applied-update moments must be scalars")
-        valid = materialization_valid.to(dtype=torch.bool)
-        scale = replication_multiplicity
-        numeric = tuple(
-            contribution.to(dtype=torch.float64) / scale for contribution in contributions[:8]
-        )
-        numeric = tuple(
-            torch.where(valid, contribution, torch.zeros_like(contribution))
-            for contribution in numeric
-        )
-        numeric = self._finite_contributions(slots, *numeric)
-        (
-            count,
-            master_sumsq,
-            applied_sumsq,
-            applied_pre_sumsq,
-            master_nonzero,
-            applied_nonzero,
-            cast_zero,
-            nonfinite,
-        ) = numeric
+        if materialization_valid.dtype != torch.bool:
+            raise ValueError("precomputed materialization validity must be boolean")
+        numeric = contributions[:8]
+        if any(contribution.dtype != torch.float64 for contribution in numeric):
+            raise ValueError("precomputed numeric applied-update moments must be float64")
+        if maximum.dtype != self.max_pack.dtype or minimum.dtype != self.min_pack.dtype:
+            raise ValueError("precomputed applied-update extrema have the wrong dtype")
+        scale = 1.0 / replication_multiplicity
 
-        self.sum_pack[slots.count].add_(count)
-        self.sum_pack[slots.sumsq].add_(master_sumsq)
-        self.sum_pack[slots.lhs_sumsq].add_(applied_sumsq)
-        self.sum_pack[slots.rhs_sumsq].add_(applied_pre_sumsq)
-        self.sum_pack[slots.sum].add_(master_nonzero)
-        self.sum_pack[slots.dot].add_(applied_nonzero)
-        self.sum_pack[slots.zero].add_(cast_zero)
-        self.sum_pack[slots.nonfinite].add_(nonfinite)
-        self.sum_pack[slots.mask_error].add_((~valid).to(dtype=self.sum_pack.dtype))
-
-        valid_extremum = valid & (count > 0)
-        candidate_max = torch.where(
-            valid_extremum,
-            maximum.to(dtype=self.max_pack.dtype),
-            torch.full_like(self.max_pack[slots.maximum], -torch.inf),
-        )
-        candidate_min = torch.where(
-            valid_extremum,
-            minimum.to(dtype=self.min_pack.dtype),
-            torch.full_like(self.min_pack[slots.minimum], torch.inf),
-        )
-        self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
-        self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
+        self.sum_pack[slots.count].add_(count, alpha=scale)
+        self.sum_pack[slots.sumsq].add_(master_sumsq, alpha=scale)
+        self.sum_pack[slots.lhs_sumsq].add_(applied_sumsq, alpha=scale)
+        self.sum_pack[slots.rhs_sumsq].add_(applied_pre_sumsq, alpha=scale)
+        self.sum_pack[slots.sum].add_(master_nonzero, alpha=scale)
+        self.sum_pack[slots.dot].add_(applied_nonzero, alpha=scale)
+        self.sum_pack[slots.zero].add_(cast_zero, alpha=scale)
+        self.sum_pack[slots.nonfinite].add_(nonfinite, alpha=scale)
+        self.sum_pack[slots.nonfinite_arithmetic].add_(arithmetic_error)
+        self.sum_pack[slots.mask_error].add_(materialization_error)
+        torch.maximum(self.max_pack[slots.maximum], maximum, out=self.max_pack[slots.maximum])
+        torch.minimum(self.min_pack[slots.minimum], minimum, out=self.min_pack[slots.minimum])
 
     def reduce_(self) -> "PackedSufficientStatistics":
         """Reduce the three fixed packs with SUM, MAX, and MIN.
