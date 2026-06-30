@@ -17,7 +17,7 @@ launcher must make these exact changes:
 - export the already verified launch identities as
   `DIAG_V2_SCALING_COMMIT`, `DIAG_V2_RESOLVED_CONFIG_SHA256`,
   `DIAG_V2_SCALING_BUNDLE_SHA256`, and `DIAG_V2_MEGATRON_BUNDLE_SHA256`;
-- retain rank 0 as the sole W&B owner and use a single W&B run ID across
+- retain the last world rank as Megatron's sole W&B owner and use a single W&B run ID across
   restart jobs.
 
 Megatron reads its runtime source identity directly from verified git `HEAD`;
@@ -31,3 +31,13 @@ consensus descriptor digest while retaining the schema's exact field set. If
 Scaling requires those identities as separately addressable manifest fields,
 Scaling must first version and approve an artifact-schema change; Megatron must
 not add undeclared fields to `diag/v2/artifact`.
+
+The unchanged schema and approved validator still require Tier-0 pre/post state
+snapshots, a rank-0 writer, and nonempty operations for every topology process
+group. Megatron does not capture state bytes, preserves its last-rank writer,
+and performs only three world all-reduces plus one world all-gather. It therefore
+emits these events as non-promotable with unavailable state snapshots, actual
+mask-checksum sampling facts, actual group memberships, and no invented
+non-world operations. Scaling must version the schema/validator to permit those
+truthful Tier-0 inapplicability and ownership semantics before promotion; until
+then its artifact gate intentionally rejects the event.

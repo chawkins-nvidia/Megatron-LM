@@ -29,10 +29,24 @@ _DEFAULT_SCRATCH_ELEMENT_CAPACITY = 16 * 1024
 _MAX_SCRATCH_BYTES_PER_ELEMENT = 96
 
 
+@dataclass(frozen=True)
+class _MomentWorkspace:
+    """Typed views over the shared startup-reserved observation workspace."""
+
+    fp32: torch.Tensor
+    fp64: torch.Tensor
+    boolean: torch.Tensor
+    fp64_scalars: torch.Tensor
+    fp32_scalars: torch.Tensor
+    bool_scalars: torch.Tensor
+
+
 class PackedReducer(Protocol):
     """Define an injectable packed-collective callable."""
 
-    def __call__(self, tensor: torch.Tensor, *, op: object, group: object | None) -> object:
+    def __call__(
+        self, tensor: torch.Tensor, *, op: object, group: object | None
+    ) -> object:
         """Reduce one packed tensor.
 
         Args:
@@ -85,7 +99,9 @@ class ReductionBinding:
         """
 
         if not isinstance(self.process_group_identity, ProcessGroupIdentity):
-            raise ValueError("reduction bindings require a typed process-group identity")
+            raise ValueError(
+                "reduction bindings require a typed process-group identity"
+            )
         if not isinstance(self.reduction_kind, ReductionKind):
             raise ValueError("reduction bindings require a typed reduction kind")
 
@@ -194,9 +210,13 @@ class DerivedStatistic:
     reason: torch.Tensor
 
 
-def _torch_all_reduce(tensor: torch.Tensor, *, op: object, group: object | None) -> object:
+def _torch_all_reduce(
+    tensor: torch.Tensor, *, op: object, group: object | None
+) -> object:
     if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized, or a reducer must be injected")
+        raise RuntimeError(
+            "torch.distributed must be initialized, or a reducer must be injected"
+        )
     return dist.all_reduce(tensor, op=op, group=group)
 
 
@@ -247,7 +267,9 @@ class PackedSufficientStatistics:
             reduction_binding.process_group_identity != ProcessGroupIdentity.WORLD
             or reduction_binding.reduction_kind != ReductionKind.PACKED_SUM_MAX_MIN
         ):
-            raise ValueError("only the flat packed world SUM/MAX/MIN reduction is implemented")
+            raise ValueError(
+                "only the flat packed world SUM/MAX/MIN reduction is implemented"
+            )
         self.slot_names = slot_names
         self.descriptor_hash = descriptor_hash
         self.schema_identity = schema_identity
@@ -265,6 +287,44 @@ class PackedSufficientStatistics:
         )
         self._peak_scratch_bytes = 0
         self._reduced = False
+        self._workspace: _MomentWorkspace | None = None
+
+    def bind_workspace(self, storage: torch.Tensor) -> None:
+        """Bind startup-preallocated byte storage as typed reusable scratch views."""
+
+        if storage.dtype != torch.uint8 or storage.device != self.sum_pack.device:
+            raise ValueError(
+                "packed-statistics workspace has the wrong device or dtype"
+            )
+        required = self.maximum_scratch_bytes
+        if storage.numel() < required:
+            raise ValueError(
+                "packed-statistics workspace is smaller than its declared bound"
+            )
+        capacity = self.scratch_element_capacity
+        offset = 0
+
+        def take(byte_count: int, dtype: torch.dtype) -> torch.Tensor:
+            nonlocal offset
+            alignment = {torch.float64: 8, torch.float32: 4, torch.bool: 1}[dtype]
+            offset = (offset + alignment - 1) // alignment * alignment
+            result = storage[offset : offset + byte_count].view(dtype)
+            offset += byte_count
+            return result
+
+        fp32 = take(5 * capacity * 4, torch.float32).view(5, capacity)
+        fp64 = take(3 * capacity * 8, torch.float64).view(3, capacity)
+        boolean = take(5 * capacity, torch.bool).view(5, capacity)
+        fp64_scalars = take(16 * 8, torch.float64)
+        fp32_scalars = take(4 * 4, torch.float32)
+        bool_scalars = take(8, torch.bool)
+        if offset > required:
+            raise AssertionError(
+                "packed-statistics workspace layout exceeds its reservation"
+            )
+        self._workspace = _MomentWorkspace(
+            fp32, fp64, boolean, fp64_scalars, fp32_scalars, bool_scalars
+        )
 
     @property
     def maximum_scratch_bytes(self) -> int:
@@ -396,6 +456,151 @@ class PackedSufficientStatistics:
         self._validate_multiplicity(replication_multiplicity)
         slots = self.slots(slot)
         detached = values.detach()
+        if self._workspace is None:
+            self._add_masked_tensor_legacy(
+                slots,
+                detached,
+                mask,
+                replication_multiplicity=replication_multiplicity,
+                require_mask=require_mask,
+            )
+            return
+        weights, mask_valid = self._validated_broadcast_mask(
+            detached, mask, slots, require_mask=require_mask
+        )
+        if detached.numel() == 0:
+            return
+        workspace = self._workspace
+        scale = replication_multiplicity
+        contributions = workspace.fp64_scalars[:5]
+        contributions.zero_()
+        candidate_max = workspace.fp32_scalars[0]
+        candidate_min = workspace.fp32_scalars[1]
+        candidate_max.fill_(-torch.inf)
+        candidate_min.fill_(torch.inf)
+        tensors = (detached,) if weights is None else (detached, weights)
+        for chunks in self._bounded_chunks(*tensors):
+            count = chunks[0].numel()
+            values_fp32, chunk_weights, clean_fp32, extrema = (
+                workspace.fp32[index, :count] for index in range(4)
+            )
+            selected, finite, finite_selected, auxiliary = (
+                workspace.boolean[index, :count] for index in range(4)
+            )
+            clean, finite_weights, work = (
+                workspace.fp64[index, :count] for index in range(3)
+            )
+            values_fp32.copy_(chunks[0])
+            if weights is None:
+                chunk_weights.fill_(1)
+            else:
+                chunk_weights.copy_(chunks[1])
+            self._isfinite_out(chunk_weights, selected, auxiliary)
+            torch.ge(chunk_weights, 0, out=auxiliary)
+            torch.logical_and(selected, auxiliary, out=selected)
+            torch.logical_not(selected, out=auxiliary)
+            chunk_weights.masked_fill_(auxiliary, 0)
+            torch.ne(chunk_weights, 0, out=selected)
+            self._isfinite_out(values_fp32, finite, auxiliary)
+            torch.logical_and(selected, finite, out=finite_selected)
+            clean_fp32.copy_(values_fp32)
+            torch.logical_not(finite, out=auxiliary)
+            clean_fp32.masked_fill_(auxiliary, 0)
+            clean.copy_(clean_fp32)
+            clean_fp32.copy_(chunk_weights)
+            clean_fp32.masked_fill_(auxiliary, 0)
+            finite_weights.copy_(clean_fp32)
+
+            torch.mul(clean, finite_weights, out=work)
+            torch.sum(work, dim=(0,), out=workspace.fp64_scalars[8])
+            contributions[0].add_(workspace.fp64_scalars[8], alpha=1.0 / scale)
+            torch.sum(finite_weights, dim=(0,), out=workspace.fp64_scalars[8])
+            contributions[1].add_(workspace.fp64_scalars[8], alpha=1.0 / scale)
+            torch.square(clean, out=work)
+            work.mul_(finite_weights)
+            torch.sum(work, dim=(0,), out=workspace.fp64_scalars[8])
+            contributions[2].add_(workspace.fp64_scalars[8], alpha=1.0 / scale)
+
+            torch.eq(values_fp32, 0, out=auxiliary)
+            torch.logical_and(finite_selected, auxiliary, out=auxiliary)
+            clean_fp32.copy_(chunk_weights)
+            torch.logical_not(auxiliary, out=workspace.boolean[4, :count])
+            clean_fp32.masked_fill_(workspace.boolean[4, :count], 0)
+            torch.sum(
+                clean_fp32,
+                dim=(0,),
+                dtype=torch.float64,
+                out=workspace.fp64_scalars[8],
+            )
+            contributions[3].add_(workspace.fp64_scalars[8], alpha=1.0 / scale)
+            torch.logical_not(finite, out=auxiliary)
+            torch.logical_and(selected, auxiliary, out=auxiliary)
+            clean_fp32.copy_(chunk_weights)
+            torch.logical_not(auxiliary, out=workspace.boolean[4, :count])
+            clean_fp32.masked_fill_(workspace.boolean[4, :count], 0)
+            torch.sum(
+                clean_fp32,
+                dim=(0,),
+                dtype=torch.float64,
+                out=workspace.fp64_scalars[8],
+            )
+            contributions[4].add_(workspace.fp64_scalars[8], alpha=1.0 / scale)
+
+            extrema.copy_(values_fp32)
+            torch.logical_not(finite_selected, out=auxiliary)
+            extrema.masked_fill_(auxiliary, -torch.inf)
+            torch.amax(extrema, out=workspace.fp32_scalars[2])
+            torch.maximum(candidate_max, workspace.fp32_scalars[2], out=candidate_max)
+            extrema.copy_(values_fp32)
+            extrema.masked_fill_(auxiliary, torch.inf)
+            torch.amin(extrema, out=workspace.fp32_scalars[2])
+            torch.minimum(candidate_min, workspace.fp32_scalars[2], out=candidate_min)
+        contributions.mul_(mask_valid)
+        weighted_sum, count, weighted_sumsq, zero, nonfinite = contributions.unbind()
+        arithmetic_finite = workspace.bool_scalars[1]
+        arithmetic_finite.fill_(True)
+        for contribution in contributions:
+            self._isfinite_out(
+                contribution, workspace.bool_scalars[2], workspace.bool_scalars[3]
+            )
+            arithmetic_finite.logical_and_(workspace.bool_scalars[2])
+        torch.logical_not(arithmetic_finite, out=workspace.bool_scalars[2])
+        self.sum_pack[slots.nonfinite_arithmetic].add_(workspace.bool_scalars[2])
+        for contribution in contributions:
+            contribution.mul_(arithmetic_finite)
+
+        self.sum_pack[slots.sum].add_(weighted_sum)
+        self.sum_pack[slots.count].add_(count)
+        self.sum_pack[slots.sumsq].add_(weighted_sumsq)
+        self.sum_pack[slots.lhs_sumsq].add_(weighted_sumsq)
+        self.sum_pack[slots.zero].add_(zero)
+        self.sum_pack[slots.nonfinite].add_(nonfinite)
+
+        torch.logical_not(mask_valid, out=workspace.bool_scalars[2])
+        candidate_max.masked_fill_(workspace.bool_scalars[2], -torch.inf)
+        candidate_min.masked_fill_(workspace.bool_scalars[2], torch.inf)
+        torch.maximum(
+            self.max_pack[slots.maximum],
+            candidate_max,
+            out=self.max_pack[slots.maximum],
+        )
+        torch.minimum(
+            self.min_pack[slots.minimum],
+            candidate_min,
+            out=self.min_pack[slots.minimum],
+        )
+
+    def _add_masked_tensor_legacy(
+        self,
+        slots: PackedSlots,
+        detached: torch.Tensor,
+        mask: torch.Tensor | None,
+        *,
+        replication_multiplicity: int,
+        require_mask: bool,
+    ) -> None:
+        """Retain the general CPU/test path when no production workspace is bound."""
+
         weights, mask_valid = self._validated_broadcast_mask(
             detached, mask, slots, require_mask=require_mask
         )
@@ -403,15 +608,17 @@ class PackedSufficientStatistics:
             return
         scale = replication_multiplicity
         contributions = torch.zeros(5, dtype=torch.float64, device=detached.device)
-        candidate_max = torch.full((), -torch.inf, dtype=torch.float32, device=detached.device)
-        candidate_min = torch.full((), torch.inf, dtype=torch.float32, device=detached.device)
+        candidate_max = torch.full(
+            (), -torch.inf, dtype=torch.float32, device=detached.device
+        )
+        candidate_min = torch.full(
+            (), torch.inf, dtype=torch.float32, device=detached.device
+        )
         tensors = (detached,) if weights is None else (detached, weights)
         for chunks in self._bounded_chunks(*tensors):
             values_fp32 = chunks[0].to(dtype=torch.float32)
             chunk_weights = (
-                torch.ones_like(values_fp32)
-                if weights is None
-                else chunks[1].to(dtype=torch.float32)
+                torch.ones_like(values_fp32) if weights is None else chunks[1].float()
             )
             valid_weights = torch.isfinite(chunk_weights) & (chunk_weights >= 0)
             chunk_weights = torch.where(
@@ -424,58 +631,53 @@ class PackedSufficientStatistics:
             finite_weights_fp32 = torch.where(
                 finite, chunk_weights, torch.zeros_like(chunk_weights)
             )
-            clean = clean_fp32.to(dtype=torch.float64)
-            finite_weights = finite_weights_fp32.to(dtype=torch.float64)
+            clean = clean_fp32.double()
+            finite_weights = finite_weights_fp32.double()
             contributions[0].add_((clean * finite_weights).sum() / scale)
             contributions[1].add_(finite_weights.sum() / scale)
             contributions[2].add_((clean.square() * finite_weights).sum() / scale)
             contributions[3].add_(
-                torch.where(
-                    finite_selected & (values_fp32 == 0),
-                    chunk_weights,
-                    torch.zeros_like(chunk_weights),
-                ).sum(dtype=torch.float64)
+                torch.where(finite_selected & (values_fp32 == 0), chunk_weights, 0).sum(
+                    dtype=torch.float64
+                )
                 / scale
             )
             contributions[4].add_(
-                torch.where(selected & ~finite, chunk_weights, torch.zeros_like(chunk_weights)).sum(
+                torch.where(selected & ~finite, chunk_weights, 0).sum(
                     dtype=torch.float64
                 )
                 / scale
             )
             candidate_max = torch.maximum(
                 candidate_max,
-                torch.where(
-                    finite_selected, values_fp32, torch.full_like(values_fp32, -torch.inf)
-                ).amax(),
+                torch.where(finite_selected, values_fp32, -torch.inf).amax(),
             )
             candidate_min = torch.minimum(
                 candidate_min,
-                torch.where(
-                    finite_selected, values_fp32, torch.full_like(values_fp32, torch.inf)
-                ).amin(),
+                torch.where(finite_selected, values_fp32, torch.inf).amin(),
             )
         contributions.mul_(mask_valid.to(dtype=contributions.dtype))
-        weighted_sum, count, weighted_sumsq, zero, nonfinite = contributions.unbind()
-        weighted_sum, count, weighted_sumsq, zero, nonfinite = self._finite_contributions(
-            slots, weighted_sum, count, weighted_sumsq, zero, nonfinite
+        weighted_sum, count, weighted_sumsq, zero, nonfinite = (
+            self._finite_contributions(slots, *contributions.unbind())
         )
-
         self.sum_pack[slots.sum].add_(weighted_sum)
         self.sum_pack[slots.count].add_(count)
         self.sum_pack[slots.sumsq].add_(weighted_sumsq)
         self.sum_pack[slots.lhs_sumsq].add_(weighted_sumsq)
         self.sum_pack[slots.zero].add_(zero)
         self.sum_pack[slots.nonfinite].add_(nonfinite)
-
-        candidate_max = torch.where(
-            mask_valid, candidate_max, torch.full_like(candidate_max, -torch.inf)
+        candidate_max = torch.where(mask_valid, candidate_max, -torch.inf)
+        candidate_min = torch.where(mask_valid, candidate_min, torch.inf)
+        torch.maximum(
+            self.max_pack[slots.maximum],
+            candidate_max,
+            out=self.max_pack[slots.maximum],
         )
-        candidate_min = torch.where(
-            mask_valid, candidate_min, torch.full_like(candidate_min, torch.inf)
+        torch.minimum(
+            self.min_pack[slots.minimum],
+            candidate_min,
+            out=self.min_pack[slots.minimum],
         )
-        self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
-        self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
 
     def add_masked_pair(
         self,
@@ -536,16 +738,26 @@ class PackedSufficientStatistics:
             return
         scale = replication_multiplicity
         contributions = torch.zeros(7, dtype=torch.float64, device=lhs_values.device)
-        candidate_max = torch.full((), -torch.inf, dtype=torch.float32, device=lhs_values.device)
-        candidate_min = torch.full((), torch.inf, dtype=torch.float32, device=lhs_values.device)
-        tensors = (lhs_values, rhs_values) if weights is None else (lhs_values, rhs_values, weights)
+        candidate_max = torch.full(
+            (), -torch.inf, dtype=torch.float32, device=lhs_values.device
+        )
+        candidate_min = torch.full(
+            (), torch.inf, dtype=torch.float32, device=lhs_values.device
+        )
+        tensors = (
+            (lhs_values, rhs_values)
+            if weights is None
+            else (lhs_values, rhs_values, weights)
+        )
         for chunks in self._bounded_chunks(*tensors):
             lhs_fp32 = chunks[0].to(dtype=torch.float32)
             rhs_fp32 = chunks[1].to(dtype=torch.float32)
             if difference_lhs:
                 lhs_fp32 = lhs_fp32 - rhs_fp32
             chunk_weights = (
-                torch.ones_like(lhs_fp32) if weights is None else chunks[2].to(dtype=torch.float32)
+                torch.ones_like(lhs_fp32)
+                if weights is None
+                else chunks[2].to(dtype=torch.float32)
             )
             valid_weights = torch.isfinite(chunk_weights) & (chunk_weights >= 0)
             chunk_weights = torch.where(
@@ -566,7 +778,9 @@ class PackedSufficientStatistics:
             contributions[1].add_(finite_weights.sum() / scale)
             contributions[2].add_((clean_lhs.square() * finite_weights).sum() / scale)
             contributions[3].add_((clean_rhs.square() * finite_weights).sum() / scale)
-            contributions[4].add_((clean_lhs * clean_rhs * finite_weights).sum() / scale)
+            contributions[4].add_(
+                (clean_lhs * clean_rhs * finite_weights).sum() / scale
+            )
             contributions[5].add_(
                 torch.where(
                     finite_selected & (lhs_fp32 == 0),
@@ -576,9 +790,9 @@ class PackedSufficientStatistics:
                 / scale
             )
             contributions[6].add_(
-                torch.where(selected & ~finite, chunk_weights, torch.zeros_like(chunk_weights)).sum(
-                    dtype=torch.float64
-                )
+                torch.where(
+                    selected & ~finite, chunk_weights, torch.zeros_like(chunk_weights)
+                ).sum(dtype=torch.float64)
                 / scale
             )
             candidate_max = torch.maximum(
@@ -589,10 +803,14 @@ class PackedSufficientStatistics:
             )
             candidate_min = torch.minimum(
                 candidate_min,
-                torch.where(finite_selected, lhs_fp32, torch.full_like(lhs_fp32, torch.inf)).amin(),
+                torch.where(
+                    finite_selected, lhs_fp32, torch.full_like(lhs_fp32, torch.inf)
+                ).amin(),
             )
         contributions.mul_(mask_valid.to(dtype=contributions.dtype))
-        weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite = contributions.unbind()
+        weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite = (
+            contributions.unbind()
+        )
         (weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite) = (
             self._finite_contributions(
                 slots, weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite
@@ -614,8 +832,12 @@ class PackedSufficientStatistics:
         candidate_min = torch.where(
             mask_valid, candidate_min, torch.full_like(candidate_min, torch.inf)
         )
-        self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
-        self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
+        self.max_pack[slots.maximum] = torch.maximum(
+            self.max_pack[slots.maximum], candidate_max
+        )
+        self.min_pack[slots.minimum] = torch.minimum(
+            self.min_pack[slots.minimum], candidate_min
+        )
 
     def add_update(
         self,
@@ -652,7 +874,9 @@ class PackedSufficientStatistics:
             difference_lhs=True,
         )
 
-    def mark_mask_error(self, slot: str | int, error: torch.Tensor | None = None) -> None:
+    def mark_mask_error(
+        self, slot: str | int, error: torch.Tensor | None = None
+    ) -> None:
         """Record a device-resident mask contract failure for one slot.
 
         Args:
@@ -669,11 +893,11 @@ class PackedSufficientStatistics:
         if error is None or error.numel() != 1 or error.device != self.sum_pack.device:
             self.sum_pack[slots.mask_error].add_(1)
             return
-        self.sum_pack[slots.mask_error].add_(
-            error.detach().reshape(()).to(dtype=self.sum_pack.dtype)
-        )
+        self.sum_pack[slots.mask_error].add_(error.detach().reshape(()))
 
-    def mark_arithmetic_error(self, slot: str | int, error: torch.Tensor | None = None) -> None:
+    def mark_arithmetic_error(
+        self, slot: str | int, error: torch.Tensor | None = None
+    ) -> None:
         """Record a device-resident arithmetic contract failure for one slot.
 
         Args:
@@ -690,11 +914,11 @@ class PackedSufficientStatistics:
         if error is None or error.numel() != 1 or error.device != self.sum_pack.device:
             self.sum_pack[slots.nonfinite_arithmetic].add_(1)
             return
-        self.sum_pack[slots.nonfinite_arithmetic].add_(
-            error.detach().reshape(()).to(dtype=self.sum_pack.dtype)
-        )
+        self.sum_pack[slots.nonfinite_arithmetic].add_(error.detach().reshape(()))
 
-    def mark_observation_error(self, slot: str | int, error: torch.Tensor | None = None) -> None:
+    def mark_observation_error(
+        self, slot: str | int, error: torch.Tensor | None = None
+    ) -> None:
         """Record missing or duplicate callback completion for one slot.
 
         Args:
@@ -711,9 +935,7 @@ class PackedSufficientStatistics:
         if error is None or error.numel() != 1 or error.device != self.sum_pack.device:
             self.sum_pack[slots.observation_error].add_(1)
             return
-        self.sum_pack[slots.observation_error].add_(
-            error.detach().reshape(()).to(dtype=self.sum_pack.dtype)
-        )
+        self.sum_pack[slots.observation_error].add_(error.detach().reshape(()))
 
     def add_applied_update(
         self,
@@ -750,13 +972,16 @@ class PackedSufficientStatistics:
         self._ensure_accumulating()
         self._validate_multiplicity(replication_multiplicity)
         slots = self.slots(slot)
-        (master_before_fp32, master_after_fp32, applied_before_fp32, applied_after_fp32) = (
-            torch.broadcast_tensors(
-                master_before.detach().to(dtype=torch.float32),
-                master_after.detach().to(dtype=torch.float32),
-                applied_before.detach().to(dtype=torch.float32),
-                applied_after.detach().to(dtype=torch.float32),
-            )
+        (
+            master_before_fp32,
+            master_after_fp32,
+            applied_before_fp32,
+            applied_after_fp32,
+        ) = torch.broadcast_tensors(
+            master_before.detach().to(dtype=torch.float32),
+            master_after.detach().to(dtype=torch.float32),
+            applied_before.detach().to(dtype=torch.float32),
+            applied_after.detach().to(dtype=torch.float32),
         )
         if master_before_fp32.numel() == 0:
             return
@@ -784,10 +1009,12 @@ class PackedSufficientStatistics:
         master_sumsq = clean_master_delta.square().sum() / scale
         applied_sumsq = clean_applied_delta.square().sum() / scale
         applied_pre_sumsq = clean_applied_before.square().sum() / scale
-        master_nonzero = (finite & (master_delta_fp32 != 0)).sum(dtype=torch.float64) / scale
-        applied_nonzero = (finite & (master_delta_fp32 != 0) & (applied_delta_fp32 != 0)).sum(
+        master_nonzero = (finite & (master_delta_fp32 != 0)).sum(
             dtype=torch.float64
         ) / scale
+        applied_nonzero = (
+            finite & (master_delta_fp32 != 0) & (applied_delta_fp32 != 0)
+        ).sum(dtype=torch.float64) / scale
         cast_zero = (finite & (master_delta_fp32 != 0) & (applied_delta_fp32 == 0)).sum(
             dtype=torch.float64
         ) / scale
@@ -828,8 +1055,12 @@ class PackedSufficientStatistics:
         candidate_min = torch.where(
             finite, applied_delta_fp32, torch.full_like(applied_delta_fp32, torch.inf)
         ).amin()
-        self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
-        self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
+        self.max_pack[slots.maximum] = torch.maximum(
+            self.max_pack[slots.maximum], candidate_max
+        )
+        self.min_pack[slots.minimum] = torch.minimum(
+            self.min_pack[slots.minimum], candidate_min
+        )
 
     def add_applied_update_moments(
         self,
@@ -905,7 +1136,9 @@ class PackedSufficientStatistics:
             raise ValueError("precomputed materialization validity must be boolean")
         numeric = contributions[:8]
         if any(contribution.dtype != torch.float64 for contribution in numeric):
-            raise ValueError("precomputed numeric applied-update moments must be float64")
+            raise ValueError(
+                "precomputed numeric applied-update moments must be float64"
+            )
         if maximum.dtype != self.max_pack.dtype or minimum.dtype != self.min_pack.dtype:
             raise ValueError("precomputed applied-update extrema have the wrong dtype")
         scale = 1.0 / replication_multiplicity
@@ -920,8 +1153,12 @@ class PackedSufficientStatistics:
         self.sum_pack[slots.nonfinite].add_(nonfinite, alpha=scale)
         self.sum_pack[slots.nonfinite_arithmetic].add_(arithmetic_error)
         self.sum_pack[slots.mask_error].add_(materialization_error)
-        torch.maximum(self.max_pack[slots.maximum], maximum, out=self.max_pack[slots.maximum])
-        torch.minimum(self.min_pack[slots.minimum], minimum, out=self.min_pack[slots.minimum])
+        torch.maximum(
+            self.max_pack[slots.maximum], maximum, out=self.max_pack[slots.maximum]
+        )
+        torch.minimum(
+            self.min_pack[slots.minimum], minimum, out=self.min_pack[slots.minimum]
+        )
 
     def reduce_(self) -> "PackedSufficientStatistics":
         """Reduce the three fixed packs with SUM, MAX, and MIN.
@@ -966,9 +1203,21 @@ class PackedSufficientStatistics:
             raise ValueError("packed event reduction requires at least one accumulator")
         device = packed[0].sum_pack.device
         return (
-            torch.empty(sum(item.sum_pack.numel() for item in packed), dtype=torch.float64, device=device),
-            torch.empty(sum(item.max_pack.numel() for item in packed), dtype=torch.float32, device=device),
-            torch.empty(sum(item.min_pack.numel() for item in packed), dtype=torch.float32, device=device),
+            torch.empty(
+                sum(item.sum_pack.numel() for item in packed),
+                dtype=torch.float64,
+                device=device,
+            ),
+            torch.empty(
+                sum(item.max_pack.numel() for item in packed),
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.empty(
+                sum(item.min_pack.numel() for item in packed),
+                dtype=torch.float32,
+                device=device,
+            ),
         )
 
     @staticmethod
@@ -992,8 +1241,8 @@ class PackedSufficientStatistics:
                 )
 
         if arenas is None:
-            sum_arena, max_arena, min_arena = PackedSufficientStatistics.allocate_reduction_arenas(
-                packed
+            sum_arena, max_arena, min_arena = (
+                PackedSufficientStatistics.allocate_reduction_arenas(packed)
             )
         else:
             sum_arena, max_arena, min_arena = arenas
@@ -1069,7 +1318,9 @@ class PackedSufficientStatistics:
         """
 
         slots = self._derived_slots(slot)
-        ratio = self._ratio(self.sum_pack[slots.sumsq], self.sum_pack[slots.count], slots)
+        ratio = self._ratio(
+            self.sum_pack[slots.sumsq], self.sum_pack[slots.count], slots
+        )
         return self._safe_sqrt(ratio)
 
     def cosine(self, slot: str | int) -> DerivedStatistic:
@@ -1098,7 +1349,9 @@ class PackedSufficientStatistics:
         """
 
         slots = self._derived_slots(slot)
-        ratio = self._ratio(self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.rhs_sumsq], slots)
+        ratio = self._ratio(
+            self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.rhs_sumsq], slots
+        )
         return self._safe_sqrt(ratio)
 
     def master_delta_rms(self, slot: str | int) -> DerivedStatistic:
@@ -1114,7 +1367,9 @@ class PackedSufficientStatistics:
 
         slots = self._derived_slots(slot)
         return self._safe_sqrt(
-            self._ratio(self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.count], slots)
+            self._ratio(
+                self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.count], slots
+            )
         )
 
     def norm_retention(self, slot: str | int) -> DerivedStatistic:
@@ -1122,7 +1377,9 @@ class PackedSufficientStatistics:
 
         slots = self._derived_slots(slot)
         return self._safe_sqrt(
-            self._ratio(self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.sumsq], slots)
+            self._ratio(
+                self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.sumsq], slots
+            )
         )
 
     def master_nonzero_fraction(self, slot: str | int) -> DerivedStatistic:
@@ -1229,7 +1486,11 @@ class PackedSufficientStatistics:
             & (~positive_denominator | torch.isfinite(quotient))
         )
         valid = (
-            has_contributors & finite_input & positive_denominator & mask_valid & arithmetic_finite
+            has_contributors
+            & finite_input
+            & positive_denominator
+            & mask_valid
+            & arithmetic_finite
         )
         value = torch.where(valid, quotient, torch.full_like(numerator, torch.nan))
         reason = self._reason(
@@ -1285,18 +1546,26 @@ class PackedSufficientStatistics:
     ) -> torch.Tensor:
         reason = torch.full_like(reference, Tier0Reason.NONE, dtype=torch.int64)
         reason = torch.where(
-            ~positive_denominator, torch.full_like(reason, Tier0Reason.ZERO_DENOMINATOR), reason
+            ~positive_denominator,
+            torch.full_like(reason, Tier0Reason.ZERO_DENOMINATOR),
+            reason,
         )
         reason = torch.where(
-            ~has_contributors, torch.full_like(reason, Tier0Reason.NO_CONTRIBUTORS), reason
+            ~has_contributors,
+            torch.full_like(reason, Tier0Reason.NO_CONTRIBUTORS),
+            reason,
         )
         reason = torch.where(
             ~finite_input, torch.full_like(reason, Tier0Reason.NONFINITE_INPUT), reason
         )
         reason = torch.where(
-            ~arithmetic_finite, torch.full_like(reason, Tier0Reason.NONFINITE_ARITHMETIC), reason
+            ~arithmetic_finite,
+            torch.full_like(reason, Tier0Reason.NONFINITE_ARITHMETIC),
+            reason,
         )
-        return torch.where(~mask_valid, torch.full_like(reason, Tier0Reason.MASK_MISMATCH), reason)
+        return torch.where(
+            ~mask_valid, torch.full_like(reason, Tier0Reason.MASK_MISMATCH), reason
+        )
 
     def _derived_slots(self, slot: str | int) -> PackedSlots:
         if not self._reduced:
@@ -1321,7 +1590,11 @@ class PackedSufficientStatistics:
         *,
         require_mask: bool,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
-        mask_valid = torch.ones((), dtype=torch.bool, device=values.device)
+        if self._workspace is None:
+            mask_valid = torch.ones((), dtype=torch.bool, device=values.device)
+        else:
+            mask_valid = self._workspace.bool_scalars[0]
+            mask_valid.fill_(True)
         if mask is None:
             if require_mask:
                 self.sum_pack[slots.mask_error].add_(1)
@@ -1339,29 +1612,68 @@ class PackedSufficientStatistics:
             return None, mask_valid
 
         for (weight_chunk,) in self._bounded_chunks(weights):
-            weights_fp32 = weight_chunk.to(dtype=torch.float32)
-            mask_valid.logical_and_((torch.isfinite(weights_fp32) & (weights_fp32 >= 0)).all())
-        self.sum_pack[slots.mask_error].add_((~mask_valid).to(dtype=self.sum_pack.dtype))
+            if self._workspace is None:
+                weights_fp32 = weight_chunk.to(dtype=torch.float32)
+                mask_valid.logical_and_(
+                    (torch.isfinite(weights_fp32) & (weights_fp32 >= 0)).all()
+                )
+            else:
+                count = weight_chunk.numel()
+                weights_fp32 = self._workspace.fp32[4, :count]
+                finite = self._workspace.boolean[4, :count]
+                nonnegative = self._workspace.boolean[3, :count]
+                weights_fp32.copy_(weight_chunk)
+                self._isfinite_out(weights_fp32, finite, nonnegative)
+                torch.ge(weights_fp32, 0, out=nonnegative)
+                finite.logical_and_(nonnegative)
+                torch.all(finite, out=self._workspace.bool_scalars[1])
+                mask_valid.logical_and_(self._workspace.bool_scalars[1])
+        if self._workspace is None:
+            self.sum_pack[slots.mask_error].add_(
+                (~mask_valid).to(dtype=self.sum_pack.dtype)
+            )
+        else:
+            torch.logical_not(mask_valid, out=self._workspace.bool_scalars[1])
+            self.sum_pack[slots.mask_error].add_(self._workspace.bool_scalars[1])
         return weights, mask_valid
 
-    def _bounded_chunks(self, *tensors: torch.Tensor) -> Iterator[tuple[torch.Tensor, ...]]:
+    @staticmethod
+    def _isfinite_out(
+        values: torch.Tensor, finite: torch.Tensor, auxiliary: torch.Tensor
+    ) -> None:
+        """Compute finite flags with primitives that support caller-provided output."""
+
+        torch.eq(values, values, out=finite)
+        torch.ne(values, torch.inf, out=auxiliary)
+        finite.logical_and_(auxiliary)
+        torch.ne(values, -torch.inf, out=auxiliary)
+        finite.logical_and_(auxiliary)
+
+    def _bounded_chunks(
+        self, *tensors: torch.Tensor
+    ) -> Iterator[tuple[torch.Tensor, ...]]:
         pending = [tensors]
         while pending:
             chunks = pending.pop()
             reference = chunks[0]
             if reference.numel() <= self.scratch_element_capacity:
                 self._peak_scratch_bytes = max(
-                    self._peak_scratch_bytes, reference.numel() * _MAX_SCRATCH_BYTES_PER_ELEMENT
+                    self._peak_scratch_bytes,
+                    reference.numel() * _MAX_SCRATCH_BYTES_PER_ELEMENT,
                 )
                 yield chunks
                 continue
             split_dimension = next(
-                dimension for dimension, length in enumerate(reference.shape) if length > 1
+                dimension
+                for dimension, length in enumerate(reference.shape)
+                if length > 1
             )
             split = reference.shape[split_dimension] // 2
             first = tuple(tensor.narrow(split_dimension, 0, split) for tensor in chunks)
             second = tuple(
-                tensor.narrow(split_dimension, split, reference.shape[split_dimension] - split)
+                tensor.narrow(
+                    split_dimension, split, reference.shape[split_dimension] - split
+                )
                 for tensor in chunks
             )
             pending.append(second)

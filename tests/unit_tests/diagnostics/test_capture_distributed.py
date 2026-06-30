@@ -12,13 +12,17 @@ Run with::
 import os
 from contextlib import nullcontext
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.diagnostics import get_diagnostic_microbatch_id
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.pipeline_parallel import schedules
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.diagnostics.accumulator import ReductionBinding
@@ -144,6 +148,191 @@ def test_fixed_shape_pp_mask_sideband_preserves_order_without_broadcast(
         ]
     # The PP=2 cooldown contains only backward traffic; it must not add masks.
     assert len(source_phases if rank == 0 else receiver_phases) == 8
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_real_noninterleaved_pp2_schedule_matches_sideband_through_cooldown(
+    gloo_world: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run the production PP2 warmup/1F1B/cooldown loop for four microbatches."""
+
+    rank = dist.get_rank()
+    singleton_groups = [dist.new_group([owner]) for owner in range(2)]
+    singleton = singleton_groups[rank]
+    events: list[tuple[str, int]] = []
+
+    class Heartbeat:
+        armed = True
+
+        def begin_microbatch(self, microbatch_id: int) -> None:
+            events.append(("begin", microbatch_id))
+
+        def end_microbatch(self, microbatch_id: int) -> None:
+            events.append(("end", microbatch_id))
+
+        def register_local_loss_mask(self, microbatch_id: int, _mask) -> None:
+            events.append(("register", microbatch_id))
+            if rank == 0:
+                dist.send(
+                    torch.tensor([float(microbatch_id)]), dst=1, tag=100 + microbatch_id
+                )
+
+        def receive_mask_sideband(self, microbatch_id: int) -> None:
+            if rank == 1:
+                payload = torch.empty(1)
+                dist.recv(payload, src=0, tag=100 + microbatch_id)
+                assert payload[0] == microbatch_id
+                events.append(("receive", microbatch_id))
+
+        def forward_mask_sideband(self, microbatch_id: int) -> None:
+            events.append(("forward", microbatch_id))
+
+    heartbeat = Heartbeat()
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.input_tensor = None
+            self.model_type = "unit-test"
+            self.config = SimpleNamespace(
+                overlap_p2p_comm=False,
+                finalize_model_grads_func=None,
+                timers=None,
+                no_sync_func=None,
+                num_microbatches_with_partial_activation_checkpoints=None,
+                sequence_parallel=False,
+                hidden_size=1,
+                pipeline_dtype=torch.float32,
+                variable_seq_lengths=False,
+                deallocate_pipeline_outputs=False,
+                grad_sync_func=None,
+                calculate_per_token_loss=False,
+                enable_autocast=False,
+                autocast_dtype=None,
+                diagnostic_heartbeat=heartbeat,
+            )
+
+        def set_input_tensor(self, value) -> None:
+            self.input_tensor = value[0]
+
+    model = Model()
+
+    class Communicator:
+        total_stages = 2
+        current_stage = rank
+        is_pp_first_stage = rank == 0
+        is_pp_last_stage = rank == 1
+
+        def __init__(self) -> None:
+            self.config = model.config
+            self.forward_send = 0
+            self.forward_recv = 0
+            self.backward_send = 0
+            self.backward_recv = 0
+
+        def recv_forward(self, _shapes, is_first: bool):
+            if is_first:
+                return None
+            value = torch.empty(1)
+            dist.recv(value, src=0, tag=200 + self.forward_recv)
+            self.forward_recv += 1
+            return value.requires_grad_(True)
+
+        def send_forward(self, output, is_last: bool) -> None:
+            if not is_last:
+                dist.send(output.detach(), dst=1, tag=200 + self.forward_send)
+                self.forward_send += 1
+
+        def send_forward_recv_backward(self, output, _shapes, is_last: bool):
+            if is_last:
+                return None
+            request = dist.isend(output.detach(), dst=1, tag=200 + self.forward_send)
+            self.forward_send += 1
+            gradient = torch.empty_like(output)
+            dist.recv(gradient, src=1, tag=300 + self.backward_recv)
+            self.backward_recv += 1
+            request.wait()
+            return gradient
+
+        def send_backward_recv_forward(self, gradient, _shapes, is_first: bool):
+            if is_first:
+                return None
+            request = dist.isend(gradient.detach(), dst=0, tag=300 + self.backward_send)
+            self.backward_send += 1
+            value = torch.empty(1)
+            dist.recv(value, src=0, tag=200 + self.forward_recv)
+            self.forward_recv += 1
+            request.wait()
+            return value.requires_grad_(True)
+
+        def recv_backward(self, _shapes, is_last: bool):
+            if is_last:
+                return None
+            gradient = torch.empty(1)
+            dist.recv(gradient, src=1, tag=300 + self.backward_recv)
+            self.backward_recv += 1
+            return gradient
+
+        def send_backward(self, gradient, is_first: bool) -> None:
+            if not is_first:
+                dist.send(gradient.detach(), dst=0, tag=300 + self.backward_send)
+                self.backward_send += 1
+
+    communicator = Communicator()
+    groups = ProcessGroupCollection()
+    groups.tp = singleton
+    groups.cp = singleton
+    groups.pp = dist.group.WORLD
+    groups.dp_cp = singleton
+
+    original_zeros = torch.zeros
+
+    def cpu_zeros(*args, **kwargs):
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(schedules.torch, "zeros", cpu_zeros)
+    monkeypatch.setattr(schedules, "deallocate_output_tensor", lambda *_args: None)
+    monkeypatch.setattr(
+        schedules,
+        "backward_step",
+        lambda input_tensor, *_args: (
+            None if input_tensor is None else torch.ones_like(input_tensor)
+        ),
+    )
+
+    def producer(_iterator, current_model):
+        microbatch_id = get_diagnostic_microbatch_id()
+        assert microbatch_id is not None
+        heartbeat.register_local_loss_mask(microbatch_id, None)
+        if rank == 0:
+            output = current_model.weight * float(microbatch_id + 1)
+        else:
+            output = current_model.input_tensor + current_model.weight
+        return output, None
+
+    schedules.forward_backward_pipelining_without_interleaving(
+        forward_step_func=producer,
+        data_iterator=None,
+        model=model,
+        num_microbatches=4,
+        seq_length=1,
+        micro_batch_size=1,
+        forward_only=False,
+        p2p_communicator=communicator,
+        pg_collection=groups,
+    )
+
+    assert [value for name, value in events if name == "begin"] == list(range(4))
+    assert [value for name, value in events if name == "end"] == list(range(4))
+    assert [value for name, value in events if name == "register"] == list(range(4))
+    if rank == 1:
+        assert [value for name, value in events if name == "receive"] == list(range(4))
+    assert communicator.forward_send + communicator.forward_recv == 4
+    assert communicator.backward_send + communicator.backward_recv == 4
     dist.barrier()
 
 

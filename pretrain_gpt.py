@@ -60,7 +60,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.diagnostics.tier0 import mark_tier0_mask_producer
+from megatron.training.diagnostics.tier0 import _register_canonical_gpt_mask_producer
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -265,7 +265,6 @@ def loss_func(
     return loss, num_tokens, report
 
 
-@mark_tier0_mask_producer
 def forward_step(
     data_iterator,
     model: GPTModel,
@@ -326,6 +325,9 @@ def forward_step(
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
+
+
+_register_canonical_gpt_mask_producer(forward_step)
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):

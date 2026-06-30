@@ -4,12 +4,12 @@
 
 from __future__ import annotations
 
-import functools
-import inspect
 import math
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any, Literal
 
 import torch
@@ -91,7 +91,16 @@ _CONTROL_NAMES = (
     "control/adapter_status",
     "control/peak_hbm_bytes",
 )
-_MASK_PRODUCER_MARKER = "megatron.tier0.canonical-gpt-mask-producer.v1"
+_RANK_EVIDENCE_FIELDS = 10
+_INT64_MAX = 2**63 - 1
+_MAX_RESERVATION_BYTES = 8 * 1024**3
+_MAX_LAYERS = 512
+_MAX_MICROBATCHES = 64
+_MAX_MICRO_BATCH_SIZE = 8
+_MAX_SEQUENCE_LENGTH = 32_768
+_MASK_PRODUCER_IDENTITY = object()
+_NONINTERLEAVED_SCHEDULE_ADAPTER = "forward_backward_pipelining_without_interleaving:v1"
+_canonical_mask_producer: tuple[Callable[..., Any], object, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +164,23 @@ class Tier0Reservation:
     max_extra_bytes: int
     accepted: bool
     measured_allocated_bytes: int = 0
+    measured_reserved_bytes: int = 0
+
+
+class Tier0ReservationStatus(IntEnum):
+    """Globally agreed startup reservation result."""
+
+    OK = 0
+    UNSUPPORTED = 1
+    OVERFLOW = 2
+
+
+class Tier0ReservationError(RuntimeError):
+    """Raised coherently before P2P when the reservation is unsupported."""
+
+    def __init__(self, status: Tier0ReservationStatus, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def tier0_reservation_bytes(
@@ -186,8 +212,15 @@ def tier0_reservation_bytes(
     )
     optimizer_bytes = snapshot_memory_estimate(owner_elements).total_bytes
     capture_scratch = PackedSufficientStatistics.scratch_bytes_for_capacity()
-    rank_evidence_bytes = (world_size + 1) * 9 * 8
-    sink_staging_bytes = (75 + 9 * world_size + 13 * (capture_slots + update_slots)) * 8
+    mask_elements = micro_batch_size * local_sequence_length
+    capture_control_bytes = 2 * mask_elements + 8 + 16
+    rank_evidence_bytes = (world_size + 1) * _RANK_EVIDENCE_FIELDS * 8
+    sink_staging_bytes = (
+        _RANK_EVIDENCE_FIELDS * world_size
+        + 13 * (capture_slots + update_slots + control_slots)
+    ) * 8
+    identity_checksum_bytes = 2 * mask_elements * 4 + 8
+    allocator_alignment_bytes = 512 * (2 * num_microbatches + 64)
     return (
         2 * pack_bytes
         + sideband_bytes
@@ -195,7 +228,24 @@ def tier0_reservation_bytes(
         + capture_scratch
         + rank_evidence_bytes
         + sink_staging_bytes
-        + 24
+        + capture_control_bytes
+        + identity_checksum_bytes
+        + 256
+        + allocator_alignment_bytes
+    )
+
+
+def allocator_growth_within_bound(
+    *,
+    pre_event_reserved_bytes: int,
+    peak_reserved_bytes: int,
+    predicted_increment_bytes: int,
+) -> bool:
+    """Check allocator-reserved event growth against the same pre-event baseline."""
+
+    return (
+        max(0, peak_reserved_bytes - pre_event_reserved_bytes)
+        <= predicted_increment_bytes
     )
 
 
@@ -215,42 +265,39 @@ def _distributed_optimizer(optimizer: object) -> DistributedOptimizer | None:
     return child if isinstance(child, DistributedOptimizer) else None
 
 
-def mark_tier0_mask_producer(
+def _register_canonical_gpt_mask_producer(
     forward_step_func: Callable[..., Any],
-) -> Callable[..., Any]:
-    """Mark a mechanically verifiable forward function as a Tier-0 mask producer."""
+    *,
+    schedule_adapter: str = _NONINTERLEAVED_SCHEDULE_ADAPTER,
+) -> None:
+    """Register the application-owned GPT producer by exact object identity."""
 
-    setattr(
-        forward_step_func, "__megatron_tier0_mask_producer__", _MASK_PRODUCER_MARKER
+    global _canonical_mask_producer
+    if schedule_adapter != _NONINTERLEAVED_SCHEDULE_ADAPTER:
+        raise ValueError(
+            "Tier-0 requires the canonical noninterleaved schedule adapter"
+        )
+    if (
+        _canonical_mask_producer is not None
+        and _canonical_mask_producer[0] is not forward_step_func
+    ):
+        raise RuntimeError("Tier-0 canonical GPT mask producer is already registered")
+    _canonical_mask_producer = (
+        forward_step_func,
+        _MASK_PRODUCER_IDENTITY,
+        schedule_adapter,
     )
-    return forward_step_func
 
 
 def _verified_mask_producer(forward_step_func: Callable[..., Any] | None) -> bool:
-    """Require both the positive marker and the canonical registration operations."""
+    """Accept only the application-registered function and schedule contract."""
 
-    if forward_step_func is None:
-        return False
-    candidate = (
-        forward_step_func.func
-        if isinstance(forward_step_func, functools.partial)
-        else forward_step_func
-    )
-    candidate = inspect.unwrap(candidate)
-    if (
-        getattr(candidate, "__megatron_tier0_mask_producer__", None)
-        != _MASK_PRODUCER_MARKER
-    ):
-        return False
-    try:
-        parameters = inspect.signature(candidate).parameters
-        names = set(candidate.__code__.co_names)
-    except (TypeError, ValueError, AttributeError):
-        return False
-    return (
-        "diagnostic_heartbeat" in parameters
-        and "register_local_loss_mask" in names
-        and "get_diagnostic_microbatch_id" in names
+    registration = _canonical_mask_producer
+    return bool(
+        registration is not None
+        and registration[0] is forward_step_func
+        and registration[1] is _MASK_PRODUCER_IDENTITY
+        and registration[2] == _NONINTERLEAVED_SCHEDULE_ADAPTER
     )
 
 
@@ -325,12 +372,30 @@ def _local_capability_reasons(
         (int(getattr(args, "tensor_model_parallel_size", 1)), 1, 1024),
         (int(getattr(args, "pipeline_model_parallel_size", 1)), 1, 1024),
         (int(getattr(args, "context_parallel_size", 1)), 1, 1024),
-        (int(getattr(args, "num_layers", 1)), 1, 10_000),
-        (int(getattr(args, "micro_batch_size", 1)), 1, 1_048_576),
-        (int(getattr(args, "seq_length", 1)), 1, 16_777_216),
+        (int(getattr(args, "num_layers", 1)), 1, _MAX_LAYERS),
+        (int(getattr(args, "micro_batch_size", 1)), 1, _MAX_MICRO_BATCH_SIZE),
+        (int(getattr(args, "seq_length", 1)), 1, _MAX_SEQUENCE_LENGTH),
     )
     if any(
         value < minimum or value > maximum for value, minimum, maximum in bounded_values
+    ):
+        reasons.append("capability_bounds")
+    topology_product = math.prod(
+        int(getattr(args, name, 1))
+        for name in (
+            "data_parallel_size",
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+        )
+    )
+    context_parallel_size = int(getattr(args, "context_parallel_size", 1))
+    if (
+        topology_product != world_size
+        or int(getattr(args, "pipeline_model_parallel_size", 1))
+        > int(getattr(args, "num_layers", 1))
+        or context_parallel_size <= 0
+        or int(getattr(args, "seq_length", 1)) % max(1, context_parallel_size) != 0
     ):
         reasons.append("capability_bounds")
     if not _verified_mask_producer(forward_step_func):
@@ -573,6 +638,8 @@ class Tier0Heartbeat:
         self._expected_num_microbatches = 0
         self._sideband_payloads: dict[int, torch.Tensor] = {}
         self._local_sideband_payloads: dict[int, torch.Tensor] = {}
+        self._sideband_validity: dict[int, torch.Tensor] = {}
+        self._local_sideband_validity: dict[int, torch.Tensor] = {}
         self._received_sidebands: set[int] = set()
         self._reduction_arenas: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
@@ -581,23 +648,74 @@ class Tier0Heartbeat:
         self._rank_evidence: torch.Tensor | None = None
         self._local_rank_evidence: torch.Tensor | None = None
         self._sink_staging: torch.Tensor | None = None
+        self._control_value: torch.Tensor | None = None
+        self._mask_compare: torch.Tensor | None = None
+        self._mask_compare_valid: torch.Tensor | None = None
+        self._mask_checksum_weights: torch.Tensor | None = None
+        self._mask_checksum_work: torch.Tensor | None = None
+        self.sink_failure_count = 0
+        self._process_group_memberships: dict[str, list[tuple[int, ...]]] = {}
+        self._pre_event_allocated_bytes = 0
+        self._pre_event_reserved_bytes = 0
+        self._predicted_event_bytes = 0
         self._startup_num_microbatches = int(num_microbatches)
-        if not 1 <= self._startup_num_microbatches <= 1_048_576:
+        if not 1 <= self._startup_num_microbatches <= _MAX_MICROBATCHES:
             raise ValueError("Tier-0 startup microbatch bound is out of range")
 
         self.reservation = self._startup_reservation()
         self._allocate_startup_state()
+        self._collect_process_group_memberships()
         self._initialize_artifact_writer()
 
+    def _collect_process_group_memberships(self) -> None:
+        """Capture actual startup process-group memberships without event collectives."""
+
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        local: dict[str, tuple[int, ...]] = {"world": tuple(range(world_size))}
+        if self.capability.supported and dist.is_initialized():
+            group_getters = {
+                "dp": lambda: parallel_state.get_data_parallel_group(
+                    with_context_parallel=False
+                ),
+                "tp": parallel_state.get_tensor_model_parallel_group,
+                "pp": parallel_state.get_pipeline_model_parallel_group,
+                "cp": parallel_state.get_context_parallel_group,
+            }
+            topology_sizes = {
+                "dp": int(getattr(self.args, "data_parallel_size", 1)),
+                "tp": int(getattr(self.args, "tensor_model_parallel_size", 1)),
+                "pp": int(getattr(self.args, "pipeline_model_parallel_size", 1)),
+                "cp": int(getattr(self.args, "context_parallel_size", 1)),
+            }
+            for name, getter in group_getters.items():
+                if topology_sizes[name] > 1:
+                    local[name] = tuple(dist.get_process_group_ranks(getter()))
+        if dist.is_initialized() and world_size > 1:
+            gathered: list[dict[str, tuple[int, ...]] | None] = [None] * world_size
+            dist.all_gather_object(gathered, local)
+            names = set().union(*(item or {} for item in gathered))
+            self._process_group_memberships = {
+                name: [tuple((item or {})[name]) for item in gathered] for name in names
+            }
+        else:
+            self._process_group_memberships = {
+                name: [members] for name, members in local.items()
+            }
+
     def _initialize_artifact_writer(self) -> None:
-        """Construct the sole rank-0 artifact owner and agree setup before training."""
+        """Construct the existing last-rank artifact owner and agree setup."""
 
         rank = dist.get_rank() if dist.is_initialized() else 0
+        sink_rank = (dist.get_world_size() - 1) if dist.is_initialized() else 0
         failed = False
-        if self.capability.supported and rank == 0 and self.artifact_writer is None:
+        if (
+            self.capability.supported
+            and rank == sink_rank
+            and self.artifact_writer is None
+        ):
             try:
                 if self.wandb_writer is None:
-                    raise RuntimeError("Tier-0 requires a rank-0 W&B writer")
+                    raise RuntimeError("Tier-0 requires the last-rank W&B writer")
                 self.artifact_writer = writer_from_runtime(
                     self.args,
                     self.wandb_writer,
@@ -617,7 +735,9 @@ class Tier0Heartbeat:
         """Calculate and globally agree the complete peak before event allocation."""
 
         max_extra = getattr(self.args, "diagnostic_max_extra_bytes", None)
-        max_extra_bytes = 2**63 - 1 if max_extra is None else int(max_extra)
+        max_extra_bytes = (
+            _MAX_RESERVATION_BYTES if max_extra is None else int(max_extra)
+        )
         num_layers = int(getattr(self.args, "num_layers", 1))
         local_sequence = int(getattr(self.args, "seq_length", 1)) // max(
             1,
@@ -640,7 +760,12 @@ class Tier0Heartbeat:
             world_size=world_size,
         )
 
-        locally_accepted = requested <= max_extra_bytes
+        overflow = requested > _INT64_MAX or max_extra_bytes > _INT64_MAX
+        locally_accepted = (
+            not overflow
+            and requested <= max_extra_bytes
+            and requested <= _MAX_RESERVATION_BYTES
+        )
         if self.device.type == "cuda":
             try:
                 free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
@@ -656,7 +781,20 @@ class Tier0Heartbeat:
                 locally_accepted = False
 
         control = torch.tensor(
-            [requested, max_extra_bytes, int(locally_accepted)],
+            [
+                min(requested, _INT64_MAX),
+                min(max_extra_bytes, _INT64_MAX),
+                int(locally_accepted),
+                int(
+                    Tier0ReservationStatus.OVERFLOW
+                    if overflow
+                    else (
+                        Tier0ReservationStatus.OK
+                        if locally_accepted
+                        else Tier0ReservationStatus.UNSUPPORTED
+                    )
+                ),
+            ],
             dtype=torch.int64,
             device=self.device,
         )
@@ -670,12 +808,24 @@ class Tier0Heartbeat:
             globally_accepted = minimum_host[2] == 1
             requested = int(maximum_host[0])
             max_extra_bytes = int(minimum_host[1])
+            status = Tier0ReservationStatus(int(maximum_host[3]))
         else:
             globally_accepted = locally_accepted
+            status = (
+                Tier0ReservationStatus.OVERFLOW
+                if overflow
+                else (
+                    Tier0ReservationStatus.OK
+                    if locally_accepted
+                    else Tier0ReservationStatus.UNSUPPORTED
+                )
+            )
         if not globally_accepted:
-            raise RuntimeError(
+            raise Tier0ReservationError(
+                status,
                 "Tier-0 startup reservation rejected globally before event allocation "
-                f"(requested={requested}, max_extra={max_extra_bytes})"
+                f"(status={status.name.lower()}, requested={requested}, "
+                f"max_extra={max_extra_bytes}, hard_max={_MAX_RESERVATION_BYTES})",
             )
         return Tier0Reservation(requested, max_extra_bytes, True)
 
@@ -686,6 +836,9 @@ class Tier0Heartbeat:
             torch.cuda.memory_allocated(self.device)
             if self.device.type == "cuda"
             else 0
+        )
+        before_reserved = (
+            torch.cuda.memory_reserved(self.device) if self.device.type == "cuda" else 0
         )
         allocation_failed = False
         try:
@@ -724,6 +877,8 @@ class Tier0Heartbeat:
                 dtype=torch.uint8,
                 device=self.device,
             )
+            if self.capture_accumulator is not None:
+                self.capture_accumulator.bind_workspace(self._capture_scratch)
             local_length = int(getattr(self.args, "seq_length", 1)) // max(
                 1, int(getattr(self.args, "context_parallel_size", 1))
             )
@@ -742,12 +897,38 @@ class Tier0Heartbeat:
                 )
                 for index in range(self._startup_num_microbatches)
             }
+            self._sideband_validity = {
+                index: torch.empty((), dtype=torch.bool, device=self.device)
+                for index in range(self._startup_num_microbatches)
+            }
+            self._local_sideband_validity = {
+                index: torch.empty((), dtype=torch.bool, device=self.device)
+                for index in range(self._startup_num_microbatches)
+            }
+            mask_elements = payload_elements - 1
+            self._mask_compare = torch.empty(
+                mask_elements, dtype=torch.bool, device=self.device
+            )
+            self._mask_compare_valid = torch.empty(
+                (), dtype=torch.bool, device=self.device
+            )
+            self._mask_checksum_weights = torch.arange(
+                1, mask_elements + 1, dtype=torch.float32, device=self.device
+            )
+            self._mask_checksum_work = torch.empty(
+                mask_elements, dtype=torch.float32, device=self.device
+            )
+            self._control_value = torch.empty(
+                (), dtype=torch.float64, device=self.device
+            )
             world_size = dist.get_world_size() if dist.is_initialized() else 1
             self._rank_evidence = torch.empty(
-                (world_size, 9), dtype=torch.float64, device=self.device
+                (world_size, _RANK_EVIDENCE_FIELDS),
+                dtype=torch.float64,
+                device=self.device,
             )
             self._local_rank_evidence = torch.empty(
-                9, dtype=torch.float64, device=self.device
+                _RANK_EVIDENCE_FIELDS, dtype=torch.float64, device=self.device
             )
             sink_pack_elements = sum(
                 accumulator.sum_pack.numel()
@@ -756,11 +937,12 @@ class Tier0Heartbeat:
                 for accumulator in (
                     self.capture_accumulator,
                     self.update_accumulator,
+                    self.control_accumulator,
                 )
                 if accumulator is not None
             )
             self._sink_staging = torch.empty(
-                75 + world_size * 9 + sink_pack_elements,
+                world_size * _RANK_EVIDENCE_FIELDS + sink_pack_elements,
                 dtype=torch.float64,
                 device=self.device,
             )
@@ -772,8 +954,17 @@ class Tier0Heartbeat:
             if self.device.type == "cuda"
             else 0
         )
+        measured_reserved = (
+            max(0, torch.cuda.memory_reserved(self.device) - before_reserved)
+            if self.device.type == "cuda"
+            else 0
+        )
         failed = torch.tensor(
-            int(allocation_failed or measured > self.reservation.requested_bytes),
+            int(
+                allocation_failed
+                or measured > self.reservation.requested_bytes
+                or measured_reserved > self.reservation.requested_bytes
+            ),
             dtype=torch.int64,
             device=self.device,
         )
@@ -786,6 +977,7 @@ class Tier0Heartbeat:
             self.reservation.max_extra_bytes,
             True,
             measured,
+            measured_reserved,
         )
 
     @property
@@ -879,11 +1071,19 @@ class Tier0Heartbeat:
             free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
             del free_bytes
             self._local_rank_evidence[3].fill_(total_bytes)
-            self._local_rank_evidence[4].fill_(torch.cuda.memory_allocated(self.device))
-            self._local_rank_evidence[5].fill_(torch.cuda.memory_reserved(self.device))
+            self._pre_event_allocated_bytes = torch.cuda.memory_allocated(self.device)
+            self._pre_event_reserved_bytes = torch.cuda.memory_reserved(self.device)
+            self._local_rank_evidence[4].fill_(self._pre_event_allocated_bytes)
+            self._local_rank_evidence[5].fill_(self._pre_event_reserved_bytes)
+            torch.cuda.reset_peak_memory_stats(self.device)
         else:
             self._local_rank_evidence[3].fill_(1)
-        self._local_rank_evidence[6].fill_(self.reservation.requested_bytes)
+        self._predicted_event_bytes = max(
+            0,
+            self.reservation.requested_bytes
+            - self.reservation.measured_allocated_bytes,
+        )
+        self._local_rank_evidence[6].fill_(self._predicted_event_bytes)
         if not self.capability.supported:
             return True
         assert self.update_registry is not None
@@ -927,6 +1127,7 @@ class Tier0Heartbeat:
                 sequence_length=int(self.args.seq_length)
                 // max(1, parallel_state.get_context_parallel_world_size()),
                 device=self.device,
+                valid_out=self._sideband_validity[microbatch_id],
             )
             self.capture.register_valid_token_mask(microbatch_id, staged)
 
@@ -958,15 +1159,39 @@ class Tier0Heartbeat:
             micro_batch_size=int(self.args.micro_batch_size),
             sequence_length=local_length,
             device=self.device,
+            valid_out=self._local_sideband_validity[microbatch_id],
         )
+        assert self._mask_checksum_weights is not None
+        assert self._mask_checksum_work is not None
+        assert self._local_rank_evidence is not None
+        assert self._control_value is not None
+        torch.mul(
+            local_payload[:-1],
+            self._mask_checksum_weights,
+            out=self._mask_checksum_work,
+        )
+        torch.sum(
+            self._mask_checksum_work,
+            dim=(0,),
+            dtype=torch.float64,
+            out=self._control_value,
+        )
+        self._local_rank_evidence[9].add_(self._control_value)
         if (
             parallel_state.is_pipeline_last_stage(ignore_virtual=True)
             and microbatch_id in self._received_sidebands
         ):
             received = self._sideband_payloads[microbatch_id]
-            staged = StagedTokenMask(
-                staged.values, staged.valid & torch.eq(local_payload, received).all()
+            assert self._mask_compare is not None
+            assert self._mask_compare_valid is not None
+            torch.eq(local_payload[:-1], received[:-1], out=self._mask_compare)
+            torch.all(self._mask_compare, out=self._mask_compare_valid)
+            torch.gt(received[-1], 0, out=self._sideband_validity[microbatch_id])
+            self._mask_compare_valid.logical_and_(
+                self._sideband_validity[microbatch_id]
             )
+            staged.valid.logical_and_(self._mask_compare_valid)
+            staged = StagedTokenMask(staged.values, staged.valid)
         self.capture.register_valid_token_mask(microbatch_id, staged)
         if parallel_state.is_pipeline_first_stage(
             ignore_virtual=True
@@ -1056,12 +1281,10 @@ class Tier0Heartbeat:
             "control/runtime_failure",
             self.capability.supported and get_diagnostic_global_valid_tokens() is None,
         )
-        adapter_status = (
-            self.adapter.local_status.squeeze(0)
-            if self.adapter is not None
-            else torch.zeros((), dtype=torch.int64, device=self.device)
-        )
-        self._add_control("control/adapter_status", adapter_status)
+        if self.adapter is not None:
+            self._add_control(
+                "control/adapter_status", self.adapter.local_status.squeeze(0)
+            )
         peak_hbm = (
             max(
                 torch.cuda.max_memory_allocated(self.device),
@@ -1071,6 +1294,15 @@ class Tier0Heartbeat:
             else 0
         )
         self._add_control("control/peak_hbm_bytes", peak_hbm)
+        if self.device.type == "cuda":
+            self._add_control(
+                "control/runtime_failure",
+                not allocator_growth_within_bound(
+                    pre_event_reserved_bytes=self._pre_event_reserved_bytes,
+                    peak_reserved_bytes=torch.cuda.max_memory_reserved(self.device),
+                    predicted_increment_bytes=self._predicted_event_bytes,
+                ),
+            )
 
         accumulators = tuple(
             accumulator
@@ -1089,21 +1321,34 @@ class Tier0Heartbeat:
 
         self._commit_successful_update()
         rank = dist.get_rank() if dist.is_initialized() else 0
-        diagnostic_valid = True
-        if rank == 0:
-            payload = self._derive_payload(latencies)
-            diagnostic_valid = self._emit(payload, iteration=iteration)
+        sink_rank = (dist.get_world_size() - 1) if dist.is_initialized() else 0
+        if rank == sink_rank:
+            self._emit(iteration=iteration)
         self.event_id += 1
         self.args.diagnostic_event_id = self.event_id
         self.abort_attempt()
-        if rank == 0 and not diagnostic_valid and self.unsupported_policy == "error":
-            raise RuntimeError("Tier-0 heartbeat event failed after sink validation")
         return True
 
     def _add_control(self, name: str, value: int | bool | torch.Tensor) -> None:
         assert self.control_accumulator is not None
-        tensor = torch.as_tensor(value, dtype=torch.float64, device=self.device)
-        self.control_accumulator.add_masked_tensor(name, tensor)
+        assert self._control_value is not None
+        slots = self.control_accumulator.slots(name)
+        if isinstance(value, torch.Tensor):
+            self._control_value.copy_(value.detach().reshape(()))
+        else:
+            self._control_value.fill_(value)
+        self.control_accumulator.sum_pack[slots.sum].add_(self._control_value)
+        self.control_accumulator.sum_pack[slots.count].add_(1)
+        torch.maximum(
+            self.control_accumulator.max_pack[slots.maximum],
+            self._control_value,
+            out=self.control_accumulator.max_pack[slots.maximum],
+        )
+        torch.minimum(
+            self.control_accumulator.min_pack[slots.minimum],
+            self._control_value,
+            out=self.control_accumulator.min_pack[slots.minimum],
+        )
 
     def _gather_latency_ms(self) -> torch.Tensor:
         assert self._local_rank_evidence is not None
@@ -1413,25 +1658,27 @@ class Tier0Heartbeat:
             torch.full_like(nonfinite, torch.nan),
         )
 
-    def _emit(self, payload: Mapping[str, torch.Tensor], *, iteration: int) -> bool:
-        """Perform the sink's sole consolidated device-to-host transfer and log once."""
+    def _emit(self, *, iteration: int) -> bool:
+        """Transfer reduced facts once, then derive and emit on the CPU sink."""
 
-        assert_payload_schema(payload)
         rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank != 0:
+        sink_rank = (dist.get_world_size() - 1) if dist.is_initialized() else 0
+        if rank != sink_rank:
             raise RuntimeError("only the global Tier-0 sink may emit an event")
         assert self._rank_evidence is not None
         assert self._sink_staging is not None
-        for index, key in enumerate(TIER0_KEYS):
-            self._sink_staging[index].copy_(payload[key])
-        offset = len(TIER0_KEYS)
+        offset = 0
         rank_elements = self._rank_evidence.numel()
         self._sink_staging[offset : offset + rank_elements].copy_(
             self._rank_evidence.reshape(-1)
         )
         offset += rank_elements
         pack_ranges: list[tuple[PackedSufficientStatistics, int, int]] = []
-        for accumulator in (self.capture_accumulator, self.update_accumulator):
+        for accumulator in (
+            self.capture_accumulator,
+            self.update_accumulator,
+            self.control_accumulator,
+        ):
             if accumulator is None:
                 continue
             start = offset
@@ -1445,20 +1692,11 @@ class Tier0Heartbeat:
                 offset = end
             pack_ranges.append((accumulator, start, offset))
         host_combined = self._sink_staging.cpu().tolist()
-        host_values = host_combined[: len(TIER0_KEYS)]
-        rank_values = host_combined[len(TIER0_KEYS) : len(TIER0_KEYS) + rank_elements]
+        rank_values = host_combined[:rank_elements]
         rank_evidence = [
-            rank_values[offset : offset + 9] for offset in range(0, len(rank_values), 9)
+            rank_values[offset : offset + _RANK_EVIDENCE_FIELDS]
+            for offset in range(0, len(rank_values), _RANK_EVIDENCE_FIELDS)
         ]
-        host_payload: dict[str, float | int] = dict(zip(TIER0_KEYS, host_values))
-        for key in (
-            "diag/v2/event/successful_update",
-            "diag/v2/event/valid_positions",
-            "diag/v2/status/valid",
-            "diag/v2/perf/peak_hbm_bytes_max_rank",
-        ):
-            host_payload[key] = int(host_payload[key])
-        assert_payload_schema(host_payload)
         host_packs: dict[str, dict[str, Sequence[Any]]] = {}
         for accumulator, start, end in pack_ranges:
             packed = host_combined[start:end]
@@ -1470,8 +1708,41 @@ class Tier0Heartbeat:
                 "max": tuple(packed[sum_count : sum_count + max_count]),
                 "min": tuple(packed[sum_count + max_count :]),
             }
-        if self.wandb_log is not None:
-            self.wandb_log(host_payload, step=iteration + 1)
+        try:
+            host_payload = self._derive_host_payload(host_packs, rank_evidence)
+            assert_payload_schema(host_payload)
+            artifact_written = False
+            if self.artifact_writer is not None:
+                artifact_written = self._write_artifact(
+                    host_payload, host_packs, rank_evidence
+                )
+            if not artifact_written:
+                raise RuntimeError("Tier-0 event has no complete artifact")
+            if self.wandb_log is not None:
+                self.wandb_log(host_payload, step=iteration + 1)
+            if self.tensorboard_writer is not None:
+                for key in (*TIER0_METRIC_KEYS, *TIER0_METADATA_KEYS):
+                    self.tensorboard_writer.add_scalar(
+                        key, host_payload[key], iteration + 1
+                    )
+            return host_payload["diag/v2/status/valid"] == 1
+        except Exception as error:
+            self.sink_failure_count += 1
+            warnings.warn(
+                f"Tier-0 sink event {self.event_id + 1} is non-promotable: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False
+
+    def _write_artifact(
+        self,
+        host_payload: Mapping[str, float | int],
+        host_packs: Mapping[str, Mapping[str, Sequence[Any]]],
+        rank_evidence: Sequence[Sequence[float]],
+    ) -> bool:
+        """Write the exact artifact before any scalar metric emission."""
+
         if self.artifact_writer is not None:
             world_size = dist.get_world_size() if dist.is_initialized() else 1
             tp = int(getattr(self.args, "tensor_model_parallel_size", 1))
@@ -1500,18 +1771,295 @@ class Tier0Heartbeat:
                 rank_evidence=rank_evidence,
                 capability_hash=capability_sha256_file(static_capability_path()),
                 schema_hash=diagnostic_schema_hash(),
+                writer_rank=(world_size - 1),
+                process_group_memberships=self._process_group_memberships,
+                reduction_bytes=(
+                    sum(arena.nbytes for arena in self._reduction_arenas)
+                    if self._reduction_arenas is not None
+                    else 0
+                ),
+                runtime_signature=self._runtime_signature(topology),
                 layer_evidence=self._host_layer_evidence(host_packs),
             )
             self.cumulative_artifact_bytes += artifact_bytes
             self.args.diagnostic_cumulative_artifact_bytes = (
                 self.cumulative_artifact_bytes
             )
-        if self.tensorboard_writer is not None:
-            for key in (*TIER0_METRIC_KEYS, *TIER0_METADATA_KEYS):
-                self.tensorboard_writer.add_scalar(
-                    key, host_payload[key], iteration + 1
+            return True
+        return False
+
+    def _runtime_signature(self, topology: Mapping[str, int]) -> dict[str, Any]:
+        """Return the supported runtime's observed optimizer and config signature."""
+
+        distributed_optimizer = _distributed_optimizer(self.optimizer)
+        inner_optimizer = (
+            distributed_optimizer.optimizer
+            if distributed_optimizer is not None
+            else self.optimizer
+        )
+        return {
+            "optimizer": type(inner_optimizer).__name__,
+            "precision": "bf16"
+            if bool(getattr(self.args, "bf16", False))
+            else "unknown",
+            **{
+                name: int(topology[name])
+                for name in ("dp", "tp", "pp", "cp", "ep", "vpp")
+            },
+            "moe": bool(getattr(self.args, "num_experts", None)),
+            "fsdp": bool(
+                getattr(self.args, "use_megatron_fsdp", False)
+                or getattr(self.args, "use_torch_fsdp2", False)
+            ),
+            "chained_optimizer": isinstance(self.optimizer, ChainedOptimizer),
+            "layerwise_optimizer": type(self.optimizer).__name__
+            == "LayerWiseOptimizer",
+            "overlap_param_gather": bool(
+                getattr(self.args, "overlap_param_gather", False)
+            ),
+            "parameter_cache_mode": "none",
+        }
+
+    def _derive_host_payload(
+        self,
+        host_packs: Mapping[str, Mapping[str, Sequence[Any]]],
+        rank_evidence: Sequence[Sequence[float]],
+    ) -> dict[str, float | int]:
+        """Derive all fixed metrics from CPU-resident reduced sufficient statistics."""
+
+        payload: dict[str, float | int] = {key: math.nan for key in TIER0_KEYS}
+        capture = (
+            host_packs.get(self.capture_accumulator.descriptor_hash)
+            if self.capture_accumulator is not None
+            else None
+        )
+        update = (
+            host_packs.get(self.update_accumulator.descriptor_hash)
+            if self.update_accumulator is not None
+            else None
+        )
+        control = host_packs[self.control_accumulator.descriptor_hash]
+
+        def fields(
+            pack: Mapping[str, Sequence[Any]], name: str
+        ) -> tuple[list[float], float, float]:
+            index = pack["names"].index(name)
+            values = [
+                float(value) for value in pack["sum"][index * 11 : (index + 1) * 11]
+            ]
+            return values, float(pack["max"][index]), float(pack["min"][index])
+
+        def slot_valid(values: Sequence[float]) -> bool:
+            return values[1] > 0 and all(value == 0 for value in values[7:11])
+
+        def quantile(values: Sequence[float], fraction: float) -> float:
+            ordered = sorted(value for value in values if math.isfinite(value))
+            if not ordered:
+                return math.nan
+            position = (len(ordered) - 1) * fraction
+            lower = math.floor(position)
+            upper = math.ceil(position)
+            if lower == upper:
+                return ordered[lower]
+            return ordered[lower] + (ordered[upper] - ordered[lower]) * (
+                position - lower
+            )
+
+        valid_positions = 0
+        event_valid = bool(
+            self.capability.supported and capture is not None and update is not None
+        )
+        if capture is not None:
+            token_values, _, _ = fields(capture, "event/valid_tokens")
+            valid_positions = int(token_values[0])
+            runtime_values, runtime_maximum, _ = fields(capture, "event/runtime_status")
+            event_valid &= runtime_maximum == 0 and all(
+                value == 0 for value in runtime_values[7:11]
+            )
+            for name in capture["names"]:
+                values, _, _ = fields(capture, name)
+                if not name.startswith("event/"):
+                    event_valid &= slot_valid(values)
+            event_valid &= valid_positions > 0
+        if update is not None:
+            tied_output = any(
+                isinstance(_unwrap_module(chunk), GPTModel)
+                and getattr(
+                    _unwrap_module(chunk), "share_embeddings_and_output_weights", False
                 )
-        return host_payload["diag/v2/status/valid"] == 1
+                for chunk in self.model
+            )
+            for name in update["names"]:
+                values, _, _ = fields(update, name)
+                event_valid &= all(value == 0 for value in values[7:11])
+                if not (tied_output and name == "update/output"):
+                    event_valid &= values[1] > 0
+        for name in (
+            "control/unsupported",
+            "control/preflight_failure",
+            "control/runtime_failure",
+            "control/adapter_status",
+        ):
+            _, maximum, _ = fields(control, name)
+            event_valid &= maximum == 0
+
+        loss_scale = float(getattr(self.args, "loss_scale", 1.0) or 1.0)
+        dgrad_divisor = (loss_scale * valid_positions) ** 2
+
+        def capture_rms(name: str) -> float:
+            values, _, _ = fields(capture, name)
+            if not slot_valid(values):
+                return math.nan
+            sumsq = values[2]
+            if name.startswith("dgrad/"):
+                sumsq = sumsq / dgrad_divisor if dgrad_divisor > 0 else math.nan
+            ratio = sumsq / values[1]
+            return math.sqrt(ratio) if ratio >= 0 and math.isfinite(ratio) else math.nan
+
+        def update_ratio(name: str, numerator: int, denominator: int) -> float:
+            values, _, _ = fields(update, name)
+            if not slot_valid(values) or values[denominator] <= 0:
+                return math.nan
+            ratio = values[numerator] / values[denominator]
+            return math.sqrt(ratio) if ratio >= 0 and math.isfinite(ratio) else math.nan
+
+        if event_valid and capture is not None and update is not None:
+            anchors = {
+                "first": 0,
+                "q1": round((int(self.args.num_layers) - 1) * 0.25),
+                "middle": round((int(self.args.num_layers) - 1) * 0.50),
+                "q3": round((int(self.args.num_layers) - 1) * 0.75),
+                "last": int(self.args.num_layers) - 1,
+            }
+            for observation in ("activation", "dgrad"):
+                values = [
+                    capture_rms(f"{observation}/residual/layer_{layer}")
+                    for layer in range(int(self.args.num_layers))
+                ]
+                for summary, index in anchors.items():
+                    payload[f"diag/v2/t0/{observation}/residual/rms/{summary}"] = (
+                        values[index]
+                    )
+                for summary, fraction in (("p10", 0.1), ("p50", 0.5), ("p90", 0.9)):
+                    payload[f"diag/v2/t0/{observation}/residual/rms/{summary}"] = (
+                        quantile(values, fraction)
+                    )
+            for family in ("qkv", "attn_out", "fc1", "fc2"):
+                values = [
+                    capture_rms(f"dgrad/{family}/layer_{layer}")
+                    for layer in range(int(self.args.num_layers))
+                ]
+                payload[f"diag/v2/t0/dgrad/{family}/p10"] = quantile(values, 0.1)
+                payload[f"diag/v2/t0/dgrad/{family}/p50"] = quantile(values, 0.5)
+                finite = [value for value in values if math.isfinite(value)]
+                payload[f"diag/v2/t0/dgrad/{family}/zero_fraction"] = (
+                    sum(
+                        value <= self.args.diagnostic_dgrad_starvation_threshold
+                        for value in finite
+                    )
+                    / len(finite)
+                    if finite
+                    else math.nan
+                )
+            for family in ("qkv", "attn_out", "fc1", "fc2", "norm"):
+                values = [
+                    update_ratio(f"update/{family}/layer_{layer}", 4, 5)
+                    for layer in range(int(self.args.num_layers))
+                ]
+                for summary, fraction in (("p10", 0.1), ("p50", 0.5), ("p90", 0.9)):
+                    payload[f"diag/v2/t0/update/{family}/{summary}"] = quantile(
+                        values, fraction
+                    )
+                finite = [value for value in values if math.isfinite(value)]
+                payload[f"diag/v2/t0/update/{family}/starved_fraction"] = (
+                    sum(
+                        value <= self.args.diagnostic_update_starvation_threshold
+                        for value in finite
+                    )
+                    / len(finite)
+                    if finite
+                    else math.nan
+                )
+            for family in ("embedding", "output"):
+                payload[f"diag/v2/t0/update/{family}/relative_rms"] = update_ratio(
+                    f"update/{family}", 4, 5
+                )
+            for family in ("embedding", "qkv", "attn_out", "fc1", "fc2", "output"):
+                names = (
+                    [f"update/{family}"]
+                    if family in ("embedding", "output")
+                    else [
+                        f"update/{family}/layer_{layer}"
+                        for layer in range(int(self.args.num_layers))
+                    ]
+                )
+                retention = [update_ratio(name, 4, 2) for name in names]
+                cast_loss = []
+                for name in names:
+                    values, _, _ = fields(update, name)
+                    cast_loss.append(
+                        values[6] / values[0] if values[0] > 0 else math.nan
+                    )
+                payload[f"diag/v2/t0/retention/{family}/median"] = quantile(
+                    retention, 0.5
+                )
+                payload[f"diag/v2/t0/retention/{family}/zero_fraction"] = quantile(
+                    cast_loss, 0.5
+                )
+            for family in ("qkv", "attn_out", "fc1", "fc2", "residual"):
+                extrema = []
+                for layer in range(int(self.args.num_layers)):
+                    values, maximum, minimum = fields(
+                        capture, f"activation/{family}/layer_{layer}"
+                    )
+                    if slot_valid(values):
+                        extrema.append(max(abs(maximum), abs(minimum)))
+                payload[f"diag/v2/t0/activation/{family}/max_abs"] = (
+                    max(extrema) if extrema else math.nan
+                )
+
+            nonfinite = finite_count = 0.0
+            for pack in (capture, update):
+                for name in pack["names"]:
+                    if name.startswith("event/"):
+                        continue
+                    values, _, _ = fields(pack, name)
+                    finite_count += values[1]
+                    nonfinite += values[7]
+            payload["diag/v2/health/nonfinite_fraction"] = (
+                nonfinite / (finite_count + nonfinite)
+                if finite_count + nonfinite > 0
+                else math.nan
+            )
+            cast_zero = master_nonzero = 0.0
+            for name in update["names"]:
+                if any(
+                    name == f"update/{family}" or name.startswith(f"update/{family}/")
+                    for family in (
+                        "embedding",
+                        "qkv",
+                        "attn_out",
+                        "fc1",
+                        "fc2",
+                        "output",
+                    )
+                ):
+                    values, _, _ = fields(update, name)
+                    cast_zero += values[6]
+                    master_nonzero += values[0]
+            payload["diag/v2/health/underflow_fraction"] = (
+                cast_zero / master_nonzero if master_nonzero > 0 else math.nan
+            )
+
+        latencies = [float(row[1]) for row in rank_evidence]
+        peak_hbm = max(max(int(row[7]), int(row[8])) for row in rank_evidence)
+        payload["diag/v2/event/successful_update"] = self.successful_updates
+        payload["diag/v2/event/valid_positions"] = valid_positions
+        payload["diag/v2/status/valid"] = int(event_valid)
+        payload["diag/v2/perf/peak_hbm_bytes_max_rank"] = peak_hbm
+        payload["diag/v2/perf/latency_ms_median_rank"] = quantile(latencies, 0.5)
+        payload["diag/v2/perf/latency_ms_max_rank"] = max(latencies)
+        return payload
 
     def _host_layer_evidence(
         self, host_packs: Mapping[str, Mapping[str, Sequence[Any]]]
@@ -1524,6 +2072,10 @@ class Tier0Heartbeat:
             )
         capture = host_packs[self.capture_accumulator.descriptor_hash]
         update = host_packs[self.update_accumulator.descriptor_hash]
+        token_index = capture["names"].index("event/valid_tokens")
+        valid_positions = float(capture["sum"][token_index * 11])
+        loss_scale = float(getattr(self.args, "loss_scale", 1.0) or 1.0)
+        dgrad_divisor = (loss_scale * valid_positions) ** 2
 
         def fields(
             pack: Mapping[str, Sequence[Any]], name: str
@@ -1543,6 +2095,10 @@ class Tier0Heartbeat:
             count = values[1]
             if metric in ("activation_rms", "dgrad_rms"):
                 numerator, denominator = values[2], count
+                if metric == "dgrad_rms":
+                    numerator = (
+                        numerator / dgrad_divisor if dgrad_divisor > 0 else math.nan
+                    )
                 value = (
                     math.sqrt(numerator / denominator) if denominator > 0 else math.nan
                 )

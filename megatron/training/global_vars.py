@@ -241,7 +241,7 @@ class _NoOpWandbWriter:  # CHAWKINS-NOOP-WANDB
 def wandb_writer_rank(args):
     """Return the sole world rank that owns the W&B run."""
 
-    return 0 if getattr(args, 'diagnostic_heartbeat', False) else args.world_size - 1
+    return args.world_size - 1
 
 
 def _set_wandb_writer(args):

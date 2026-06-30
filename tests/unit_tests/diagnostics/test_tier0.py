@@ -2,6 +2,7 @@
 
 """Tier-0 heartbeat orchestration and runtime-contract tests."""
 
+import hashlib
 import inspect
 import io
 import json
@@ -13,6 +14,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -27,7 +29,9 @@ from megatron.training.diagnostics.artifact import Tier0ArtifactWriter
 from megatron.training.diagnostics.tier0 import (
     Tier0Cadence,
     Tier0Heartbeat,
-    mark_tier0_mask_producer,
+    Tier0ReservationError,
+    Tier0ReservationStatus,
+    allocator_growth_within_bound,
     tier0_reservation_bytes,
 )
 from megatron.training.global_vars import wandb_writer_rank
@@ -151,22 +155,37 @@ def test_narrow_backend_capability_rejects_unsupported_modes(
     assert reason in reasons
 
 
-def test_forward_function_requires_marker_and_registration_bytecode() -> None:
+def test_forward_function_requires_exact_registered_identity_and_rejects_review_spoof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def permissive(_iterator, _model, *, diagnostic_heartbeat=None):
         return diagnostic_heartbeat
 
-    @mark_tier0_mask_producer
-    def marked_but_nonregistering(_iterator, _model, *, diagnostic_heartbeat=None):
-        return diagnostic_heartbeat
-
-    @mark_tier0_mask_producer
     def canonical(_iterator, _model, *, diagnostic_heartbeat=None):
         microbatch_id = get_diagnostic_microbatch_id()
         diagnostic_heartbeat.register_local_loss_mask(microbatch_id, None)
 
+    def spoof(_iterator, _model, *, diagnostic_heartbeat=None):
+        unused_getter = get_diagnostic_microbatch_id
+        unused_method = diagnostic_heartbeat.register_local_loss_mask
+        return unused_getter, unused_method
+
+    spoof.__megatron_tier0_mask_producer__ = (
+        "megatron.tier0.canonical-gpt-mask-producer.v1"
+    )
+    monkeypatch.setattr(
+        tier0_module,
+        "_canonical_mask_producer",
+        (
+            canonical,
+            tier0_module._MASK_PRODUCER_IDENTITY,
+            tier0_module._NONINTERLEAVED_SCHEDULE_ADAPTER,
+        ),
+    )
+
     assert not tier0_module._verified_mask_producer(None)
     assert not tier0_module._verified_mask_producer(permissive)
-    assert not tier0_module._verified_mask_producer(marked_but_nonregistering)
+    assert not tier0_module._verified_mask_producer(spoof)
     assert tier0_module._verified_mask_producer(canonical)
 
 
@@ -202,31 +221,9 @@ def test_status_only_retries_overflow_then_writes_one_exact_payload() -> None:
     assert args.diagnostic_successful_updates == 1
     assert args.diagnostic_event_id == 1
     rank = dist.get_rank() if dist.is_initialized() else 0
-    assert len(calls) == (1 if rank == 0 else 0)
-    if rank == 0:
-        payload, step = calls[0]
-        assert step == 6
-        assert tuple(payload) == TIER0_KEYS
-        assert len(payload) == 75
-        assert payload["diag/v2/status/valid"] == 0
-        assert payload["diag/v2/event/successful_update"] == 1
-        assert all(
-            isinstance(payload[key], int)
-            for key in (
-                "diag/v2/event/successful_update",
-                "diag/v2/event/valid_positions",
-                "diag/v2/status/valid",
-                "diag/v2/perf/peak_hbm_bytes_max_rank",
-            )
-        )
-        assert all(
-            math_value != math_value
-            for key, math_value in payload.items()
-            if key in TIER0_METRIC_KEYS
-        )
-        assert "diag/v2/status/status_code" not in payload
-        assert "diag/v2/event/event_id" not in payload
-    assert set(tensorboard.values) == set(TIER0_KEYS)
+    assert calls == []
+    assert tensorboard.values == {}
+    assert heartbeat.sink_failure_count == (1 if rank == 0 else 0)
 
 
 def test_event_reduction_is_exactly_one_sum_max_min_sequence() -> None:
@@ -414,6 +411,91 @@ def test_pure_startup_reservation_is_bounded_at_world_size_1024() -> None:
     assert requested < 700_000_000
 
 
+def test_joint_advertised_boundary_fits_and_one_past_rejects_before_p2p() -> None:
+    static = load_static_capability()
+    bounds = static["config_bounds"]
+    requested = tier0_reservation_bytes(
+        num_layers=bounds["num_layers"]["maximum"],
+        num_microbatches=bounds["num_microbatches"]["maximum"],
+        micro_batch_size=bounds["micro_batch_size"]["maximum"],
+        local_sequence_length=bounds["sequence_length"]["maximum"],
+        owner_elements=0,
+        world_size=static["topology_bounds"]["world_size"]["maximum"],
+    )
+    assert requested <= bounds["maximum_reservation_bytes"] < 2**63
+
+    args = _status_only_args()
+    args.num_layers = 2**60
+    args.seq_length = 2**60
+    args.micro_batch_size = 8
+    args.context_parallel_size = 1
+    with pytest.raises(Tier0ReservationError) as raised:
+        Tier0Heartbeat(args, [nn.Linear(2, 2)], object(), num_microbatches=64)
+    assert raised.value.status == Tier0ReservationStatus.OVERFLOW
+
+
+def test_allocator_reserved_growth_uses_the_pre_event_baseline() -> None:
+    assert allocator_growth_within_bound(
+        pre_event_reserved_bytes=1_000,
+        peak_reserved_bytes=1_512,
+        predicted_increment_bytes=512,
+    )
+    assert not allocator_growth_within_bound(
+        pre_event_reserved_bytes=1_000,
+        peak_reserved_bytes=1_513,
+        predicted_increment_bytes=512,
+    )
+
+
+def test_bound_observation_workspace_uses_no_tensor_producing_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = ReductionBinding.flat_world(None, reducer=lambda *_args, **_kwargs: None)
+    accumulator = PackedSufficientStatistics(
+        ("x",), "cpu", descriptor_hash="workspace", reduction_binding=binding
+    )
+    storage = torch.empty(accumulator.maximum_scratch_bytes, dtype=torch.uint8)
+    accumulator.bind_workspace(storage)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("workspace path called a tensor-producing fallback")
+
+    for name in ("as_tensor", "full", "sort", "stack", "tensor", "where", "zeros"):
+        monkeypatch.setattr(torch, name, forbidden)
+    accumulator.add_masked_tensor(
+        "x", torch.Tensor([1.0, 2.0, 3.0]), mask=torch.Tensor([1.0, 0.0, 1.0])
+    )
+    assert accumulator.sum_pack[accumulator.slots("x").count] == 2
+
+
+def test_complete_event_runtime_probe_catches_prior_tensor_producing_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heartbeat = Tier0Heartbeat(
+        _status_only_args(),
+        [nn.Linear(2, 2)],
+        object(),
+        reduction_binding=ReductionBinding.flat_world(
+            None, reducer=lambda *_args, **_kwargs: None
+        ),
+    )
+    assert heartbeat.prepare_attempt(num_microbatches=1)
+    counts = {
+        name: 0
+        for name in ("as_tensor", "full", "sort", "stack", "tensor", "where", "zeros")
+    }
+    for name in counts:
+        original = getattr(torch, name)
+
+        def counted(*args, _name=name, _original=original, **kwargs):
+            counts[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(torch, name, counted)
+    assert heartbeat.finish_optimizer_event(True, iteration=0)
+    assert counts == {name: 0 for name in counts}
+
+
 def test_multirank_wandb_ownership_keeps_validation_on_the_single_owner() -> None:
     args = SimpleNamespace(diagnostic_heartbeat=True, world_size=8)
     owners = [
@@ -421,12 +503,29 @@ def test_multirank_wandb_ownership_keeps_validation_on_the_single_owner() -> Non
     ]
     tensorboard_owners = [args.world_size - 1]
     validation_wandb_owners = list(owners)
-    assert owners == [0]
+    assert owners == [7]
     assert tensorboard_owners == [7]
-    assert validation_wandb_owners == [0]
-    source = Path(tier0_module.__file__).parents[1] / "training.py"
-    validation_source = source.read_text(encoding="utf-8")
-    assert "if wandb_writer and is_last_rank()" not in validation_source
+    assert validation_wandb_owners == [7]
+    ordinary_training_calls = sum(
+        rank in owners and rank in tensorboard_owners for rank in range(args.world_size)
+    )
+    validation_calls = sum(rank in owners for rank in range(args.world_size))
+    throughput_calls = sum(rank in owners for rank in range(args.world_size))
+    checkpoint_save_calls = sum(
+        rank in owners and rank == args.world_size - 1
+        for rank in range(args.world_size)
+    )
+    checkpoint_load_calls = sum(
+        rank in owners and rank == args.world_size - 1
+        for rank in range(args.world_size)
+    )
+    assert (
+        ordinary_training_calls,
+        validation_calls,
+        throughput_calls,
+        checkpoint_save_calls,
+        checkpoint_load_calls,
+    ) == (1, 1, 1, 1, 1)
 
 
 def test_full_event_orchestrator_has_only_one_sink_host_transfer() -> None:
@@ -434,17 +533,86 @@ def test_full_event_orchestrator_has_only_one_sink_host_transfer() -> None:
     for method_name in (
         "finish_optimizer_event",
         "_gather_latency_ms",
-        "_derive_payload",
-        "_updates_valid",
-        "_derive_capture_metrics",
-        "_derive_update_metrics",
-        "_derive_nonfinite_health",
     ):
         source = inspect.getsource(getattr(Tier0Heartbeat, method_name))
         assert not any(token in source for token in forbidden), method_name
     sink_source = inspect.getsource(Tier0Heartbeat._emit)
     assert sink_source.count(".cpu()") == 1
     assert ".item(" not in sink_source
+
+
+def test_cpu_post_transfer_derivation_retains_exact_75_key_contract() -> None:
+    binding = ReductionBinding.flat_world(None, reducer=lambda *_args, **_kwargs: None)
+    capture_names = (
+        "event/valid_tokens",
+        "event/runtime_status",
+        *(
+            f"{observation}/{family}/layer_0"
+            for observation in ("activation", "dgrad")
+            for family in ("residual", "qkv", "attn_out", "fc1", "fc2")
+        ),
+    )
+    update_names = (
+        *(
+            f"update/{family}/layer_0"
+            for family in ("qkv", "attn_out", "fc1", "fc2", "norm")
+        ),
+        "update/embedding",
+        "update/output",
+    )
+    control_names = tier0_module._CONTROL_NAMES
+    heartbeat = Tier0Heartbeat.__new__(Tier0Heartbeat)
+    heartbeat.capture_accumulator = PackedSufficientStatistics(
+        capture_names, "cpu", descriptor_hash="capture", reduction_binding=binding
+    )
+    heartbeat.update_accumulator = PackedSufficientStatistics(
+        update_names, "cpu", descriptor_hash="update", reduction_binding=binding
+    )
+    heartbeat.control_accumulator = PackedSufficientStatistics(
+        control_names, "cpu", descriptor_hash="control", reduction_binding=binding
+    )
+    heartbeat.capability = SimpleNamespace(supported=True)
+    heartbeat.args = SimpleNamespace(
+        num_layers=1,
+        loss_scale=1.0,
+        diagnostic_dgrad_starvation_threshold=0.0,
+        diagnostic_update_starvation_threshold=0.0,
+    )
+    heartbeat.model = (nn.Linear(1, 1),)
+    heartbeat.successful_updates = 1
+
+    def pack(accumulator: PackedSufficientStatistics, *, control: bool = False):
+        sums = []
+        maxima = []
+        minima = []
+        for name in accumulator.slot_names:
+            values = [1.0, 1.0, 4.0, 0.0, 4.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            maximum = 0.0 if control or name == "event/runtime_status" else 2.0
+            minimum = 0.0 if control or name == "event/runtime_status" else -2.0
+            if name == "event/valid_tokens":
+                values[0] = 5.0
+            sums.extend(values)
+            maxima.append(maximum)
+            minima.append(minimum)
+        return {
+            "names": accumulator.slot_names,
+            "sum": tuple(sums),
+            "max": tuple(maxima),
+            "min": tuple(minima),
+        }
+
+    host_packs = {
+        "capture": pack(heartbeat.capture_accumulator),
+        "update": pack(heartbeat.update_accumulator),
+        "control": pack(heartbeat.control_accumulator, control=True),
+    }
+    payload = heartbeat._derive_host_payload(
+        host_packs, [[0, 1, 1, 1024, 0, 0, 0, 0, 0, 3]]
+    )
+    assert tuple(payload) == TIER0_KEYS
+    assert len(payload) == 75
+    assert payload["diag/v2/status/valid"] == 1
+    assert all(math_value == math_value for math_value in payload.values())
 
 
 def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> None:
@@ -499,7 +667,7 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
                 "vpp": 1,
                 "num_layers": 2,
             },
-            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120]],
+            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120, 7]],
             capability_hash="f" * 64,
             schema_hash=diagnostic_schema_hash(),
         )
@@ -511,6 +679,40 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
         assert compressed == writer.cumulative_bytes
         assert len(wandb.run.calls) == 1
         assert wandb.run.calls[0].name == "diag-v2-run-209"
+        manifest = json.loads((directory / "manifest.json").read_text())
+        assert manifest["status"] == "invalid"
+        assert not manifest["state_snapshots"]["pre"]["applicable"]
+        assert not manifest["state_snapshots"]["post"]["applicable"]
+        assert manifest["capability_signature"]["chained_optimizer"] is True
+        observed_sampling_fact = hashlib.sha256(
+            json.dumps(
+                {"mask_checksum": 7.0, "rank": 0, "valid_positions": 4},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        ).hexdigest()
+        assert manifest["sampling"]["selected_sample_id_hashes"] == [
+            observed_sampling_fact
+        ]
+        observed_world = hashlib.sha256(b"[0]").hexdigest()
+        assert manifest["process_groups"][0]["membership_sha256_by_rank"] == [
+            observed_world
+        ]
+        assert manifest["process_groups"] == [
+            {
+                "name": "world",
+                "membership_sha256_by_rank": manifest["process_groups"][0][
+                    "membership_sha256_by_rank"
+                ],
+                "operations": [
+                    {"name": "all_reduce", "count": 3, "bytes": 1},
+                    {"name": "all_gather", "count": 1, "bytes": 80},
+                ],
+            }
+        ]
+        with np.load(directory / "rank_perf.npz", allow_pickle=False) as ranks:
+            assert ranks["rank"].dtype == np.int32
+            assert ranks["predicted_increment_bytes"].dtype == np.int64
         second_writer = Tier0ArtifactWriter(
             Path(tmpdir) / "second",
             run_id="run-209",
@@ -533,7 +735,7 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
                 "vpp": 1,
                 "num_layers": 2,
             },
-            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120]],
+            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120, 7]],
             capability_hash="f" * 64,
             schema_hash=diagnostic_schema_hash(),
         )
@@ -545,7 +747,7 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
             for name in ("manifest.json", "layer_metrics.npz", "rank_perf.npz")
         }
         scaling_root = Path(
-            "/home/chawkins/src/scaling-worktrees/issue-209-scalable-diagnostics"
+            "/home/chawkins/src/scaling-worktrees/issue-209-launch-review"
         )
         completed = subprocess.run(
             [
@@ -562,7 +764,70 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
             capture_output=True,
             text=True,
         )
-        assert completed.returncode == 0, completed.stderr
+        assert completed.returncode != 0
+        assert "ContractError" in completed.stderr
+
+
+def test_actual_artifact_cap_and_wandb_failures_leave_no_promotable_directory() -> None:
+    class Artifact:
+        def add_dir(self, _directory: str) -> None:
+            pass
+
+    class FailingRun:
+        def log_artifact(self, _artifact: Artifact) -> None:
+            raise RuntimeError("injected W&B upload failure")
+
+    class FailingWandb:
+        run = FailingRun()
+
+        @staticmethod
+        def Artifact(**_kwargs):
+            return Artifact()
+
+    kwargs = {
+        "event_id": 1,
+        "successful_update": 1,
+        "consumed_tokens": 1,
+        "valid_positions": 1,
+        "valid": True,
+        "topology": {
+            "dp": 1,
+            "tp": 1,
+            "pp": 1,
+            "cp": 1,
+            "ep": 1,
+            "vpp": 1,
+            "num_layers": 1,
+        },
+        "rank_evidence": [[0, 1, 1, 1024, 0, 0, 1, 0, 0, 1]],
+        "capability_hash": "a" * 64,
+        "schema_hash": diagnostic_schema_hash(),
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "wandb"
+        writer = Tier0ArtifactWriter(
+            root,
+            run_id="run",
+            job_name="job",
+            repro={},
+            wandb_writer=FailingWandb(),
+        )
+        with pytest.raises(RuntimeError, match="W&B"):
+            writer.write(**kwargs)
+        assert not (root / "event-00000001").exists()
+
+        cap_root = Path(tmpdir) / "cap"
+        capped = Tier0ArtifactWriter(
+            cap_root,
+            run_id="run",
+            job_name="job",
+            repro={},
+            wandb_writer=None,
+            max_run_bytes=0,
+        )
+        with pytest.raises(RuntimeError, match="cumulative artifact budget"):
+            capped.write(**kwargs)
+        assert not (cap_root / "event-00000001").exists()
 
 
 @pytest.fixture(scope="module")
@@ -597,7 +862,39 @@ def test_one_rank_update_failure_retries_with_fixed_world_collectives(
     assert heartbeat.finish_optimizer_event(True, iteration=1)
     assert heartbeat.successful_updates == 1
     assert heartbeat.event_id == 1
-    assert len(calls) == (1 if dist.get_rank() == 0 else 0)
+    assert not calls
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_sink_schema_filesystem_cap_and_wandb_failures_keep_next_step_coherent(
+    gloo_world: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = _status_only_args()
+    args.diagnostic_interval = 1
+    heartbeat = Tier0Heartbeat(args, [nn.Linear(2, 2)], object())
+    sink_rank = dist.get_world_size() - 1
+
+    for index, label in enumerate(("schema", "filesystem", "cap", "wandb")):
+        method_name = "_derive_host_payload" if label == "schema" else "_write_artifact"
+        original = getattr(heartbeat, method_name)
+
+        def fail(*_args, _label=label, **_kwargs):
+            raise RuntimeError(f"injected {_label} sink failure")
+
+        if dist.get_rank() == sink_rank:
+            monkeypatch.setattr(heartbeat, method_name, fail)
+        assert heartbeat.prepare_attempt(num_microbatches=1)
+        assert heartbeat.finish_optimizer_event(True, iteration=index)
+        marker = torch.tensor(1)
+        dist.all_reduce(marker)
+        assert marker == dist.get_world_size()
+        if dist.get_rank() == sink_rank:
+            monkeypatch.setattr(heartbeat, method_name, original)
+
+    assert heartbeat.successful_updates == 4
+    assert heartbeat.event_id == 4
+    assert heartbeat.sink_failure_count == (4 if dist.get_rank() == sink_rank else 0)
     dist.barrier()
 
 
@@ -614,7 +911,6 @@ def test_pp2_incompatible_forward_function_is_rejected_globally_before_p2p(
         tier0_module, "_distributed_optimizer", lambda _optimizer: distributed_optimizer
     )
 
-    @mark_tier0_mask_producer
     def canonical(_iterator, _model, *, diagnostic_heartbeat=None):
         microbatch_id = get_diagnostic_microbatch_id()
         diagnostic_heartbeat.register_local_loss_mask(microbatch_id, None)
@@ -627,6 +923,15 @@ def test_pp2_incompatible_forward_function_is_rejected_globally_before_p2p(
         fp16=False,
         calculate_per_token_loss=True,
         transformer_impl="local",
+    )
+    monkeypatch.setattr(
+        tier0_module,
+        "_canonical_mask_producer",
+        (
+            canonical,
+            tier0_module._MASK_PRODUCER_IDENTITY,
+            tier0_module._NONINTERLEAVED_SCHEDULE_ADAPTER,
+        ),
     )
     forward_function = canonical if dist.get_rank() == 0 else nonregistering
     capability = tier0_module.negotiate_tier0_capability(

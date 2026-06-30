@@ -119,24 +119,6 @@ def _rank_digest(values: Sequence[str]) -> str:
     return _sha256(json.dumps(list(values), separators=(",", ":")).encode("ascii"))
 
 
-def _snapshot(world_size: int, identity: str) -> dict[str, Any]:
-    model = [_sha256(f"{identity}:model:{rank}".encode()) for rank in range(world_size)]
-    optimizer = [
-        _sha256(f"{identity}:optimizer:{rank}".encode()) for rank in range(world_size)
-    ]
-    model_digest = _rank_digest(model)
-    optimizer_digest = _rank_digest(optimizer)
-    return {
-        "applicable": True,
-        "model_sha256_by_rank": model,
-        "optimizer_sha256_by_rank": optimizer,
-        "model_sha256": model_digest,
-        "optimizer_sha256": optimizer_digest,
-        "model_consensus_sha256_by_rank": [model_digest] * world_size,
-        "optimizer_consensus_sha256_by_rank": [optimizer_digest] * world_size,
-    }
-
-
 def _unavailable_snapshot() -> dict[str, Any]:
     return {
         "applicable": False,
@@ -161,9 +143,10 @@ def _unavailable_restore() -> dict[str, Any]:
     }
 
 
-def _membership_hashes(world_size: int, group: str) -> list[str]:
+def _membership_hashes(memberships: Sequence[Sequence[int]]) -> list[str]:
     return [
-        _sha256(f"{group}:{rank}:{world_size}".encode()) for rank in range(world_size)
+        _sha256(json.dumps(list(ranks), separators=(",", ":")).encode("ascii"))
+        for ranks in memberships
     ]
 
 
@@ -222,8 +205,8 @@ def _layer_arrays(
 
 def _rank_arrays(rank_evidence: Sequence[Sequence[float]]) -> dict[str, np.ndarray]:
     rows = np.asarray(rank_evidence, dtype=np.float64)
-    if rows.ndim != 2 or rows.shape[1] != 9:
-        raise RuntimeError("rank evidence must have fixed shape [world, 9]")
+    if rows.ndim != 2 or rows.shape[1] != 10:
+        raise RuntimeError("rank evidence must have fixed shape [world, 10]")
     return {
         "rank": rows[:, 0].astype(np.int32),
         "event_wall_time_ms": rows[:, 1].astype(np.float64),
@@ -293,6 +276,10 @@ class Tier0ArtifactWriter:
         rank_evidence: Sequence[Sequence[float]],
         capability_hash: str,
         schema_hash: str,
+        writer_rank: int = 0,
+        process_group_memberships: Mapping[str, Sequence[Sequence[int]]] | None = None,
+        reduction_bytes: int = 1,
+        runtime_signature: Mapping[str, Any] | None = None,
         layer_evidence: Mapping[tuple[int, str, str], Mapping[str, float | int]]
         | None = None,
     ) -> tuple[Path, int]:
@@ -317,25 +304,41 @@ class Tier0ArtifactWriter:
             ranks = _rank_arrays(rank_evidence)
             _write_deterministic_npz(temporary / "layer_metrics.npz", layers)
             _write_deterministic_npz(temporary / "rank_perf.npz", ranks)
-            sample_id = _sha256(
-                f"{self.run_id}:{event_id}:{successful_update}".encode()
-            )
+            sampling_facts = [
+                _sha256(
+                    json.dumps(
+                        {
+                            "rank": int(row[0]),
+                            "valid_positions": valid_positions,
+                            "mask_checksum": float(row[9]),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                )
+                for row in rank_evidence
+            ]
+            sample_id = _rank_digest(sampling_facts)
             descriptor = _sha256(f"{capability_hash}:{schema_hash}".encode())
             topology_fields = {
                 name: int(topology[name])
                 for name in ("dp", "tp", "pp", "cp", "ep", "vpp")
             }
-            runtime_signature = {
-                "optimizer": "distributed_optimizer",
-                "precision": "bf16",
-                **topology_fields,
-                "moe": False,
-                "fsdp": False,
-                "chained_optimizer": False,
-                "layerwise_optimizer": False,
-                "overlap_param_gather": False,
-                "parameter_cache_mode": "none",
-            }
+            runtime_signature = (
+                dict(runtime_signature)
+                if runtime_signature is not None
+                else {
+                    "optimizer": "distributed_optimizer",
+                    "precision": "bf16",
+                    **topology_fields,
+                    "moe": False,
+                    "fsdp": False,
+                    "chained_optimizer": True,
+                    "layerwise_optimizer": False,
+                    "overlap_param_gather": False,
+                    "parameter_cache_mode": "none",
+                }
+            )
             manifest: dict[str, Any] = {
                 "schema": "diag/v2/artifact",
                 "successful_update": successful_update,
@@ -344,14 +347,16 @@ class Tier0ArtifactWriter:
                 "requested_tier": 0,
                 "effective_tier": 0,
                 "require_tier": 0,
-                "status": "ok" if valid else "invalid",
-                "status_reason": None
-                if valid
-                else "Tier-0 sufficient statistics invalid",
+                "status": "invalid",
+                "status_reason": (
+                    "Tier-0 model/optimizer state snapshots are not captured"
+                    if valid
+                    else "Tier-0 sufficient statistics invalid and state snapshots are not captured"
+                ),
                 "run_identity": {
                     "run_id": self.run_id,
                     "job_name": self.job_name,
-                    "writer_rank": 0,
+                    "writer_rank": writer_rank,
                 },
                 "capability_signature": runtime_signature,
                 "capability_status": {
@@ -373,7 +378,7 @@ class Tier0ArtifactWriter:
                 "sampling": {
                     "selector": "global_topk_hash_v1",
                     "seed": 0,
-                    "selected_sample_id_hashes": [sample_id],
+                    "selected_sample_id_hashes": sorted(set(sampling_facts)),
                     "valid_position_count": valid_positions,
                     "selected_sample_ids_sha256": sample_id,
                     "valid_token_ids_sha256": sample_id,
@@ -398,12 +403,8 @@ class Tier0ArtifactWriter:
                     )
                 },
                 "state_snapshots": {
-                    "pre": _snapshot(
-                        world_size, f"{descriptor}:pre:{successful_update}"
-                    ),
-                    "post": _snapshot(
-                        world_size, f"{descriptor}:post:{successful_update}"
-                    ),
+                    "pre": _unavailable_snapshot(),
+                    "post": _unavailable_snapshot(),
                     "midpoint": _unavailable_snapshot(),
                 },
                 "restore_evidence": {
@@ -423,18 +424,21 @@ class Tier0ArtifactWriter:
                     {
                         "name": "world",
                         "membership_sha256_by_rank": _membership_hashes(
-                            world_size, "world"
+                            (
+                                process_group_memberships
+                                or {"world": [tuple(range(world_size))] * world_size}
+                            )["world"]
                         ),
                         "operations": [
                             {
                                 "name": "all_reduce",
                                 "count": 3,
-                                "bytes": max(1, topology["num_layers"] * 96),
+                                "bytes": reduction_bytes,
                             },
                             {
                                 "name": "all_gather",
                                 "count": 1,
-                                "bytes": world_size * 9 * 8,
+                                "bytes": world_size * 10 * 8,
                             },
                         ],
                     },
@@ -442,14 +446,14 @@ class Tier0ArtifactWriter:
                         {
                             "name": name,
                             "membership_sha256_by_rank": _membership_hashes(
-                                world_size, name
+                                memberships
                             ),
-                            "operations": [
-                                {"name": "all_reduce", "count": 1, "bytes": 1}
-                            ],
+                            "operations": [],
                         }
-                        for name in ("dp", "tp", "pp", "cp", "ep")
-                        if topology[name] > 1
+                        for name, memberships in sorted(
+                            (process_group_memberships or {}).items()
+                        )
+                        if name != "world"
                     ),
                 ],
                 "artifact_bytes": {"compressed": 0, "uncompressed": 0},
@@ -480,13 +484,19 @@ class Tier0ArtifactWriter:
             if self.cumulative_bytes + compressed > self.max_run_bytes:
                 raise RuntimeError("Tier-0 cumulative artifact budget exceeded")
             os.replace(temporary, target)
+            try:
+                if self.wandb_writer is not None:
+                    artifact = self.wandb_writer.Artifact(
+                        name=f"diag-v2-{self.run_id}", type="diagnostic-event-v2"
+                    )
+                    artifact.add_dir(str(target))
+                    self.wandb_writer.run.log_artifact(artifact)
+            except Exception:
+                for path in target.iterdir():
+                    path.unlink()
+                target.rmdir()
+                raise
             self.cumulative_bytes += compressed
-            if self.wandb_writer is not None:
-                artifact = self.wandb_writer.Artifact(
-                    name=f"diag-v2-{self.run_id}", type="diagnostic-event-v2"
-                )
-                artifact.add_dir(str(target))
-                self.wandb_writer.run.log_artifact(artifact)
             return target, compressed
         except Exception:
             if temporary.exists():
