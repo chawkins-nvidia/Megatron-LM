@@ -1,11 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import ast
 import inspect
 
 import pytest
 import torch
 import torch.distributed as dist
 
+import megatron.training.diagnostics.accumulator as accumulator_module
 from megatron.training.diagnostics.accumulator import PackedSufficientStatistics
 from megatron.training.diagnostics.schema import Tier0Reason
 
@@ -34,7 +36,9 @@ class _PeerReducer:
 
 
 def _accumulator(*slot_names: str) -> PackedSufficientStatistics:
-    return PackedSufficientStatistics(tuple(slot_names), "cpu")
+    return PackedSufficientStatistics(
+        tuple(slot_names), "cpu", descriptor_hash=f"test:{slot_names!r}"
+    )
 
 
 def test_unequal_populations_masks_and_microbatches_match_concatenated_reference() -> (
@@ -157,6 +161,62 @@ def test_nonfinites_are_counted_but_invalidate_numeric_derivations() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "mask",
+    (
+        torch.tensor([-1.0, 1.0]),
+        torch.tensor([torch.nan, 1.0]),
+        torch.tensor([torch.inf, 1.0]),
+        torch.ones(3),
+        torch.ones(2, dtype=torch.complex64),
+        torch.ones(2, device="meta"),
+    ),
+    ids=("negative", "nan", "infinite", "shape", "complex", "device"),
+)
+def test_invalid_masks_are_neutral_and_surface_packed_mask_mismatch(
+    mask: torch.Tensor,
+) -> None:
+    accumulator = _accumulator("masked")
+    accumulator.add_masked_tensor("masked", torch.tensor([3.0, 4.0]), mask=mask)
+    slots = accumulator.slots("masked")
+
+    assert accumulator.sum_pack[slots.mask_error] > 0
+    torch.testing.assert_close(
+        accumulator.sum_pack[slots.count], torch.tensor(0.0, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        accumulator.sum_pack[slots.sumsq], torch.tensor(0.0, dtype=torch.float64)
+    )
+    accumulator.finalize_local_()
+    statistic = accumulator.rms("masked")
+    assert not statistic.valid
+    assert torch.isnan(statistic.value)
+    assert statistic.reason == Tier0Reason.MASK_MISMATCH
+
+
+def test_mask_mismatch_reduces_collectively_without_changing_collective_count() -> None:
+    local = _accumulator("masked")
+    local.add_masked_tensor("masked", torch.tensor([3.0, 4.0]))
+    peer = _accumulator("masked")
+    peer.add_masked_tensor(
+        "masked", torch.tensor([100.0, 200.0]), mask=torch.tensor([-1.0, 1.0])
+    )
+    group = object()
+    reducer = _PeerReducer(peer, group)
+
+    local.reduce_(group=group, reducer=reducer)
+
+    assert reducer.operations == [
+        dist.ReduceOp.SUM,
+        dist.ReduceOp.MAX,
+        dist.ReduceOp.MIN,
+    ]
+    statistic = local.rms("masked")
+    assert not statistic.valid
+    assert torch.isnan(statistic.value)
+    assert statistic.reason == Tier0Reason.MASK_MISMATCH
+
+
 def test_zero_denominators_are_invalid_nan_not_zero() -> None:
     accumulator = _accumulator("response", "masked")
     accumulator.add_masked_pair("response", torch.ones(4), torch.zeros(4))
@@ -199,6 +259,57 @@ def test_pooled_cosine_avoids_known_mean_of_rank_cosines_sign_flip() -> None:
     assert rank0.cosine("cosine").value < 0
 
 
+def test_finite_fp32_square_overflow_range_is_safe_for_rms() -> None:
+    values = torch.tensor([2.0e19, -2.0e19], dtype=torch.float32)
+    assert not torch.isfinite(values.square()).all()
+    accumulator = _accumulator("large")
+    accumulator.add_masked_tensor("large", values)
+    accumulator.finalize_local_()
+
+    statistic = accumulator.rms("large")
+    assert statistic.valid
+    assert torch.isfinite(statistic.value)
+    torch.testing.assert_close(
+        statistic.value,
+        torch.tensor(2.0e19, dtype=torch.float64),
+        rtol=1e-6,
+        atol=0,
+    )
+
+
+def test_finite_fp32_product_overflow_range_is_safe_for_relative_rms_and_cosine() -> (
+    None
+):
+    lhs = torch.tensor([2.0e19, -2.0e19], dtype=torch.float32)
+    rhs = torch.tensor([2.0e19, -2.0e19], dtype=torch.float32)
+    assert not torch.isfinite(lhs * rhs).all()
+    accumulator = _accumulator("large_pair")
+    accumulator.add_masked_pair("large_pair", lhs, rhs)
+    accumulator.finalize_local_()
+
+    relative = accumulator.relative_rms("large_pair")
+    cosine = accumulator.cosine("large_pair")
+    assert relative.valid
+    assert cosine.valid
+    assert torch.isfinite(relative.value)
+    assert torch.isfinite(cosine.value)
+    torch.testing.assert_close(relative.value, torch.tensor(1.0, dtype=torch.float64))
+    torch.testing.assert_close(cosine.value, torch.tensor(1.0, dtype=torch.float64))
+
+
+def test_nonfinite_reduced_arithmetic_cannot_be_valid() -> None:
+    accumulator = _accumulator("corrupt")
+    accumulator.add_masked_tensor("corrupt", torch.ones(2))
+    slots = accumulator.slots("corrupt")
+    accumulator.sum_pack[slots.sumsq] = torch.inf
+    accumulator.finalize_local_()
+
+    statistic = accumulator.rms("corrupt")
+    assert not statistic.valid
+    assert torch.isnan(statistic.value)
+    assert statistic.reason == Tier0Reason.NONFINITE_ARITHMETIC
+
+
 @pytest.mark.parametrize(
     "dtype,tolerance", [(torch.float32, 1e-6), (torch.bfloat16, 1e-3)]
 )
@@ -233,10 +344,22 @@ def test_update_relative_rms_uses_delta_only_after_accumulation() -> None:
     )
 
 
-def test_accumulation_source_has_no_host_scalar_transfers() -> None:
-    source = inspect.getsource(PackedSufficientStatistics.add_masked_tensor)
-    source += inspect.getsource(PackedSufficientStatistics.add_masked_pair)
-    source += inspect.getsource(PackedSufficientStatistics.add_update)
-    assert ".item(" not in source
-    assert ".cpu(" not in source
-    assert "float(" not in source
+def test_full_accumulation_module_has_no_prohibited_host_synchronization() -> None:
+    source = inspect.getsource(accumulator_module)
+    tree = ast.parse(source)
+    prohibited_attributes = {"cpu", "item", "numpy", "tolist"}
+    violations = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in prohibited_attributes:
+                violations.append((node.func.attr, node.lineno))
+            if node.func.attr == "to" and (
+                node.args or any(keyword.arg != "dtype" for keyword in node.keywords)
+            ):
+                violations.append(("device-moving to", node.lineno))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in {"bool", "float", "int"}:
+                violations.append((node.func.id, node.lineno))
+
+    assert violations == []

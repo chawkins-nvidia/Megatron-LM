@@ -11,7 +11,7 @@ from typing import Iterable
 import torch
 
 from .accumulator import PackedSlots, PackedSufficientStatistics
-from .schema import SCHEMA_VERSION
+from .schema import SCHEMA_PREFIX
 
 
 class MetricFamily(StrEnum):
@@ -67,20 +67,82 @@ class MaskKind(StrEnum):
     PARAMETER = "parameter"
 
 
+class StatisticKind(StrEnum):
+    """Sufficient-statistic operation accepted by a metric descriptor."""
+
+    TENSOR_MOMENTS = "tensor_moments"
+    PAIR_MOMENTS = "pair_moments"
+    UPDATE = "update"
+
+
+class DenominatorKind(StrEnum):
+    """Canonical denominator represented by a descriptor's packed moments."""
+
+    SELECTED_ELEMENTS = "selected_elements"
+    RHS_SUMSQ = "rhs_sumsq"
+    PRE_UPDATE_SUMSQ = "pre_update_sumsq"
+
+
+class NormalizationKind(StrEnum):
+    """Normalization applied before or during sufficient-statistic pooling."""
+
+    NONE = "none"
+    GLOBAL_VALID_TOKENS = "global_valid_tokens"
+    LOSS_SCALE_AND_GLOBAL_VALID_TOKENS = "loss_scale_and_global_valid_tokens"
+
+
+class ReductionKind(StrEnum):
+    """Fixed collective operations used by an accumulator."""
+
+    PACKED_SUM_MAX_MIN = "packed_sum_max_min"
+    HIERARCHICAL_PACKED_SUM_MAX_MIN = "hierarchical_packed_sum_max_min"
+
+
 @dataclass(frozen=True)
 class MetricDescriptor:
-    """Static topology and packed-slot contract for one logical metric."""
+    """Describe one logical metric's complete, rank-independent semantics.
+
+    Attributes:
+        logical_name: Stable logical metric name and packed-slot identity.
+        family: Logical model tensor family.
+        global_layer: Global layer index, or ``None`` for non-layer metrics.
+        partition_axes: Axes that contain distinct logical observations.
+        replication_axes: Axes that may repeat logical observations.
+        replication_multiplicity: Number of repeated copies corrected during pooling.
+        ownership: Static rule used to choose authoritative contributors.
+        mask_kind: Expected masking semantics.
+        statistic_kind: Accumulation operation permitted for the descriptor.
+        denominator_kind: Meaning of the packed denominator.
+        normalization_kind: Pre-pooling loss or token normalization contract.
+        process_group_identity: Stable name of the collective process group.
+        reduction_kind: Collective operations applied to the packed buffers.
+        tied_owner_identity: Stable tied-parameter owner identity, when applicable.
+        packed_slots: Canonical offsets occupied in the packed buffers.
+    """
 
     logical_name: str
     family: MetricFamily
     global_layer: int | None
     partition_axes: tuple[PartitionAxis, ...]
     replication_axes: tuple[ReplicationAxis, ...]
+    replication_multiplicity: int
     ownership: Ownership
     mask_kind: MaskKind
+    statistic_kind: StatisticKind
+    denominator_kind: DenominatorKind
+    normalization_kind: NormalizationKind
+    process_group_identity: str
+    reduction_kind: ReductionKind
+    tied_owner_identity: str | None
     packed_slots: PackedSlots
 
     def __post_init__(self) -> None:
+        """Validate the static descriptor contract.
+
+        Raises:
+            ValueError: If an identity, axis, multiplicity, or statistic contract is invalid.
+        """
+
         if not self.logical_name:
             raise ValueError("a metric descriptor requires a logical name")
         if self.global_layer is not None and self.global_layer < 0:
@@ -89,10 +151,31 @@ class MetricDescriptor:
             raise ValueError("partition axes must be unique")
         if len(self.replication_axes) != len(set(self.replication_axes)):
             raise ValueError("replication axes must be unique")
+        if self.replication_multiplicity <= 0:
+            raise ValueError("replication multiplicity must be positive")
+        if not self.process_group_identity:
+            raise ValueError("a metric descriptor requires a process-group identity")
+        if (
+            self.ownership == Ownership.TIED_PARAMETER_OWNER
+            and not self.tied_owner_identity
+        ):
+            raise ValueError("tied-parameter ownership requires a tied-owner identity")
+        if self.tied_owner_identity is not None and not self.tied_owner_identity:
+            raise ValueError("tied-owner identities must be nonempty")
+
+        expected_denominator = {
+            StatisticKind.TENSOR_MOMENTS: DenominatorKind.SELECTED_ELEMENTS,
+            StatisticKind.PAIR_MOMENTS: DenominatorKind.RHS_SUMSQ,
+            StatisticKind.UPDATE: DenominatorKind.PRE_UPDATE_SUMSQ,
+        }[self.statistic_kind]
+        if self.denominator_kind != expected_denominator:
+            raise ValueError(
+                f"{self.statistic_kind.value} requires denominator {expected_denominator.value}"
+            )
 
 
 class MetricRegistry:
-    """A fixed descriptor sequence plus rank-local ownership decisions."""
+    """Hold a fixed descriptor sequence plus rank-local ownership decisions."""
 
     def __init__(
         self,
@@ -100,7 +183,15 @@ class MetricRegistry:
         *,
         local_owners: Iterable[bool] | None = None,
     ) -> None:
-        """Validate descriptors and retain neutral slots for non-owning ranks."""
+        """Validate descriptors and retain neutral slots for non-owning ranks.
+
+        Args:
+            descriptors: Rank-independent descriptors in collective slot order.
+            local_owners: Optional rank-local contribution decision per descriptor.
+
+        Raises:
+            ValueError: If descriptors, slots, reductions, or ownership lengths disagree.
+        """
 
         self.descriptors = tuple(descriptors)
         names = tuple(descriptor.logical_name for descriptor in self.descriptors)
@@ -111,6 +202,18 @@ class MetricRegistry:
                 raise ValueError(
                     "descriptor packed slots must follow canonical registry order"
                 )
+
+        process_groups = {
+            descriptor.process_group_identity for descriptor in self.descriptors
+        }
+        reductions = {descriptor.reduction_kind for descriptor in self.descriptors}
+        if len(process_groups) > 1 or len(reductions) > 1:
+            raise ValueError(
+                "one packed registry must use one process-group and reduction identity"
+            )
+        self.process_group_identity = next(iter(process_groups), "unbound")
+        self.reduction_kind = next(iter(reductions), ReductionKind.PACKED_SUM_MAX_MIN)
+
         owners = (
             tuple(True for _ in self.descriptors)
             if local_owners is None
@@ -129,16 +232,18 @@ class MetricRegistry:
 
     @property
     def descriptor_hash(self) -> str:
-        """Return a stable SHA-256 hash of static, rank-independent descriptors."""
+        """Return a SHA-256 hash of all static, rank-independent semantics."""
 
         records = []
         for descriptor in self.descriptors:
             records.append(
                 {
+                    "denominator_kind": descriptor.denominator_kind.value,
                     "family": descriptor.family.value,
                     "global_layer": descriptor.global_layer,
                     "logical_name": descriptor.logical_name,
                     "mask_kind": descriptor.mask_kind.value,
+                    "normalization_kind": descriptor.normalization_kind.value,
                     "ownership": descriptor.ownership.value,
                     "packed_slots": {
                         packed_field.name: getattr(
@@ -149,25 +254,51 @@ class MetricRegistry:
                     "partition_axes": sorted(
                         axis.value for axis in descriptor.partition_axes
                     ),
+                    "process_group_identity": descriptor.process_group_identity,
+                    "reduction_kind": descriptor.reduction_kind.value,
                     "replication_axes": sorted(
                         axis.value for axis in descriptor.replication_axes
                     ),
+                    "replication_multiplicity": descriptor.replication_multiplicity,
+                    "statistic_kind": descriptor.statistic_kind.value,
+                    "tied_owner_identity": descriptor.tied_owner_identity,
                 }
             )
         encoded = json.dumps(
-            {"descriptors": records, "schema_version": SCHEMA_VERSION},
+            {"descriptors": records, "schema_identity": SCHEMA_PREFIX.rstrip("/")},
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
     def new_accumulator(self, device: torch.device | str) -> PackedSufficientStatistics:
-        """Allocate neutral packs matching the registry on CPU or CUDA."""
+        """Allocate neutral packs bound to this registry's complete identity.
 
-        return PackedSufficientStatistics(self.slot_names, device)
+        Args:
+            device: CPU or CUDA device on which accumulation and reduction occur.
+
+        Returns:
+            An empty accumulator carrying this registry's descriptor and schema identity.
+        """
+
+        return PackedSufficientStatistics(
+            self.slot_names,
+            device,
+            descriptor_hash=self.descriptor_hash,
+            schema_identity=SCHEMA_PREFIX.rstrip("/"),
+            process_group_identity=self.process_group_identity,
+            reduction_identity=self.reduction_kind.value,
+        )
 
     def owns(self, logical_name: str) -> bool:
-        """Return whether this rank contributes to ``logical_name``."""
+        """Return whether this rank contributes to a logical metric.
+
+        Args:
+            logical_name: Registered logical metric name.
+
+        Returns:
+            Whether the rank-local ownership decision is authoritative.
+        """
 
         return self.local_owners[self._index(logical_name)]
 
@@ -178,18 +309,28 @@ class MetricRegistry:
         values: torch.Tensor,
         *,
         mask: torch.Tensor | None = None,
-        replication_multiplicity: int = 1,
     ) -> None:
-        """Accumulate an owned tensor or leave its neutral slots untouched."""
+        """Accumulate an owned tensor under its registered semantics.
 
-        index = self._index(logical_name)
-        self._validate_accumulator(accumulator)
+        Args:
+            accumulator: Registry-bound packed accumulator.
+            logical_name: Registered tensor-moment descriptor name.
+            values: Local tensor observation.
+            mask: Optional same-device broadcastable nonnegative weights.
+
+        Raises:
+            ValueError: If the accumulator or requested operation conflicts with the descriptor.
+        """
+
+        index, descriptor = self._operation(
+            accumulator, logical_name, StatisticKind.TENSOR_MOMENTS, mask
+        )
         if self.local_owners[index]:
             accumulator.add_masked_tensor(
                 index,
                 values,
                 mask=mask,
-                replication_multiplicity=replication_multiplicity,
+                replication_multiplicity=descriptor.replication_multiplicity,
             )
 
     def add_masked_pair(
@@ -200,20 +341,84 @@ class MetricRegistry:
         rhs: torch.Tensor,
         *,
         mask: torch.Tensor | None = None,
-        replication_multiplicity: int = 1,
     ) -> None:
-        """Accumulate an owned pair or leave its neutral slots untouched."""
+        """Accumulate an owned pair under its registered semantics.
 
-        index = self._index(logical_name)
-        self._validate_accumulator(accumulator)
+        Args:
+            accumulator: Registry-bound packed accumulator.
+            logical_name: Registered pair-moment descriptor name.
+            lhs: Numerator-side tensor observation.
+            rhs: Denominator-side tensor observation.
+            mask: Optional same-device broadcastable nonnegative weights.
+
+        Raises:
+            ValueError: If the accumulator or requested operation conflicts with the descriptor.
+        """
+
+        index, descriptor = self._operation(
+            accumulator, logical_name, StatisticKind.PAIR_MOMENTS, mask
+        )
         if self.local_owners[index]:
             accumulator.add_masked_pair(
                 index,
                 lhs,
                 rhs,
                 mask=mask,
-                replication_multiplicity=replication_multiplicity,
+                replication_multiplicity=descriptor.replication_multiplicity,
             )
+
+    def add_update(
+        self,
+        accumulator: PackedSufficientStatistics,
+        logical_name: str,
+        before: torch.Tensor,
+        after: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+    ) -> None:
+        """Accumulate an authoritative update or preserve neutral non-owner slots.
+
+        Args:
+            accumulator: Registry-bound packed accumulator.
+            logical_name: Registered update descriptor name.
+            before: Authoritative pre-update tensor.
+            after: Authoritative post-update tensor.
+            mask: Optional same-device broadcastable nonnegative weights.
+
+        Raises:
+            ValueError: If the accumulator or requested operation conflicts with the descriptor.
+        """
+
+        index, descriptor = self._operation(
+            accumulator, logical_name, StatisticKind.UPDATE, mask
+        )
+        if self.local_owners[index]:
+            accumulator.add_update(
+                index,
+                before,
+                after,
+                mask=mask,
+                replication_multiplicity=descriptor.replication_multiplicity,
+            )
+
+    def _operation(
+        self,
+        accumulator: PackedSufficientStatistics,
+        logical_name: str,
+        statistic_kind: StatisticKind,
+        mask: torch.Tensor | None,
+    ) -> tuple[int, MetricDescriptor]:
+        index = self._index(logical_name)
+        self._validate_accumulator(accumulator)
+        descriptor = self.descriptors[index]
+        if descriptor.statistic_kind != statistic_kind:
+            raise ValueError(
+                f"{logical_name} requires {descriptor.statistic_kind.value}, "
+                f"not {statistic_kind.value}"
+            )
+        if descriptor.mask_kind == MaskKind.NONE and mask is not None:
+            raise ValueError(f"{logical_name} does not accept a mask")
+        return index, descriptor
 
     def _index(self, logical_name: str) -> int:
         try:
@@ -225,4 +430,13 @@ class MetricRegistry:
         if accumulator.slot_names != self.slot_names:
             raise ValueError(
                 "accumulator slot order does not match the metric registry"
+            )
+        if (
+            accumulator.schema_identity != SCHEMA_PREFIX.rstrip("/")
+            or accumulator.descriptor_hash != self.descriptor_hash
+            or accumulator.process_group_identity != self.process_group_identity
+            or accumulator.reduction_identity != self.reduction_kind.value
+        ):
+            raise ValueError(
+                "accumulator descriptor/schema identity does not match the metric registry"
             )

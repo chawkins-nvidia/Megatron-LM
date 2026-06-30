@@ -241,6 +241,7 @@ addopts = "--durations=15 -s -rA"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
+    "distributed: mark a test that requires torch.distributed.run with multiple ranks.",
     "internal: mark a test as a test to private/internal functions.",
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",

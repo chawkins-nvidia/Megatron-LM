@@ -6,7 +6,8 @@ from enum import IntEnum
 from typing import Mapping
 
 SCHEMA_VERSION = 2
-TIER0_PREFIX = f"diag/v{SCHEMA_VERSION}/t0/"
+SCHEMA_PREFIX = f"diag/v{SCHEMA_VERSION}/"
+TIER0_PREFIX = f"{SCHEMA_PREFIX}t0/"
 
 
 class Tier0Status(IntEnum):
@@ -28,6 +29,7 @@ class Tier0Reason(IntEnum):
     MASK_MISMATCH = 4
     DESCRIPTOR_MISMATCH = 5
     UNSUPPORTED_LAYOUT = 6
+    NONFINITE_ARITHMETIC = 7
 
 
 _DEPTH_SUMMARIES = ("first", "q1", "middle", "q3", "last", "p10", "p50", "p90")
@@ -35,7 +37,7 @@ _MODULE_FAMILIES = ("qkv", "attn_out", "fc1", "fc2")
 _LAYERED_UPDATE_FAMILIES = (*_MODULE_FAMILIES, "norm")
 _MATRIX_FAMILIES = ("embedding", *_MODULE_FAMILIES, "output")
 
-TIER0_KEYS: tuple[str, ...] = (
+TIER0_METRIC_KEYS: tuple[str, ...] = (
     *(
         f"{TIER0_PREFIX}activation/residual/rms/{summary}"
         for summary in _DEPTH_SUMMARIES
@@ -62,15 +64,20 @@ TIER0_KEYS: tuple[str, ...] = (
         f"{TIER0_PREFIX}activation/{family}/max_abs"
         for family in (*_MODULE_FAMILIES, "residual")
     ),
-    f"{TIER0_PREFIX}event/successful_update",
-    f"{TIER0_PREFIX}event/valid_positions",
-    f"{TIER0_PREFIX}health/nonfinite_fraction",
-    f"{TIER0_PREFIX}health/underflow_fraction",
-    f"{TIER0_PREFIX}status/valid",
-    f"{TIER0_PREFIX}perf/peak_hbm_bytes_max_rank",
-    f"{TIER0_PREFIX}perf/latency_ms_median_rank",
-    f"{TIER0_PREFIX}perf/latency_ms_max_rank",
 )
+
+TIER0_METADATA_KEYS: tuple[str, ...] = (
+    f"{SCHEMA_PREFIX}event/successful_update",
+    f"{SCHEMA_PREFIX}event/valid_positions",
+    f"{SCHEMA_PREFIX}health/nonfinite_fraction",
+    f"{SCHEMA_PREFIX}health/underflow_fraction",
+    f"{SCHEMA_PREFIX}status/valid",
+    f"{SCHEMA_PREFIX}perf/peak_hbm_bytes_max_rank",
+    f"{SCHEMA_PREFIX}perf/latency_ms_median_rank",
+    f"{SCHEMA_PREFIX}perf/latency_ms_max_rank",
+)
+
+TIER0_KEYS: tuple[str, ...] = (*TIER0_METRIC_KEYS, *TIER0_METADATA_KEYS)
 
 
 def assert_payload_schema(payload: Mapping[str, object]) -> None:
