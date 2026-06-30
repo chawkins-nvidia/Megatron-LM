@@ -306,6 +306,7 @@ _groups:
     - 0.005725
     - 0.028625
     - 0.143125
+    - 0.715625
     lr_values:
     - 4.4000000000000006e-05
     - 0.00022000000000000003
@@ -338,6 +339,11 @@ _groups:
     - hpo_r6_promoted_attention_out_i0p143125_lr0p0011
     - hpo_r6_promoted_attention_out_i0p143125_lr0p0055
     - hpo_r6_promoted_attention_out_i0p143125_lr0p0275
+    - hpo_r6_promoted_attention_out_i0p715625_lr4p4em05
+    - hpo_r6_promoted_attention_out_i0p715625_lr0p00022
+    - hpo_r6_promoted_attention_out_i0p715625_lr0p0011
+    - hpo_r6_promoted_attention_out_i0p715625_lr0p0055
+    - hpo_r6_promoted_attention_out_i0p715625_lr0p0275
   attention_out:
     label: attention out
     target_type: linear_proj
@@ -16320,6 +16326,681 @@ hpo_r6_promoted_attention_out_i0p143125_lr0p0275:
       - linear_proj
       init_std_mult:
         const: 6.25
+      lr_mult:
+        const: 25.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_attention_out_i0p715625_lr4p4em05:
+  metadata:
+    group: promoted_attention_out
+    label: r6 restart attention out
+    target_type: linear_proj
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.715625
+    lr: 4.4000000000000006e-05
+  parametrization:
+    enabled: true
+    candidate_name: hpo_r6_promoted_attention_out_i0p715625_lr4p4em05
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types:
+    - embedding
+    - unembedding
+    - linear_qkv
+    - linear_proj
+    - linear_fc1
+    - linear_fc2
+    - qk_norm
+    - norm_bias
+    type_registry:
+      embedding:
+        attr:
+        - is_embedding_parameter
+        - shared_embedding
+        name_globs:
+        - '*word_embeddings.weight'
+        min_dim: 2
+      unembedding:
+        name_globs:
+        - '*output_layer.weight'
+        min_dim: 2
+      linear_qkv:
+        name_globs:
+        - '*.linear_qkv.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_proj:
+        name_globs:
+        - '*.linear_proj.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc1:
+        name_globs:
+        - '*.linear_fc1.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc2:
+        name_globs:
+        - '*.linear_fc2.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      qk_norm:
+        name_globs:
+        - '*.q_layernorm.weight'
+        - '*.q_layernorm.bias'
+        - '*.k_layernorm.weight'
+        - '*.k_layernorm.bias'
+        max_dim: 1
+      norm_bias:
+        name_globs:
+        - '*layernorm.weight'
+        - '*.bias'
+        - '*final_layernorm.weight'
+        - '*.layer_norm_weight'
+        - '*.layer_norm_bias'
+        exclude_globs:
+        - '*.q_layernorm.*'
+        - '*.k_layernorm.*'
+        max_dim: 1
+    rules:
+    - name: embedding_promoted
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 4.0
+    - name: unembedding_promoted
+      types:
+      - unembedding
+      init_std_mult:
+        const: 0.007977808640344915
+      lr_mult:
+        const: 0.519521462169745
+    - name: linear_qkv_promoted
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 0.3032933477757485
+      lr_mult:
+        const: 0.5671238945810118
+    - name: promoted_attention_out_tuned
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 31.249999999999996
+      lr_mult:
+        const: 0.04
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_attention_out_i0p715625_lr0p00022:
+  metadata:
+    group: promoted_attention_out
+    label: r6 restart attention out
+    target_type: linear_proj
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.715625
+    lr: 0.00022000000000000003
+  parametrization:
+    enabled: true
+    candidate_name: hpo_r6_promoted_attention_out_i0p715625_lr0p00022
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types:
+    - embedding
+    - unembedding
+    - linear_qkv
+    - linear_proj
+    - linear_fc1
+    - linear_fc2
+    - qk_norm
+    - norm_bias
+    type_registry:
+      embedding:
+        attr:
+        - is_embedding_parameter
+        - shared_embedding
+        name_globs:
+        - '*word_embeddings.weight'
+        min_dim: 2
+      unembedding:
+        name_globs:
+        - '*output_layer.weight'
+        min_dim: 2
+      linear_qkv:
+        name_globs:
+        - '*.linear_qkv.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_proj:
+        name_globs:
+        - '*.linear_proj.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc1:
+        name_globs:
+        - '*.linear_fc1.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc2:
+        name_globs:
+        - '*.linear_fc2.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      qk_norm:
+        name_globs:
+        - '*.q_layernorm.weight'
+        - '*.q_layernorm.bias'
+        - '*.k_layernorm.weight'
+        - '*.k_layernorm.bias'
+        max_dim: 1
+      norm_bias:
+        name_globs:
+        - '*layernorm.weight'
+        - '*.bias'
+        - '*final_layernorm.weight'
+        - '*.layer_norm_weight'
+        - '*.layer_norm_bias'
+        exclude_globs:
+        - '*.q_layernorm.*'
+        - '*.k_layernorm.*'
+        max_dim: 1
+    rules:
+    - name: embedding_promoted
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 4.0
+    - name: unembedding_promoted
+      types:
+      - unembedding
+      init_std_mult:
+        const: 0.007977808640344915
+      lr_mult:
+        const: 0.519521462169745
+    - name: linear_qkv_promoted
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 0.3032933477757485
+      lr_mult:
+        const: 0.5671238945810118
+    - name: promoted_attention_out_tuned
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 31.249999999999996
+      lr_mult:
+        const: 0.2
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_attention_out_i0p715625_lr0p0011:
+  metadata:
+    group: promoted_attention_out
+    label: r6 restart attention out
+    target_type: linear_proj
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.715625
+    lr: 0.0011
+  parametrization:
+    enabled: true
+    candidate_name: hpo_r6_promoted_attention_out_i0p715625_lr0p0011
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types:
+    - embedding
+    - unembedding
+    - linear_qkv
+    - linear_proj
+    - linear_fc1
+    - linear_fc2
+    - qk_norm
+    - norm_bias
+    type_registry:
+      embedding:
+        attr:
+        - is_embedding_parameter
+        - shared_embedding
+        name_globs:
+        - '*word_embeddings.weight'
+        min_dim: 2
+      unembedding:
+        name_globs:
+        - '*output_layer.weight'
+        min_dim: 2
+      linear_qkv:
+        name_globs:
+        - '*.linear_qkv.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_proj:
+        name_globs:
+        - '*.linear_proj.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc1:
+        name_globs:
+        - '*.linear_fc1.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc2:
+        name_globs:
+        - '*.linear_fc2.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      qk_norm:
+        name_globs:
+        - '*.q_layernorm.weight'
+        - '*.q_layernorm.bias'
+        - '*.k_layernorm.weight'
+        - '*.k_layernorm.bias'
+        max_dim: 1
+      norm_bias:
+        name_globs:
+        - '*layernorm.weight'
+        - '*.bias'
+        - '*final_layernorm.weight'
+        - '*.layer_norm_weight'
+        - '*.layer_norm_bias'
+        exclude_globs:
+        - '*.q_layernorm.*'
+        - '*.k_layernorm.*'
+        max_dim: 1
+    rules:
+    - name: embedding_promoted
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 4.0
+    - name: unembedding_promoted
+      types:
+      - unembedding
+      init_std_mult:
+        const: 0.007977808640344915
+      lr_mult:
+        const: 0.519521462169745
+    - name: linear_qkv_promoted
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 0.3032933477757485
+      lr_mult:
+        const: 0.5671238945810118
+    - name: promoted_attention_out_tuned
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 31.249999999999996
+      lr_mult:
+        const: 1.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_attention_out_i0p715625_lr0p0055:
+  metadata:
+    group: promoted_attention_out
+    label: r6 restart attention out
+    target_type: linear_proj
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.715625
+    lr: 0.0055000000000000005
+  parametrization:
+    enabled: true
+    candidate_name: hpo_r6_promoted_attention_out_i0p715625_lr0p0055
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types:
+    - embedding
+    - unembedding
+    - linear_qkv
+    - linear_proj
+    - linear_fc1
+    - linear_fc2
+    - qk_norm
+    - norm_bias
+    type_registry:
+      embedding:
+        attr:
+        - is_embedding_parameter
+        - shared_embedding
+        name_globs:
+        - '*word_embeddings.weight'
+        min_dim: 2
+      unembedding:
+        name_globs:
+        - '*output_layer.weight'
+        min_dim: 2
+      linear_qkv:
+        name_globs:
+        - '*.linear_qkv.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_proj:
+        name_globs:
+        - '*.linear_proj.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc1:
+        name_globs:
+        - '*.linear_fc1.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc2:
+        name_globs:
+        - '*.linear_fc2.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      qk_norm:
+        name_globs:
+        - '*.q_layernorm.weight'
+        - '*.q_layernorm.bias'
+        - '*.k_layernorm.weight'
+        - '*.k_layernorm.bias'
+        max_dim: 1
+      norm_bias:
+        name_globs:
+        - '*layernorm.weight'
+        - '*.bias'
+        - '*final_layernorm.weight'
+        - '*.layer_norm_weight'
+        - '*.layer_norm_bias'
+        exclude_globs:
+        - '*.q_layernorm.*'
+        - '*.k_layernorm.*'
+        max_dim: 1
+    rules:
+    - name: embedding_promoted
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 4.0
+    - name: unembedding_promoted
+      types:
+      - unembedding
+      init_std_mult:
+        const: 0.007977808640344915
+      lr_mult:
+        const: 0.519521462169745
+    - name: linear_qkv_promoted
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 0.3032933477757485
+      lr_mult:
+        const: 0.5671238945810118
+    - name: promoted_attention_out_tuned
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 31.249999999999996
+      lr_mult:
+        const: 5.0
+    - name: linear_fc1_identity
+      types:
+      - linear_fc1
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: linear_fc2_identity
+      types:
+      - linear_fc2
+      init_std_mult:
+        const: 1.0
+      lr_mult:
+        const: 1.0
+    - name: qk_norm_identity
+      types:
+      - qk_norm
+      lr_mult:
+        const: 1.0
+    - name: norm_bias_identity
+      types:
+      - norm_bias
+      lr_mult:
+        const: 1.0
+hpo_r6_promoted_attention_out_i0p715625_lr0p0275:
+  metadata:
+    group: promoted_attention_out
+    label: r6 restart attention out
+    target_type: linear_proj
+    axis_mode: init_lr
+    r: 6
+    num_layers: 12
+    init_base: 0.0229
+    lr_base: 0.0011
+    init_std: 0.715625
+    lr: 0.0275
+  parametrization:
+    enabled: true
+    candidate_name: hpo_r6_promoted_attention_out_i0p715625_lr0p0275
+    alpha: 1.0
+    depth_base: 8
+    residual_attention_const: 1.0
+    residual_mlp_const: 1.0
+    expected_types:
+    - embedding
+    - unembedding
+    - linear_qkv
+    - linear_proj
+    - linear_fc1
+    - linear_fc2
+    - qk_norm
+    - norm_bias
+    type_registry:
+      embedding:
+        attr:
+        - is_embedding_parameter
+        - shared_embedding
+        name_globs:
+        - '*word_embeddings.weight'
+        min_dim: 2
+      unembedding:
+        name_globs:
+        - '*output_layer.weight'
+        min_dim: 2
+      linear_qkv:
+        name_globs:
+        - '*.linear_qkv.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_proj:
+        name_globs:
+        - '*.linear_proj.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc1:
+        name_globs:
+        - '*.linear_fc1.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      linear_fc2:
+        name_globs:
+        - '*.linear_fc2.weight'
+        exclude_globs:
+        - '*experts*'
+        min_dim: 2
+      qk_norm:
+        name_globs:
+        - '*.q_layernorm.weight'
+        - '*.q_layernorm.bias'
+        - '*.k_layernorm.weight'
+        - '*.k_layernorm.bias'
+        max_dim: 1
+      norm_bias:
+        name_globs:
+        - '*layernorm.weight'
+        - '*.bias'
+        - '*final_layernorm.weight'
+        - '*.layer_norm_weight'
+        - '*.layer_norm_bias'
+        exclude_globs:
+        - '*.q_layernorm.*'
+        - '*.k_layernorm.*'
+        max_dim: 1
+    rules:
+    - name: embedding_promoted
+      types:
+      - embedding
+      init_std_mult:
+        const: 0.015625
+      lr_mult:
+        const: 4.0
+    - name: unembedding_promoted
+      types:
+      - unembedding
+      init_std_mult:
+        const: 0.007977808640344915
+      lr_mult:
+        const: 0.519521462169745
+    - name: linear_qkv_promoted
+      types:
+      - linear_qkv
+      init_std_mult:
+        const: 0.3032933477757485
+      lr_mult:
+        const: 0.5671238945810118
+    - name: promoted_attention_out_tuned
+      types:
+      - linear_proj
+      init_std_mult:
+        const: 31.249999999999996
       lr_mult:
         const: 25.0
     - name: linear_fc1_identity
