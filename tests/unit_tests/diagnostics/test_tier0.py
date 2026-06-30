@@ -69,6 +69,70 @@ def _status_only_args() -> SimpleNamespace:
     )
 
 
+def _capability_args(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "bf16": True,
+        "fp16": False,
+        "calculate_per_token_loss": True,
+        "transformer_impl": "local",
+        "data_parallel_size": 1,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "num_layers": 1,
+        "micro_batch_size": 1,
+        "seq_length": 1,
+        "world_size": 1,
+        "sequence_parallel": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _install_supported_capability_fakes(monkeypatch: pytest.MonkeyPatch) -> object:
+    parameter = nn.Parameter(torch.ones(1))
+    distributed_optimizer = SimpleNamespace(
+        grad_scaler=None, optimizer=torch.optim.Adam([parameter])
+    )
+
+    def canonical(_iterator, _model, *, diagnostic_heartbeat=None):
+        return diagnostic_heartbeat
+
+    monkeypatch.setattr(tier0_module, "GPTModel", nn.Linear)
+    monkeypatch.setattr(
+        tier0_module, "_distributed_optimizer", lambda _optimizer: distributed_optimizer
+    )
+    monkeypatch.setattr(
+        tier0_module,
+        "_canonical_mask_producer",
+        (
+            canonical,
+            tier0_module._MASK_PRODUCER_IDENTITY,
+            tier0_module._NONINTERLEAVED_SCHEDULE_ADAPTER,
+        ),
+    )
+    return canonical
+
+
+def _memory_evidence() -> dict[str, object]:
+    return {
+        "all_rank_post_gather_peak": {
+            "available": False,
+            "promotable": False,
+            "reason": "no post-gather all-rank consensus operation exists",
+        },
+        "sink_post_interval": {
+            "available": False,
+            "rank": 0,
+            "event_wall_time_ms": 10.0,
+            "peak_allocated_bytes": 0,
+            "peak_reserved_bytes": 0,
+            "allocated_growth_within_bound": True,
+            "reserved_growth_within_bound": True,
+        },
+    }
+
+
 class _TensorboardWriter:
     def __init__(self) -> None:
         self.values: dict[str, torch.Tensor] = {}
@@ -153,6 +217,98 @@ def test_narrow_backend_capability_rejects_unsupported_modes(
     args = SimpleNamespace(**values)
     reasons = tier0_module._local_capability_reasons(args, [nn.Linear(1, 1)], object())
     assert reason in reasons
+
+
+@pytest.mark.parametrize(
+    ("boundary", "one_past", "boundary_microbatches", "one_past_microbatches"),
+    (
+        ({"num_layers": 512}, {"num_layers": 513}, 1, 1),
+        ({"micro_batch_size": 8}, {"micro_batch_size": 9}, 1, 1),
+        ({"seq_length": 32_768}, {"seq_length": 32_769}, 1, 1),
+        ({}, {}, 64, 65),
+        (
+            {"world_size": 1024, "data_parallel_size": 1024},
+            {"world_size": 1025, "data_parallel_size": 1025},
+            1,
+            1,
+        ),
+        (
+            {"world_size": 1024, "data_parallel_size": 1024},
+            {"world_size": 1025, "data_parallel_size": 1025},
+            1,
+            1,
+        ),
+        (
+            {"world_size": 1024, "tensor_model_parallel_size": 1024},
+            {"world_size": 1025, "tensor_model_parallel_size": 1025},
+            1,
+            1,
+        ),
+        (
+            {"world_size": 512, "pipeline_model_parallel_size": 512, "num_layers": 512},
+            {"world_size": 513, "pipeline_model_parallel_size": 513, "num_layers": 512},
+            1,
+            1,
+        ),
+        (
+            {"world_size": 1024, "context_parallel_size": 1024, "seq_length": 32_768},
+            {"world_size": 1025, "context_parallel_size": 1025, "seq_length": 32_768},
+            1,
+            1,
+        ),
+    ),
+)
+def test_capability_accepts_each_boundary_and_rejects_every_one_past(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: dict[str, int],
+    one_past: dict[str, int],
+    boundary_microbatches: int,
+    one_past_microbatches: int,
+) -> None:
+    canonical = _install_supported_capability_fakes(monkeypatch)
+    supported = tier0_module._local_capability_reasons(
+        _capability_args(**boundary),
+        [nn.Linear(1, 1)],
+        object(),
+        canonical,
+        num_microbatches=boundary_microbatches,
+    )
+    rejected = tier0_module._local_capability_reasons(
+        _capability_args(**one_past),
+        [nn.Linear(1, 1)],
+        object(),
+        canonical,
+        num_microbatches=one_past_microbatches,
+    )
+    assert "capability_bounds" not in supported
+    assert "capability_bounds" in rejected
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"world_size": 2, "context_parallel_size": 2, "seq_length": 6},
+        {
+            "world_size": 4,
+            "tensor_model_parallel_size": 4,
+            "seq_length": 6,
+            "sequence_parallel": True,
+        },
+        {"world_size": 2, "data_parallel_size": 3},
+        {"world_size": 2**80, "data_parallel_size": 2**80},
+    ),
+)
+def test_capability_rejects_real_divisibility_topology_and_integer_overflow(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
+) -> None:
+    canonical = _install_supported_capability_fakes(monkeypatch)
+    reasons = tier0_module._local_capability_reasons(
+        _capability_args(**overrides),
+        [nn.Linear(1, 1)],
+        object(),
+        canonical,
+    )
+    assert "capability_bounds" in reasons
 
 
 def test_forward_function_requires_exact_registered_identity_and_rejects_review_spoof(
@@ -422,6 +578,44 @@ def test_joint_advertised_boundary_fits_and_one_past_rejects_before_p2p() -> Non
         owner_elements=0,
         world_size=static["topology_bounds"]["world_size"]["maximum"],
     )
+    capture_slots = 2 + 10 * 512
+    update_slots = 5 * 512 + 2
+    control_slots = 6
+    pack_bytes = (capture_slots + update_slots + control_slots) * 96
+    mask_elements = 8 * 32_768
+    named_allocations = {
+        "accumulator_packs": pack_bytes,
+        "reduction_arenas": pack_bytes,
+        "received_sidebands": 64 * (mask_elements + 1) * 4,
+        "local_sidebands": 64 * (mask_elements + 1) * 4,
+        "received_sideband_validity": 64,
+        "local_sideband_validity": 64,
+        "optimizer_snapshot_and_scratch": 104,
+        "capture_workspace": 1_572_864,
+        "capture_runtime_status": 8,
+        "capture_runtime_error": 8,
+        "capture_mask_finite": mask_elements,
+        "capture_mask_nonnegative": mask_elements,
+        "capture_mask_scalar": 1,
+        "capture_valid_token_count": 8,
+        "global_rank_evidence": 1024 * 11 * 8,
+        "local_rank_evidence": 11 * 8,
+        "sink_staging": (
+            1024 * 11 + 13 * (capture_slots + update_slots + control_slots)
+        )
+        * 8,
+        "mask_comparison": mask_elements,
+        "mask_comparison_validity": 1,
+        "mask_checksum_weights": mask_elements * 4,
+        "mask_checksum_work": mask_elements * 4,
+        "control_scalar": 8,
+        "startup_allocation_status": 8,
+        "artifact_setup_status": 8,
+    }
+    named_minimum = sum(named_allocations.values())
+    explicit_margin = 512 * (2 * 64 + 64) + 64 * 1024**2
+    assert named_minimum >= 141_115_114
+    assert requested == named_minimum + explicit_margin
     assert requested <= bounds["maximum_reservation_bytes"] < 2**63
 
     args = _status_only_args()
@@ -445,6 +639,109 @@ def test_allocator_reserved_growth_uses_the_pre_event_baseline() -> None:
         peak_reserved_bytes=1_513,
         predicted_increment_bytes=512,
     )
+
+
+def test_startup_primes_exact_reduction_arena_sizes() -> None:
+    calls: list[tuple[int, object]] = []
+
+    def reducer(tensor: torch.Tensor, *, op: object, group: object | None) -> None:
+        assert group is None
+        calls.append((tensor.numel(), op))
+
+    heartbeat = Tier0Heartbeat(
+        _status_only_args(),
+        [nn.Linear(2, 2)],
+        object(),
+        reduction_binding=ReductionBinding.flat_world(None, reducer=reducer),
+    )
+    assert heartbeat._reduction_arenas is not None
+    assert calls == [
+        (heartbeat._reduction_arenas[0].numel(), dist.ReduceOp.SUM),
+        (heartbeat._reduction_arenas[1].numel(), dist.ReduceOp.MAX),
+        (heartbeat._reduction_arenas[2].numel(), dist.ReduceOp.MIN),
+    ]
+
+
+def test_fake_cuda_interval_checks_after_all_collectives_staging_and_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+
+    def reducer(_tensor: torch.Tensor, *, op: object, group: object | None) -> None:
+        del op, group
+        order.append("reduce")
+
+    heartbeat = Tier0Heartbeat(
+        _status_only_args(),
+        [nn.Linear(2, 2)],
+        object(),
+        reduction_binding=ReductionBinding.flat_world(None, reducer=reducer),
+    )
+    order.clear()
+    heartbeat.device = torch.device("cuda")
+    heartbeat.artifact_writer = object()
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (10_000, 20_000))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _device: 1_000)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device: 2_000)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _device: 1_200)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda _device: 2_300)
+    monkeypatch.setattr(
+        heartbeat,
+        "_gather_pre_gather_rank_evidence",
+        lambda: order.append("gather"),
+    )
+    original_transfer = heartbeat._sink_host_transfer
+
+    def transfer() -> list[float]:
+        order.append("transfer")
+        return original_transfer()
+
+    monkeypatch.setattr(heartbeat, "_sink_host_transfer", transfer)
+    original_sample = heartbeat._sample_sink_interval_memory
+
+    def sample() -> dict[str, object]:
+        assert order[-1] == "transfer"
+        order.append("sample")
+        return original_sample()
+
+    monkeypatch.setattr(heartbeat, "_sample_sink_interval_memory", sample)
+    monkeypatch.setattr(
+        heartbeat,
+        "_derive_host_payload",
+        lambda _packs, _ranks: dict.fromkeys(TIER0_KEYS, 0.0),
+    )
+    captured: dict[str, object] = {}
+
+    def write_artifact(_payload, _packs, _ranks, memory_evidence) -> bool:
+        order.append("artifact")
+        captured.update(memory_evidence)
+        return True
+
+    monkeypatch.setattr(heartbeat, "_write_artifact", write_artifact)
+
+    assert heartbeat.prepare_attempt(num_microbatches=1)
+    assert heartbeat.finish_optimizer_event(True, iteration=0)
+    assert order == [
+        "reduce",
+        "reduce",
+        "reduce",
+        "gather",
+        "transfer",
+        "sample",
+        "artifact",
+    ]
+    sink = captured["sink_post_interval"]
+    assert isinstance(sink, dict)
+    assert sink["peak_allocated_bytes"] == 1_200
+    assert sink["peak_reserved_bytes"] == 2_300
+    assert sink["allocated_growth_within_bound"]
+    assert sink["reserved_growth_within_bound"]
+    assert captured["all_rank_post_gather_peak"] == {
+        "available": False,
+        "promotable": False,
+        "reason": "no post-gather all-rank consensus operation exists",
+    }
 
 
 def test_bound_observation_workspace_uses_no_tensor_producing_fallbacks(
@@ -532,13 +829,16 @@ def test_full_event_orchestrator_has_only_one_sink_host_transfer() -> None:
     forbidden = (".item(", ".cpu(", ".tolist(")
     for method_name in (
         "finish_optimizer_event",
-        "_gather_latency_ms",
+        "_gather_pre_gather_rank_evidence",
+        "_sample_sink_interval_memory",
+        "_emit",
     ):
         source = inspect.getsource(getattr(Tier0Heartbeat, method_name))
         assert not any(token in source for token in forbidden), method_name
-    sink_source = inspect.getsource(Tier0Heartbeat._emit)
-    assert sink_source.count(".cpu()") == 1
-    assert ".item(" not in sink_source
+    transfer_source = inspect.getsource(Tier0Heartbeat._sink_host_transfer)
+    assert transfer_source.count(".cpu()") == 1
+    assert transfer_source.count(".tolist()") == 1
+    assert ".item(" not in transfer_source
 
 
 def test_cpu_post_transfer_derivation_retains_exact_75_key_contract() -> None:
@@ -607,15 +907,25 @@ def test_cpu_post_transfer_derivation_retains_exact_75_key_contract() -> None:
         "control": pack(heartbeat.control_accumulator, control=True),
     }
     payload = heartbeat._derive_host_payload(
-        host_packs, [[0, 1, 1, 1024, 0, 0, 0, 0, 0, 3]]
+        host_packs, [[0, 1, 1, 1024, 0, 0, 0, 0, 0, 3, 5]]
     )
     assert tuple(payload) == TIER0_KEYS
     assert len(payload) == 75
     assert payload["diag/v2/status/valid"] == 1
-    assert all(math_value == math_value for math_value in payload.values())
+    unavailable = {
+        "diag/v2/perf/peak_hbm_bytes_max_rank",
+        "diag/v2/perf/latency_ms_median_rank",
+        "diag/v2/perf/latency_ms_max_rank",
+    }
+    assert all(
+        math_value == math_value
+        for key, math_value in payload.items()
+        if key not in unavailable
+    )
+    assert all(payload[key] != payload[key] for key in unavailable)
 
 
-def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> None:
+def test_event_artifact_is_truthful_invalid_and_logs_once() -> None:
     class Artifact:
         def __init__(self, *, name: str, type: str) -> None:
             self.name = name
@@ -667,7 +977,9 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
                 "vpp": 1,
                 "num_layers": 2,
             },
-            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120, 7]],
+            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120, 7, 4]],
+            mask_shape=(1, 1, 4),
+            memory_evidence=_memory_evidence(),
             capability_hash="f" * 64,
             schema_hash=diagnostic_schema_hash(),
         )
@@ -684,16 +996,35 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
         assert not manifest["state_snapshots"]["pre"]["applicable"]
         assert not manifest["state_snapshots"]["post"]["applicable"]
         assert manifest["capability_signature"]["chained_optimizer"] is True
-        observed_sampling_fact = hashlib.sha256(
-            json.dumps(
-                {"mask_checksum": 7.0, "rank": 0, "valid_positions": 4},
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("ascii")
-        ).hexdigest()
-        assert manifest["sampling"]["selected_sample_id_hashes"] == [
-            observed_sampling_fact
-        ]
+        assert manifest["sampling"] == {
+            "evidence_type": "tier0_mask_population_checksum_v1",
+            "per_rank": [{"rank": 0, "population": 4.0, "checksum_value": 7.0}],
+            "global_population": 4,
+            "mask_shape": [1, 1, 4],
+            "checksum_algorithm": (
+                "sum_over_microbatches(sum_i(float32(mask_i) * float32(i + 1))) "
+                "accumulated in float64"
+            ),
+            "collision_limitation": (
+                "population and weighted checksum are collision-prone and do not identify "
+                "sample IDs, token IDs, or mask membership"
+            ),
+        }
+        serialized = json.dumps(manifest)
+        assert "global_topk_hash_v1" not in serialized
+        assert "selected_sample" not in serialized
+        assert "valid_token_ids" not in serialized
+        old_schema = json.loads(
+            (
+                Path(tier0_module.__file__).parent
+                / "schemas"
+                / "diag_v2.artifact.schema.json"
+            ).read_text()
+        )
+        old_sampling_required = set(old_schema["properties"]["sampling"]["required"])
+        assert not old_sampling_required.issubset(manifest["sampling"])
+        assert "memory_evidence" not in old_schema["properties"]
+        assert "versioned Scaling schema" in manifest["status_reason"]
         observed_world = hashlib.sha256(b"[0]").hexdigest()
         assert manifest["process_groups"][0]["membership_sha256_by_rank"] == [
             observed_world
@@ -706,13 +1037,15 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
                 ],
                 "operations": [
                     {"name": "all_reduce", "count": 3, "bytes": 1},
-                    {"name": "all_gather", "count": 1, "bytes": 80},
+                    {"name": "all_gather", "count": 1, "bytes": 88},
                 ],
             }
         ]
         with np.load(directory / "rank_perf.npz", allow_pickle=False) as ranks:
             assert ranks["rank"].dtype == np.int32
             assert ranks["predicted_increment_bytes"].dtype == np.int64
+            assert "pre_gather_peak_allocated_bytes" in ranks
+            assert "peak_allocated_bytes" not in ranks
         second_writer = Tier0ArtifactWriter(
             Path(tmpdir) / "second",
             run_id="run-209",
@@ -735,7 +1068,9 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
                 "vpp": 1,
                 "num_layers": 2,
             },
-            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120, 7]],
+            rank_evidence=[[0, 10, 25, 1000, 90, 100, 20, 100, 120, 7, 4]],
+            mask_shape=(1, 1, 4),
+            memory_evidence=_memory_evidence(),
             capability_hash="f" * 64,
             schema_hash=diagnostic_schema_hash(),
         )
@@ -766,6 +1101,71 @@ def test_event_artifact_matches_approved_scaling_validator_and_logs_once() -> No
         )
         assert completed.returncode != 0
         assert "ContractError" in completed.stderr
+
+
+def test_colliding_masks_emit_equal_nonidentity_population_checksum_evidence() -> None:
+    first_mask = np.asarray([1, 0, 0, 1], dtype=np.float32)
+    second_mask = np.asarray([0, 1, 1, 0], dtype=np.float32)
+    weights = np.arange(1, 5, dtype=np.float32)
+    assert not np.array_equal(first_mask, second_mask)
+    assert first_mask.sum() == second_mask.sum() == 2
+    assert (first_mask * weights).sum() == (second_mask * weights).sum() == 5
+
+    common = {
+        "event_id": 1,
+        "successful_update": 1,
+        "consumed_tokens": 4,
+        "valid_positions": 2,
+        "valid": True,
+        "topology": {
+            "dp": 1,
+            "tp": 1,
+            "pp": 1,
+            "cp": 1,
+            "ep": 1,
+            "vpp": 1,
+            "num_layers": 1,
+        },
+        "rank_evidence": [[0, 1, 1, 1024, 0, 0, 0, 0, 0, 5, 2]],
+        "mask_shape": (1, 1, 4),
+        "memory_evidence": _memory_evidence(),
+        "capability_hash": "a" * 64,
+        "schema_hash": diagnostic_schema_hash(),
+    }
+    repro = {
+        "scaling_commit": "a" * 40,
+        "megatron_commit": "b" * 40,
+        "resolved_config_sha256": "c" * 64,
+        "scaling_bundle_sha256": "d" * 64,
+        "megatron_bundle_sha256": "e" * 64,
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        directories = []
+        for name in ("first", "second"):
+            writer = Tier0ArtifactWriter(
+                Path(tmpdir) / name,
+                run_id="collision",
+                job_name="collision",
+                repro=repro,
+                wandb_writer=None,
+            )
+            directory, _ = writer.write(**common)
+            directories.append(directory)
+        assert {
+            name: sha256_file(directories[0] / name)
+            for name in ("manifest.json", "layer_metrics.npz", "rank_perf.npz")
+        } == {
+            name: sha256_file(directories[1] / name)
+            for name in ("manifest.json", "layer_metrics.npz", "rank_perf.npz")
+        }
+        manifest = json.loads((directories[0] / "manifest.json").read_text())
+        assert manifest["sampling"]["collision_limitation"].endswith(
+            "do not identify sample IDs, token IDs, or mask membership"
+        )
+        serialized = json.dumps(manifest)
+        assert "global_topk_hash_v1" not in serialized
+        assert "selected_sample" not in serialized
+        assert "valid_token_ids" not in serialized
 
 
 def test_actual_artifact_cap_and_wandb_failures_leave_no_promotable_directory() -> None:
@@ -799,7 +1199,9 @@ def test_actual_artifact_cap_and_wandb_failures_leave_no_promotable_directory() 
             "vpp": 1,
             "num_layers": 1,
         },
-        "rank_evidence": [[0, 1, 1, 1024, 0, 0, 1, 0, 0, 1]],
+        "rank_evidence": [[0, 1, 1, 1024, 0, 0, 1, 0, 0, 1, 1]],
+        "mask_shape": (1, 1, 1),
+        "memory_evidence": _memory_evidence(),
         "capability_hash": "a" * 64,
         "schema_hash": diagnostic_schema_hash(),
     }
@@ -944,13 +1346,46 @@ def test_pp2_incompatible_forward_function_is_rejected_globally_before_p2p(
 
 
 @pytest.mark.distributed
+def test_asymmetric_64_65_microbatch_bound_rejects_identically_before_hooks_or_p2p(
+    gloo_world: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = _install_supported_capability_fakes(monkeypatch)
+    args = _capability_args(world_size=2, data_parallel_size=2)
+    args.diagnostic_interval = 1000
+    args.diagnostic_early_updates = "1,10,100"
+    args.diagnostic_unsupported_policy = "error"
+    local_microbatches = 65 if dist.get_rank() == 0 else 64
+    with pytest.raises(RuntimeError) as raised:
+        Tier0Heartbeat(
+            args,
+            [nn.Linear(1, 1)],
+            object(),
+            canonical,
+            num_microbatches=local_microbatches,
+        )
+    message = str(raised.value)
+    assert "capability_bounds" in message
+    assert "rank_inconsistent" in message
+    messages: list[str | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(messages, message)
+    assert len(set(messages)) == 1
+    dist.barrier()
+
+
+@pytest.mark.distributed
 def test_one_rank_startup_allocation_failure_is_agreed_before_training(
     gloo_world: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original_empty = tier0_module.torch.empty
+    capture_workspace_bytes = PackedSufficientStatistics.scratch_bytes_for_capacity()
 
     def injected_empty(*args, **kwargs):
-        if dist.get_rank() == 1 and kwargs.get("dtype") == torch.uint8:
+        if (
+            dist.get_rank() == 1
+            and args
+            and args[0] == capture_workspace_bytes
+            and kwargs.get("dtype") == torch.uint8
+        ):
             raise torch.OutOfMemoryError("injected startup allocation failure")
         return original_empty(*args, **kwargs)
 

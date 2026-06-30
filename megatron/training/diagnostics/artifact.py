@@ -115,10 +115,6 @@ def _array_descriptor(value: np.ndarray) -> dict[str, Any]:
     }
 
 
-def _rank_digest(values: Sequence[str]) -> str:
-    return _sha256(json.dumps(list(values), separators=(",", ":")).encode("ascii"))
-
-
 def _unavailable_snapshot() -> dict[str, Any]:
     return {
         "applicable": False,
@@ -205,18 +201,19 @@ def _layer_arrays(
 
 def _rank_arrays(rank_evidence: Sequence[Sequence[float]]) -> dict[str, np.ndarray]:
     rows = np.asarray(rank_evidence, dtype=np.float64)
-    if rows.ndim != 2 or rows.shape[1] != 10:
-        raise RuntimeError("rank evidence must have fixed shape [world, 10]")
+    if rows.ndim != 2 or rows.shape[1] != 11:
+        raise RuntimeError("rank evidence must have fixed shape [world, 11]")
     return {
         "rank": rows[:, 0].astype(np.int32),
-        "event_wall_time_ms": rows[:, 1].astype(np.float64),
+        "pre_gather_wall_time_ms": rows[:, 1].astype(np.float64),
         "ordinary_step_wall_time_ms": rows[:, 2].astype(np.float64),
         "detected_hbm_capacity_bytes": rows[:, 3].astype(np.int64),
         "pre_event_allocated_bytes": rows[:, 4].astype(np.int64),
         "pre_event_reserved_bytes": rows[:, 5].astype(np.int64),
         "predicted_increment_bytes": rows[:, 6].astype(np.int64),
-        "peak_allocated_bytes": rows[:, 7].astype(np.int64),
-        "peak_reserved_bytes": rows[:, 8].astype(np.int64),
+        "pre_gather_peak_allocated_bytes": rows[:, 7].astype(np.int64),
+        "pre_gather_peak_reserved_bytes": rows[:, 8].astype(np.int64),
+        "mask_population": rows[:, 10].astype(np.float64),
     }
 
 
@@ -274,6 +271,8 @@ class Tier0ArtifactWriter:
         valid: bool,
         topology: Mapping[str, int],
         rank_evidence: Sequence[Sequence[float]],
+        mask_shape: Sequence[int],
+        memory_evidence: Mapping[str, Any],
         capability_hash: str,
         schema_hash: str,
         writer_rank: int = 0,
@@ -288,6 +287,10 @@ class Tier0ArtifactWriter:
         world_size = math.prod(topology[name] for name in ("dp", "tp", "pp", "cp"))
         if world_size != len(rank_evidence):
             raise RuntimeError("rank evidence does not cover the declared topology")
+        if len(mask_shape) != 3 or any(int(dimension) <= 0 for dimension in mask_shape):
+            raise RuntimeError(
+                "mask shape must be [microbatches, batch, local_sequence]"
+            )
         target = self.root / f"event-{event_id:08d}"
         if target.exists():
             raise RuntimeError(f"diagnostic event artifact already exists: {target}")
@@ -304,21 +307,6 @@ class Tier0ArtifactWriter:
             ranks = _rank_arrays(rank_evidence)
             _write_deterministic_npz(temporary / "layer_metrics.npz", layers)
             _write_deterministic_npz(temporary / "rank_perf.npz", ranks)
-            sampling_facts = [
-                _sha256(
-                    json.dumps(
-                        {
-                            "rank": int(row[0]),
-                            "valid_positions": valid_positions,
-                            "mask_checksum": float(row[9]),
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("ascii")
-                )
-                for row in rank_evidence
-            ]
-            sample_id = _rank_digest(sampling_facts)
             descriptor = _sha256(f"{capability_hash}:{schema_hash}".encode())
             topology_fields = {
                 name: int(topology[name])
@@ -349,9 +337,12 @@ class Tier0ArtifactWriter:
                 "require_tier": 0,
                 "status": "invalid",
                 "status_reason": (
-                    "Tier-0 model/optimizer state snapshots are not captured"
+                    "Tier-0 state snapshots and all-rank post-gather peak evidence are unavailable; "
+                    "mask checksum evidence requires a versioned Scaling schema"
                     if valid
-                    else "Tier-0 sufficient statistics invalid and state snapshots are not captured"
+                    else "Tier-0 evidence is non-promotable: sufficient statistics may be invalid, "
+                    "state snapshots and all-rank post-gather peaks are unavailable, and mask "
+                    "checksum evidence requires a versioned Scaling schema"
                 ),
                 "run_identity": {
                     "run_id": self.run_id,
@@ -376,18 +367,30 @@ class Tier0ArtifactWriter:
                     "layer_pp_owners": owners,
                 },
                 "sampling": {
-                    "selector": "global_topk_hash_v1",
-                    "seed": 0,
-                    "selected_sample_id_hashes": sorted(set(sampling_facts)),
-                    "valid_position_count": valid_positions,
-                    "selected_sample_ids_sha256": sample_id,
-                    "valid_token_ids_sha256": sample_id,
+                    "evidence_type": "tier0_mask_population_checksum_v1",
+                    "per_rank": [
+                        {
+                            "rank": int(row[0]),
+                            "population": float(row[10]),
+                            "checksum_value": float(row[9]),
+                        }
+                        for row in rank_evidence
+                    ],
+                    "global_population": valid_positions,
+                    "mask_shape": [int(dimension) for dimension in mask_shape],
+                    "checksum_algorithm": (
+                        "sum_over_microbatches(sum_i(float32(mask_i) * float32(i + 1))) "
+                        "accumulated in float64"
+                    ),
+                    "collision_limitation": (
+                        "population and weighted checksum are collision-prone and do not identify "
+                        "sample IDs, token IDs, or mask membership"
+                    ),
                 },
                 "digests": {
                     "descriptor_sha256_by_rank": [descriptor] * world_size,
-                    "selected_sample_ids_sha256_by_rank": [sample_id] * world_size,
-                    "valid_token_ids_sha256_by_rank": [sample_id] * world_size,
                 },
+                "memory_evidence": dict(memory_evidence),
                 "enums": {"metric": metrics, "family": families},
                 "files": {
                     name: {
@@ -438,7 +441,7 @@ class Tier0ArtifactWriter:
                             {
                                 "name": "all_gather",
                                 "count": 1,
-                                "bytes": world_size * 10 * 8,
+                                "bytes": world_size * 11 * 8,
                             },
                         ],
                     },

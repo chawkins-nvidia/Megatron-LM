@@ -27,17 +27,34 @@ capability document must remain a pre-submit failure.
 
 The approved artifact schema currently has no explicit top-level fields for the
 capability-file hash or the combined schema hash. Megatron binds both into the
-consensus descriptor digest while retaining the schema's exact field set. If
-Scaling requires those identities as separately addressable manifest fields,
-Scaling must first version and approve an artifact-schema change; Megatron must
-not add undeclared fields to `diag/v2/artifact`.
+consensus descriptor digest. The packaged legacy schema remains byte-exact for
+its published hash; the manifest below is explicitly invalid against it and must
+not be represented as conforming. Scaling must first version and approve these
+artifact-schema changes before promotion.
 
 The unchanged schema and approved validator still require Tier-0 pre/post state
-snapshots, a rank-0 writer, and nonempty operations for every topology process
-group. Megatron does not capture state bytes, preserves its last-rank writer,
-and performs only three world all-reduces plus one world all-gather. It therefore
-emits these events as non-promotable with unavailable state snapshots, actual
-mask-checksum sampling facts, actual group memberships, and no invented
-non-world operations. Scaling must version the schema/validator to permit those
-truthful Tier-0 inapplicability and ownership semantics before promotion; until
-then its artifact gate intentionally rejects the event.
+snapshots, a rank-0 writer, the `global_topk_hash_v1` identity selector, and
+nonempty operations for every topology process group. Megatron does not capture
+state bytes or sample/token identities, preserves its last-rank writer, and
+performs only three world all-reduces plus one world all-gather. It therefore
+emits these events as explicitly invalid and non-promotable with unavailable
+state snapshots, actual group memberships, and no invented non-world operations.
+
+Scaling must version the sampling schema with an exact
+`tier0_mask_population_checksum_v1` record containing only:
+
+- `evidence_type`;
+- `per_rank` entries with `rank`, `population`, and `checksum_value`;
+- `global_population`;
+- `mask_shape` in `[microbatches, micro_batch_size, cp_local_sequence]` order;
+- `checksum_algorithm`;
+- `collision_limitation`, explicitly stating that population plus a weighted
+  checksum does not identify sample IDs, token IDs, or mask membership.
+
+The old `global_topk_hash_v1`, selected-sample-ID, and valid-token-ID fields are
+intentionally absent. Scaling must also version `digests` so it does not require
+those false identity digests, and add `memory_evidence` with unavailable,
+non-promotable all-rank post-gather peaks plus the sink-only post-interval sample.
+Rank performance arrays are explicitly named `pre_gather_*`; the all-gather
+operation carries `88 * world_size` bytes. Until that version is approved, the
+current Scaling artifact gate must reject the exact three-file event.

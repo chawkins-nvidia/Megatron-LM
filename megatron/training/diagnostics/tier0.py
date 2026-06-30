@@ -89,11 +89,12 @@ _CONTROL_NAMES = (
     "control/preflight_failure",
     "control/runtime_failure",
     "control/adapter_status",
-    "control/peak_hbm_bytes",
+    "control/all_rank_post_gather_peak_unavailable",
 )
-_RANK_EVIDENCE_FIELDS = 10
+_RANK_EVIDENCE_FIELDS = 11
 _INT64_MAX = 2**63 - 1
 _MAX_RESERVATION_BYTES = 8 * 1024**3
+_BACKEND_WORKSPACE_ALLOWANCE_BYTES = 64 * 1024**2
 _MAX_LAYERS = 512
 _MAX_MICROBATCHES = 64
 _MAX_MICRO_BATCH_SIZE = 8
@@ -207,31 +208,40 @@ def tier0_reservation_bytes(
     update_slots = 5 * num_layers + 2
     control_slots = len(_CONTROL_NAMES)
     pack_bytes = (capture_slots + update_slots + control_slots) * (11 * 8 + 4 + 4)
-    sideband_bytes = (
-        2 * num_microbatches * (micro_batch_size * local_sequence_length + 1) * 4
-    )
+    mask_elements = micro_batch_size * local_sequence_length
+    one_sideband_set_bytes = num_microbatches * (mask_elements + 1) * 4
+    one_sideband_validity_set_bytes = num_microbatches
     optimizer_bytes = snapshot_memory_estimate(owner_elements).total_bytes
     capture_scratch = PackedSufficientStatistics.scratch_bytes_for_capacity()
-    mask_elements = micro_batch_size * local_sequence_length
-    capture_control_bytes = 2 * mask_elements + 8 + 16
-    rank_evidence_bytes = (world_size + 1) * _RANK_EVIDENCE_FIELDS * 8
+    capture_session_bytes = 2 * mask_elements + 8 + 8 + 1 + 8
+    global_rank_evidence_bytes = world_size * _RANK_EVIDENCE_FIELDS * 8
+    local_rank_evidence_bytes = _RANK_EVIDENCE_FIELDS * 8
     sink_staging_bytes = (
         _RANK_EVIDENCE_FIELDS * world_size
         + 13 * (capture_slots + update_slots + control_slots)
     ) * 8
-    identity_checksum_bytes = 2 * mask_elements * 4 + 8
+    mask_comparison_bytes = mask_elements + 1
+    checksum_control_bytes = 2 * mask_elements * 4 + 8
+    startup_status_bytes = 2 * 8
     allocator_alignment_bytes = 512 * (2 * num_microbatches + 64)
     return (
-        2 * pack_bytes
-        + sideband_bytes
+        pack_bytes
+        + pack_bytes
+        + one_sideband_set_bytes
+        + one_sideband_set_bytes
+        + one_sideband_validity_set_bytes
+        + one_sideband_validity_set_bytes
         + optimizer_bytes
         + capture_scratch
-        + rank_evidence_bytes
+        + capture_session_bytes
+        + global_rank_evidence_bytes
+        + local_rank_evidence_bytes
         + sink_staging_bytes
-        + capture_control_bytes
-        + identity_checksum_bytes
-        + 256
+        + mask_comparison_bytes
+        + checksum_control_bytes
+        + startup_status_bytes
         + allocator_alignment_bytes
+        + _BACKEND_WORKSPACE_ALLOWANCE_BYTES
     )
 
 
@@ -301,11 +311,53 @@ def _verified_mask_producer(forward_step_func: Callable[..., Any] | None) -> boo
     )
 
 
+def _local_bounded_int(value: object, *, fallback: int = 1) -> tuple[int, bool]:
+    """Convert one startup integer without allowing a rank-local exception."""
+
+    try:
+        converted = int(value)
+    except Exception:
+        return fallback, False
+    return converted, -_INT64_MAX <= converted <= _INT64_MAX
+
+
+def _local_bound_values(
+    args: Any, num_microbatches: object
+) -> tuple[dict[str, int], bool]:
+    """Return usable local startup integers and whether every conversion was valid."""
+
+    raw = {
+        "dp": getattr(args, "data_parallel_size", 1),
+        "tp": getattr(args, "tensor_model_parallel_size", 1),
+        "pp": getattr(args, "pipeline_model_parallel_size", 1),
+        "cp": getattr(args, "context_parallel_size", 1),
+        "layers": getattr(args, "num_layers", 1),
+        "micro_batch_size": getattr(args, "micro_batch_size", 1),
+        "sequence_length": getattr(args, "seq_length", 1),
+        "num_microbatches": num_microbatches,
+    }
+    values: dict[str, int] = {}
+    valid = True
+    for name, value in raw.items():
+        values[name], converted = _local_bounded_int(value)
+        valid &= converted
+    if dist.is_initialized():
+        values["world_size"] = dist.get_world_size()
+    else:
+        values["world_size"], converted = _local_bounded_int(
+            getattr(args, "world_size", 1)
+        )
+        valid &= converted
+    return values, valid
+
+
 def _local_capability_reasons(
     args: Any,
     model: Sequence[nn.Module],
     optimizer: object,
     forward_step_func: Callable[..., Any] | None = None,
+    *,
+    num_microbatches: object = 1,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     chunks = tuple(_unwrap_module(chunk) for chunk in model)
@@ -361,41 +413,41 @@ def _local_capability_reasons(
         reasons.append("packed_micro_batch_size")
     if getattr(args, "variable_seq_lengths", False):
         reasons.append("variable_sequence_lengths")
-    world_size = (
-        dist.get_world_size()
-        if dist.is_initialized()
-        else int(getattr(args, "world_size", 1))
-    )
+    bounds, conversions_valid = _local_bound_values(args, num_microbatches)
+    world_size = bounds["world_size"]
     bounded_values = (
         (world_size, 1, 1024),
-        (int(getattr(args, "data_parallel_size", 1)), 1, 1024),
-        (int(getattr(args, "tensor_model_parallel_size", 1)), 1, 1024),
-        (int(getattr(args, "pipeline_model_parallel_size", 1)), 1, 1024),
-        (int(getattr(args, "context_parallel_size", 1)), 1, 1024),
-        (int(getattr(args, "num_layers", 1)), 1, _MAX_LAYERS),
-        (int(getattr(args, "micro_batch_size", 1)), 1, _MAX_MICRO_BATCH_SIZE),
-        (int(getattr(args, "seq_length", 1)), 1, _MAX_SEQUENCE_LENGTH),
+        (bounds["dp"], 1, 1024),
+        (bounds["tp"], 1, 1024),
+        (bounds["pp"], 1, _MAX_LAYERS),
+        (bounds["cp"], 1, 1024),
+        (bounds["layers"], 1, _MAX_LAYERS),
+        (bounds["micro_batch_size"], 1, _MAX_MICRO_BATCH_SIZE),
+        (bounds["sequence_length"], 1, _MAX_SEQUENCE_LENGTH),
+        (bounds["num_microbatches"], 1, _MAX_MICROBATCHES),
     )
-    if any(
+    if not conversions_valid or any(
         value < minimum or value > maximum for value, minimum, maximum in bounded_values
     ):
         reasons.append("capability_bounds")
-    topology_product = math.prod(
-        int(getattr(args, name, 1))
-        for name in (
-            "data_parallel_size",
-            "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
-            "context_parallel_size",
-        )
+    topology_product = math.prod(bounds[name] for name in ("dp", "tp", "pp", "cp"))
+    context_parallel_size = bounds["cp"]
+    sequence_length = bounds["sequence_length"]
+    tensor_parallel_size = bounds["tp"]
+    cp_divisor = 2 * context_parallel_size if context_parallel_size > 1 else 1
+    cp_local_sequence = (
+        sequence_length // context_parallel_size if context_parallel_size > 0 else 0
     )
-    context_parallel_size = int(getattr(args, "context_parallel_size", 1))
     if (
         topology_product != world_size
-        or int(getattr(args, "pipeline_model_parallel_size", 1))
-        > int(getattr(args, "num_layers", 1))
+        or bounds["pp"] > bounds["layers"]
         or context_parallel_size <= 0
-        or int(getattr(args, "seq_length", 1)) % max(1, context_parallel_size) != 0
+        or sequence_length % cp_divisor != 0
+        or (
+            bool(getattr(args, "sequence_parallel", False))
+            and tensor_parallel_size > 0
+            and cp_local_sequence % tensor_parallel_size != 0
+        )
     ):
         reasons.append("capability_bounds")
     if not _verified_mask_producer(forward_step_func):
@@ -408,10 +460,18 @@ def negotiate_tier0_capability(
     model: Sequence[nn.Module],
     optimizer: object,
     forward_step_func: Callable[..., Any] | None = None,
+    *,
+    num_microbatches: object = 1,
 ) -> Tier0Capability:
     """Collectively fail closed for the first supported runtime signature."""
 
-    local_reasons = _local_capability_reasons(args, model, optimizer, forward_step_func)
+    local_reasons = _local_capability_reasons(
+        args,
+        model,
+        optimizer,
+        forward_step_func,
+        num_microbatches=num_microbatches,
+    )
     known = (
         "adam_optimizer",
         "bf16",
@@ -605,7 +665,11 @@ class Tier0Heartbeat:
                 "diagnostic unsupported policy must be error or status-only"
             )
         self.capability = negotiate_tier0_capability(
-            args, self.model, optimizer, forward_step_func
+            args,
+            self.model,
+            optimizer,
+            forward_step_func,
+            num_microbatches=num_microbatches,
         )
         self.forward_step_func = forward_step_func
         if not self.capability.supported and self.unsupported_policy == "error":
@@ -658,14 +722,20 @@ class Tier0Heartbeat:
         self._pre_event_allocated_bytes = 0
         self._pre_event_reserved_bytes = 0
         self._predicted_event_bytes = 0
-        self._startup_num_microbatches = int(num_microbatches)
-        if not 1 <= self._startup_num_microbatches <= _MAX_MICROBATCHES:
-            raise ValueError("Tier-0 startup microbatch bound is out of range")
+        startup_microbatches, startup_microbatches_valid = _local_bounded_int(
+            num_microbatches
+        )
+        self._requested_num_microbatches = (
+            startup_microbatches if startup_microbatches_valid else _INT64_MAX
+        )
+        self._startup_num_microbatches = min(
+            _MAX_MICROBATCHES, max(1, startup_microbatches)
+        )
 
         self.reservation = self._startup_reservation()
-        self._allocate_startup_state()
         self._collect_process_group_memberships()
         self._initialize_artifact_writer()
+        self._allocate_startup_state()
 
     def _collect_process_group_memberships(self) -> None:
         """Capture actual startup process-group memberships without event collectives."""
@@ -735,34 +805,48 @@ class Tier0Heartbeat:
         """Calculate and globally agree the complete peak before event allocation."""
 
         max_extra = getattr(self.args, "diagnostic_max_extra_bytes", None)
-        max_extra_bytes = (
-            _MAX_RESERVATION_BYTES if max_extra is None else int(max_extra)
+        if max_extra is None:
+            max_extra_bytes = _MAX_RESERVATION_BYTES
+            max_extra_valid = True
+        else:
+            max_extra_bytes, max_extra_valid = _local_bounded_int(max_extra, fallback=0)
+        bounds, bounds_valid = _local_bound_values(
+            self.args, self._requested_num_microbatches
         )
-        num_layers = int(getattr(self.args, "num_layers", 1))
-        local_sequence = int(getattr(self.args, "seq_length", 1)) // max(
-            1,
-            int(getattr(self.args, "context_parallel_size", 1)),
-        )
+        local_sequence = bounds["sequence_length"] // max(1, bounds["cp"])
         owner_elements = 0
+        calculation_failed = not bounds_valid or not max_extra_valid
         distributed_optimizer = _distributed_optimizer(self.optimizer)
         if self.capability.supported and distributed_optimizer is not None:
-            owner_elements = sum(
-                shard.main_shard.numel()
-                for shard in distributed_optimizer.iter_model_main_param_shards()
+            try:
+                owner_elements = sum(
+                    shard.main_shard.numel()
+                    for shard in distributed_optimizer.iter_model_main_param_shards()
+                )
+            except Exception:
+                calculation_failed = True
+        try:
+            requested = tier0_reservation_bytes(
+                num_layers=bounds["layers"],
+                num_microbatches=self._requested_num_microbatches,
+                micro_batch_size=bounds["micro_batch_size"],
+                local_sequence_length=local_sequence,
+                owner_elements=owner_elements,
+                world_size=bounds["world_size"],
             )
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        requested = tier0_reservation_bytes(
-            num_layers=num_layers,
-            num_microbatches=self._startup_num_microbatches,
-            micro_batch_size=int(getattr(self.args, "micro_batch_size", 1)),
-            local_sequence_length=local_sequence,
-            owner_elements=owner_elements,
-            world_size=world_size,
-        )
+        except Exception:
+            requested = _INT64_MAX
+            calculation_failed = True
 
-        overflow = requested > _INT64_MAX or max_extra_bytes > _INT64_MAX
+        overflow = (
+            requested > _INT64_MAX
+            or max_extra_bytes > _INT64_MAX
+            or self._requested_num_microbatches > _INT64_MAX
+        )
         locally_accepted = (
-            not overflow
+            not calculation_failed
+            and not overflow
+            and max_extra_bytes >= 0
             and requested <= max_extra_bytes
             and requested <= _MAX_RESERVATION_BYTES
         )
@@ -832,6 +916,7 @@ class Tier0Heartbeat:
     def _allocate_startup_state(self) -> None:
         """Allocate all persistent/event buffers and globally agree measured success."""
 
+        allocation_status = torch.empty((), dtype=torch.int64, device=self.device)
         before = (
             torch.cuda.memory_allocated(self.device)
             if self.device.type == "cuda"
@@ -879,45 +964,43 @@ class Tier0Heartbeat:
             )
             if self.capture_accumulator is not None:
                 self.capture_accumulator.bind_workspace(self._capture_scratch)
-            local_length = int(getattr(self.args, "seq_length", 1)) // max(
-                1, int(getattr(self.args, "context_parallel_size", 1))
-            )
-            payload_elements = (
-                int(getattr(self.args, "micro_batch_size", 1)) * local_length + 1
-            )
-            self._sideband_payloads = {
-                index: torch.empty(
-                    payload_elements, dtype=torch.float32, device=self.device
+            bounds, _ = _local_bound_values(self.args, self._requested_num_microbatches)
+            local_length = bounds["sequence_length"] // max(1, bounds["cp"])
+            payload_elements = bounds["micro_batch_size"] * local_length + 1
+            if self.capability.supported:
+                self._sideband_payloads = {
+                    index: torch.empty(
+                        payload_elements, dtype=torch.float32, device=self.device
+                    )
+                    for index in range(self._startup_num_microbatches)
+                }
+                self._local_sideband_payloads = {
+                    index: torch.empty(
+                        payload_elements, dtype=torch.float32, device=self.device
+                    )
+                    for index in range(self._startup_num_microbatches)
+                }
+                self._sideband_validity = {
+                    index: torch.empty((), dtype=torch.bool, device=self.device)
+                    for index in range(self._startup_num_microbatches)
+                }
+                self._local_sideband_validity = {
+                    index: torch.empty((), dtype=torch.bool, device=self.device)
+                    for index in range(self._startup_num_microbatches)
+                }
+                mask_elements = payload_elements - 1
+                self._mask_compare = torch.empty(
+                    mask_elements, dtype=torch.bool, device=self.device
                 )
-                for index in range(self._startup_num_microbatches)
-            }
-            self._local_sideband_payloads = {
-                index: torch.empty(
-                    payload_elements, dtype=torch.float32, device=self.device
+                self._mask_compare_valid = torch.empty(
+                    (), dtype=torch.bool, device=self.device
                 )
-                for index in range(self._startup_num_microbatches)
-            }
-            self._sideband_validity = {
-                index: torch.empty((), dtype=torch.bool, device=self.device)
-                for index in range(self._startup_num_microbatches)
-            }
-            self._local_sideband_validity = {
-                index: torch.empty((), dtype=torch.bool, device=self.device)
-                for index in range(self._startup_num_microbatches)
-            }
-            mask_elements = payload_elements - 1
-            self._mask_compare = torch.empty(
-                mask_elements, dtype=torch.bool, device=self.device
-            )
-            self._mask_compare_valid = torch.empty(
-                (), dtype=torch.bool, device=self.device
-            )
-            self._mask_checksum_weights = torch.arange(
-                1, mask_elements + 1, dtype=torch.float32, device=self.device
-            )
-            self._mask_checksum_work = torch.empty(
-                mask_elements, dtype=torch.float32, device=self.device
-            )
+                self._mask_checksum_weights = torch.arange(
+                    1, mask_elements + 1, dtype=torch.float32, device=self.device
+                )
+                self._mask_checksum_work = torch.empty(
+                    mask_elements, dtype=torch.float32, device=self.device
+                )
             self._control_value = torch.empty(
                 (), dtype=torch.float64, device=self.device
             )
@@ -949,6 +1032,18 @@ class Tier0Heartbeat:
         except Exception:
             allocation_failed = True
 
+        allocation_status.fill_(int(allocation_failed))
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(allocation_status, op=dist.ReduceOp.MAX)
+        if bool(allocation_status.cpu().item()):
+            raise RuntimeError("Tier-0 startup allocation failed on at least one rank")
+
+        prime_failed = False
+        try:
+            self._prime_event_collectives()
+        except Exception:
+            prime_failed = True
+
         measured = (
             max(0, torch.cuda.memory_allocated(self.device) - before)
             if self.device.type == "cuda"
@@ -959,19 +1054,19 @@ class Tier0Heartbeat:
             if self.device.type == "cuda"
             else 0
         )
-        failed = torch.tensor(
+        allocation_status.fill_(
             int(
-                allocation_failed
+                prime_failed
                 or measured > self.reservation.requested_bytes
                 or measured_reserved > self.reservation.requested_bytes
-            ),
-            dtype=torch.int64,
-            device=self.device,
+            )
         )
         if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-        if bool(failed.cpu().item()):
-            raise RuntimeError("Tier-0 startup allocation failed on at least one rank")
+            dist.all_reduce(allocation_status, op=dist.ReduceOp.MAX)
+        if bool(allocation_status.cpu().item()):
+            raise RuntimeError(
+                "Tier-0 startup collective priming or measured allocation failed globally"
+            )
         self.reservation = Tier0Reservation(
             self.reservation.requested_bytes,
             self.reservation.max_extra_bytes,
@@ -979,6 +1074,31 @@ class Tier0Heartbeat:
             measured,
             measured_reserved,
         )
+
+    def _prime_event_collectives(self) -> None:
+        """Prime the exact three reductions and fourth rank-evidence gather."""
+
+        assert self._reduction_arenas is not None
+        reduce_call = self.reduction_binding.reducer or dist.all_reduce
+        if self.reduction_binding.reducer is not None or dist.is_initialized():
+            for arena, operation in zip(
+                self._reduction_arenas,
+                (dist.ReduceOp.SUM, dist.ReduceOp.MAX, dist.ReduceOp.MIN),
+            ):
+                reduce_call(
+                    arena,
+                    op=operation,
+                    group=self.reduction_binding.group,
+                )
+        assert self._rank_evidence is not None
+        assert self._local_rank_evidence is not None
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if world_size == 1:
+            self._rank_evidence[0].copy_(self._local_rank_evidence)
+        else:
+            dist.all_gather_into_tensor(
+                self._rank_evidence.reshape(-1), self._local_rank_evidence
+            )
 
     @property
     def armed(self) -> bool:
@@ -1080,8 +1200,7 @@ class Tier0Heartbeat:
             self._local_rank_evidence[3].fill_(1)
         self._predicted_event_bytes = max(
             0,
-            self.reservation.requested_bytes
-            - self.reservation.measured_allocated_bytes,
+            self.reservation.requested_bytes - self.reservation.measured_reserved_bytes,
         )
         self._local_rank_evidence[6].fill_(self._predicted_event_bytes)
         if not self.capability.supported:
@@ -1177,6 +1296,13 @@ class Tier0Heartbeat:
             out=self._control_value,
         )
         self._local_rank_evidence[9].add_(self._control_value)
+        torch.sum(
+            local_payload[:-1],
+            dim=(0,),
+            dtype=torch.float64,
+            out=self._control_value,
+        )
+        self._local_rank_evidence[10].add_(self._control_value)
         if (
             parallel_state.is_pipeline_last_stage(ignore_virtual=True)
             and microbatch_id in self._received_sidebands
@@ -1285,24 +1411,7 @@ class Tier0Heartbeat:
             self._add_control(
                 "control/adapter_status", self.adapter.local_status.squeeze(0)
             )
-        peak_hbm = (
-            max(
-                torch.cuda.max_memory_allocated(self.device),
-                torch.cuda.max_memory_reserved(self.device),
-            )
-            if self.device.type == "cuda"
-            else 0
-        )
-        self._add_control("control/peak_hbm_bytes", peak_hbm)
-        if self.device.type == "cuda":
-            self._add_control(
-                "control/runtime_failure",
-                not allocator_growth_within_bound(
-                    pre_event_reserved_bytes=self._pre_event_reserved_bytes,
-                    peak_reserved_bytes=torch.cuda.max_memory_reserved(self.device),
-                    predicted_increment_bytes=self._predicted_event_bytes,
-                ),
-            )
+        self._add_control("control/all_rank_post_gather_peak_unavailable", True)
 
         accumulators = tuple(
             accumulator
@@ -1314,7 +1423,7 @@ class Tier0Heartbeat:
             if accumulator is not None
         )
         PackedSufficientStatistics.reduce_many_(accumulators, self._reduction_arenas)
-        latencies = self._gather_latency_ms()
+        self._gather_pre_gather_rank_evidence()
         if not update_successful:
             self.abort_attempt()
             return False
@@ -1350,7 +1459,9 @@ class Tier0Heartbeat:
             out=self.control_accumulator.min_pack[slots.minimum],
         )
 
-    def _gather_latency_ms(self) -> torch.Tensor:
+    def _gather_pre_gather_rank_evidence(self) -> None:
+        """Gather rank facts sampled immediately before the fourth operation."""
+
         assert self._local_rank_evidence is not None
         assert self._rank_evidence is not None
         elapsed = (time.perf_counter() - self._attempt_started) * 1000.0
@@ -1373,7 +1484,6 @@ class Tier0Heartbeat:
             dist.all_gather_into_tensor(
                 self._rank_evidence.reshape(-1), self._local_rank_evidence
             )
-        return self._rank_evidence[:, 1]
 
     def _commit_successful_update(self) -> None:
         self.successful_updates += 1
@@ -1430,20 +1540,12 @@ class Tier0Heartbeat:
             payload["diag/v2/event/valid_positions"] = torch.zeros(
                 (), dtype=torch.float64, device=self.device
             )
-        payload["diag/v2/status/valid"] = torch.tensor(
-            valid, dtype=torch.float64, device=self.device
+        payload["diag/v2/status/valid"] = torch.zeros(
+            (), dtype=torch.float64, device=self.device
         )
-        payload["diag/v2/perf/peak_hbm_bytes_max_rank"] = (
-            self.control_accumulator.maximum("control/peak_hbm_bytes").value
-        )
-        sorted_latency = torch.sort(latencies).values
-        count = sorted_latency.numel()
-        if count % 2:
-            median = sorted_latency[count // 2]
-        else:
-            median = (sorted_latency[count // 2 - 1] + sorted_latency[count // 2]) / 2
-        payload["diag/v2/perf/latency_ms_median_rank"] = median
-        payload["diag/v2/perf/latency_ms_max_rank"] = sorted_latency[-1]
+        payload["diag/v2/perf/peak_hbm_bytes_max_rank"] = nan.clone()
+        payload["diag/v2/perf/latency_ms_median_rank"] = nan.clone()
+        payload["diag/v2/perf/latency_ms_max_rank"] = nan.clone()
         assert_payload_schema(payload)
         return payload
 
@@ -1691,7 +1793,8 @@ class Tier0Heartbeat:
                 self._sink_staging[offset:end].copy_(tensor)
                 offset = end
             pack_ranges.append((accumulator, start, offset))
-        host_combined = self._sink_staging.cpu().tolist()
+        host_combined = self._sink_host_transfer()
+        memory_evidence = self._sample_sink_interval_memory()
         rank_values = host_combined[:rank_elements]
         rank_evidence = [
             rank_values[offset : offset + _RANK_EVIDENCE_FIELDS]
@@ -1710,11 +1813,12 @@ class Tier0Heartbeat:
             }
         try:
             host_payload = self._derive_host_payload(host_packs, rank_evidence)
+            host_payload["diag/v2/status/valid"] = 0
             assert_payload_schema(host_payload)
             artifact_written = False
             if self.artifact_writer is not None:
                 artifact_written = self._write_artifact(
-                    host_payload, host_packs, rank_evidence
+                    host_payload, host_packs, rank_evidence, memory_evidence
                 )
             if not artifact_written:
                 raise RuntimeError("Tier-0 event has no complete artifact")
@@ -1735,11 +1839,62 @@ class Tier0Heartbeat:
             )
             return False
 
+    def _sink_host_transfer(self) -> list[float]:
+        """Perform the event's sole device-to-host transfer on the sink rank."""
+
+        assert self._sink_staging is not None
+        return self._sink_staging.cpu().tolist()
+
+    def _sample_sink_interval_memory(self) -> dict[str, Any]:
+        """Sample the sink after gather, staging, and the sole host transfer."""
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        available = self.device.type == "cuda"
+        peak_allocated = (
+            torch.cuda.max_memory_allocated(self.device) if available else 0
+        )
+        peak_reserved = torch.cuda.max_memory_reserved(self.device) if available else 0
+        allocated_increment_bound = max(
+            0,
+            self.reservation.requested_bytes
+            - self.reservation.measured_allocated_bytes,
+        )
+        reserved_increment_bound = max(
+            0,
+            self.reservation.requested_bytes - self.reservation.measured_reserved_bytes,
+        )
+        return {
+            "all_rank_post_gather_peak": {
+                "available": False,
+                "promotable": False,
+                "reason": "no post-gather all-rank consensus operation exists",
+            },
+            "sink_post_interval": {
+                "available": available,
+                "rank": rank,
+                "event_wall_time_ms": (time.perf_counter() - self._attempt_started)
+                * 1000.0,
+                "peak_allocated_bytes": peak_allocated,
+                "peak_reserved_bytes": peak_reserved,
+                "allocated_growth_within_bound": allocator_growth_within_bound(
+                    pre_event_reserved_bytes=self._pre_event_allocated_bytes,
+                    peak_reserved_bytes=peak_allocated,
+                    predicted_increment_bytes=allocated_increment_bound,
+                ),
+                "reserved_growth_within_bound": allocator_growth_within_bound(
+                    pre_event_reserved_bytes=self._pre_event_reserved_bytes,
+                    peak_reserved_bytes=peak_reserved,
+                    predicted_increment_bytes=reserved_increment_bound,
+                ),
+            },
+        }
+
     def _write_artifact(
         self,
         host_payload: Mapping[str, float | int],
         host_packs: Mapping[str, Mapping[str, Sequence[Any]]],
         rank_evidence: Sequence[Sequence[float]],
+        memory_evidence: Mapping[str, Any],
     ) -> bool:
         """Write the exact artifact before any scalar metric emission."""
 
@@ -1769,6 +1924,12 @@ class Tier0Heartbeat:
                 valid=host_payload["diag/v2/status/valid"] == 1,
                 topology=topology,
                 rank_evidence=rank_evidence,
+                mask_shape=(
+                    self._expected_num_microbatches,
+                    int(getattr(self.args, "micro_batch_size", 1)),
+                    int(getattr(self.args, "seq_length", 1)) // max(1, cp),
+                ),
+                memory_evidence=memory_evidence,
                 capability_hash=capability_sha256_file(static_capability_path()),
                 schema_hash=diagnostic_schema_hash(),
                 writer_rank=(world_size - 1),
@@ -2051,14 +2212,12 @@ class Tier0Heartbeat:
                 cast_zero / master_nonzero if master_nonzero > 0 else math.nan
             )
 
-        latencies = [float(row[1]) for row in rank_evidence]
-        peak_hbm = max(max(int(row[7]), int(row[8])) for row in rank_evidence)
         payload["diag/v2/event/successful_update"] = self.successful_updates
         payload["diag/v2/event/valid_positions"] = valid_positions
         payload["diag/v2/status/valid"] = int(event_valid)
-        payload["diag/v2/perf/peak_hbm_bytes_max_rank"] = peak_hbm
-        payload["diag/v2/perf/latency_ms_median_rank"] = quantile(latencies, 0.5)
-        payload["diag/v2/perf/latency_ms_max_rank"] = max(latencies)
+        payload["diag/v2/perf/peak_hbm_bytes_max_rank"] = math.nan
+        payload["diag/v2/perf/latency_ms_median_rank"] = math.nan
+        payload["diag/v2/perf/latency_ms_max_rank"] = math.nan
         return payload
 
     def _host_layer_evidence(
