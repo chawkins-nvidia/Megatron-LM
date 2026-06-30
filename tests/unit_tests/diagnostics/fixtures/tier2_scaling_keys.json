@@ -1,0 +1,19 @@
+[
+  "diag/v2/t2/true_response/p10",
+  "diag/v2/t2/true_response/p50",
+  "diag/v2/t2/true_response/p90",
+  "diag/v2/t2/secant_error/p10",
+  "diag/v2/t2/secant_error/p50",
+  "diag/v2/t2/secant_error/p90",
+  "diag/v2/t2/secant_cosine/p10",
+  "diag/v2/t2/secant_cosine/p50",
+  "diag/v2/t2/secant_cosine/p90",
+  "diag/v2/t2/realized_midpoint_fraction/p10",
+  "diag/v2/t2/realized_midpoint_fraction/p50",
+  "diag/v2/t2/realized_midpoint_fraction/p90",
+  "diag/v2/t2/replay_floor/p10",
+  "diag/v2/t2/replay_floor/p50",
+  "diag/v2/t2/replay_floor/p90",
+  "diag/v2/t2/unresolved_fraction",
+  "diag/v2/t2/valid"
+]

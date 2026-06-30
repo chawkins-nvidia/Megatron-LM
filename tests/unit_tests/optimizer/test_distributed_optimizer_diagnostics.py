@@ -562,16 +562,13 @@ def test_cross_lane_exact_hbm_adds_capture_scratch_and_optimizer_event_only() ->
     combined_incremental_hbm = accumulator.maximum_scratch_bytes + estimate.total_bytes
 
     assert accumulator.maximum_scratch_bytes == 1_572_864
-    assert estimate.snapshot_bytes == 42
-    assert estimate.finish_scratch_bytes == 304
-    assert (
-        estimate.total_bytes
-        == estimate.snapshot_bytes + estimate.finish_scratch_bytes
-        == 346
-    )
-    assert combined_incremental_hbm == 1_573_210
+    assert estimate.snapshot_bytes == 74
+    assert estimate.post_fingerprint_bytes == 32
+    assert estimate.finish_scratch_bytes == 360
+    assert estimate.total_bytes == estimate.snapshot_bytes + estimate.finish_scratch_bytes == 434
+    assert combined_incremental_hbm == 1_573_298
     assert persistent_pack_baseline == 384
-    assert combined_incremental_hbm + persistent_pack_baseline == 1_573_594
+    assert combined_incremental_hbm + persistent_pack_baseline == 1_573_682
 
 
 def test_iterator_exposes_existing_cross_parameter_and_padding_ranges() -> None:
@@ -1093,7 +1090,7 @@ def test_normal_main_to_param_copy_materializes_and_accumulates_in_bounded_chunk
     accumulator.finalize_local_()
 
     assert measurement is not None
-    assert measurement.payload_bytes == measurement.estimated_bytes
+    assert measurement.payload_bytes + 32 == measurement.estimated_bytes
     assert adapter.local_status.item() == DistributedOptimizerEventStatus.OK
     for logical_name in accumulator.slot_names:
         assert accumulator.relative_rms(logical_name).valid
@@ -1107,14 +1104,15 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
     assert estimate.owner_elements == 7
     assert estimate.fp32_master_bytes == 28
     assert estimate.bf16_applied_bytes == 14
-    assert estimate.snapshot_bytes == 42
-    assert estimate.finish_elementwise_bytes == 198
+    assert estimate.snapshot_bytes == 74
+    assert estimate.post_fingerprint_bytes == 32
+    assert estimate.finish_elementwise_bytes == 254
     assert estimate.finish_scalar_bytes == 106
-    assert estimate.finish_scratch_bytes == 304
-    assert estimate.total_bytes == 346
+    assert estimate.finish_scratch_bytes == 360
+    assert estimate.total_bytes == 434
     measurement = adapter.begin_event()
     assert measurement is not None
-    assert measurement.estimated_bytes == 346
+    assert measurement.estimated_bytes == 434
     assert measurement.payload_bytes == 42
     adapter.abort_event()
 
@@ -1124,9 +1122,9 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
         rereview_cap.preflight_snapshot_memory().reason
         == SnapshotMemoryReason.MAX_EXTRA_BYTES
     )
-    exact, _ = _adapter(optimizer, parameters, max_extra_bytes=346)
+    exact, _ = _adapter(optimizer, parameters, max_extra_bytes=434)
     assert exact.preflight_snapshot_memory().accepted
-    capped, _ = _adapter(optimizer, parameters, max_extra_bytes=345)
+    capped, _ = _adapter(optimizer, parameters, max_extra_bytes=433)
     assert (
         capped.preflight_snapshot_memory().reason
         == SnapshotMemoryReason.MAX_EXTRA_BYTES
@@ -1183,21 +1181,21 @@ def test_preflight_uses_exact_reusable_driver_and_projected_reserved_boundaries(
     accepted, _ = _adapter(
         optimizer,
         parameters,
-        max_extra_bytes=446,
-        memory_state_provider=lambda device: DeviceMemoryState(600, 800, 246, 1200),
+        max_extra_bytes=534,
+        memory_state_provider=lambda device: DeviceMemoryState(600, 800, 334, 1300),
     )
     preflight = accepted.preflight_snapshot_memory(additional_bytes=100)
-    assert preflight.requested_bytes == 446
+    assert preflight.requested_bytes == 534
     assert preflight.reusable_bytes == 200
-    assert preflight.driver_need_bytes == 246
-    assert preflight.projected_reserved_bytes == 1046
+    assert preflight.driver_need_bytes == 334
+    assert preflight.projected_reserved_bytes == 1134
     assert preflight.accepted
 
     no_driver_headroom, _ = _adapter(
         optimizer,
         parameters,
-        max_extra_bytes=446,
-        memory_state_provider=lambda device: DeviceMemoryState(600, 800, 245, 1200),
+        max_extra_bytes=534,
+        memory_state_provider=lambda device: DeviceMemoryState(600, 800, 333, 1300),
     )
     assert (
         no_driver_headroom.preflight_snapshot_memory(additional_bytes=100).reason
@@ -1207,14 +1205,14 @@ def test_preflight_uses_exact_reusable_driver_and_projected_reserved_boundaries(
     projected_over_90_percent, _ = _adapter(
         optimizer,
         parameters,
-        max_extra_bytes=446,
-        memory_state_provider=lambda device: DeviceMemoryState(640, 840, 300, 1200),
+        max_extra_bytes=534,
+        memory_state_provider=lambda device: DeviceMemoryState(640, 840, 400, 1200),
     )
     projected = projected_over_90_percent.preflight_snapshot_memory(
         additional_bytes=100
     )
-    assert projected.driver_need_bytes == 246
-    assert projected.projected_reserved_bytes == 1086
+    assert projected.driver_need_bytes == 334
+    assert projected.projected_reserved_bytes == 1174
     assert projected.reason == SnapshotMemoryReason.DEVICE_MEMORY_FRACTION
 
 
@@ -1292,7 +1290,8 @@ def test_allocator_peak_is_tracked_through_finish(
 
     assert finish_measurement is not None
     assert finish_measurement.allocator_peak_delta_bytes == 240
-    assert finish_measurement.payload_bytes == finish_measurement.estimated_bytes == 346
+    assert finish_measurement.payload_bytes == 402
+    assert finish_measurement.estimated_bytes == 434
 
 
 def test_finish_allocator_query_failure_is_typed_and_releases_all_event_tensors(
@@ -1429,7 +1428,7 @@ def test_preflight_estimate_covers_independently_enumerated_peak_live_storages(
     assert adapter.finish_event(accumulator, update_successful=True) is not None
 
     assert observed_peak_bytes
-    assert max(observed_peak_bytes) == estimate.total_bytes
+    assert max(observed_peak_bytes) + estimate.post_fingerprint_bytes == estimate.total_bytes
     assert max(observed_peak_bytes) <= estimate.total_bytes
 
 

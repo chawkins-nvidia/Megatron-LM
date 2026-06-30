@@ -74,6 +74,14 @@ class DistributedOptimizerEventStatus(IntEnum):
     SECANT_MIDPOINT_INSTALL_FAILED = 29
     SECANT_RESTORE_COPY_FAILED = 30
     SECANT_RESTORE_VERIFY_FAILED = 31
+    SECANT_INVALID_PHASE = 32
+
+
+class _SecantAdapterPhase(IntEnum):
+    ARMED = 0
+    DELTA_COMMITTED = 1
+    MIDPOINT_INSTALLED = 2
+    RESTORED = 3
 
 
 class SnapshotMemoryReason(IntEnum):
@@ -118,6 +126,7 @@ class SnapshotMemoryEstimate:
 
     fp32_master_bytes: int
     bf16_applied_bytes: int
+    post_fingerprint_bytes: int
     finish_elementwise_bytes: int
     finish_scalar_bytes: int
     finish_scratch_bytes: int
@@ -137,11 +146,15 @@ def snapshot_memory_estimate(
     chunk_elements = min(owner_elements, finish_chunk_elements)
     fp32_master_bytes = owner_elements * 4
     bf16_applied_bytes = owner_elements * 2
+    post_fingerprint_bytes = 4 * 8
     layout = _scratch_layout(chunk_elements)
-    snapshot_bytes = fp32_master_bytes + bf16_applied_bytes
+    snapshot_bytes = (
+        fp32_master_bytes + bf16_applied_bytes + post_fingerprint_bytes
+    )
     return SnapshotMemoryEstimate(
         fp32_master_bytes=fp32_master_bytes,
         bf16_applied_bytes=bf16_applied_bytes,
+        post_fingerprint_bytes=post_fingerprint_bytes,
         finish_elementwise_bytes=layout.elementwise_bytes,
         finish_scalar_bytes=layout.scalar_bytes,
         finish_scratch_bytes=layout.total_bytes,
@@ -215,9 +228,17 @@ class _SnapshotState:
     measurement: SnapshotMemoryMeasurement
     allocator_before: int | None
     unique_capture_indices: tuple[int, ...]
-    delta_ready: bool = False
-    midpoint_installed: bool = False
+    phase: _SecantAdapterPhase = _SecantAdapterPhase.ARMED
     post_fingerprints: torch.Tensor | None = None
+    commit_measurement: SnapshotMemoryMeasurement | None = None
+
+    @property
+    def delta_ready(self) -> bool:
+        return self.phase >= _SecantAdapterPhase.DELTA_COMMITTED
+
+    @property
+    def midpoint_installed(self) -> bool:
+        return self.phase == _SecantAdapterPhase.MIDPOINT_INSTALLED
 
 
 @dataclass(frozen=True)
@@ -228,6 +249,7 @@ class _FinishScratchLayout:
     master_delta_fp32: tuple[int, int]
     applied_delta_fp32: tuple[int, int]
     work_fp64: tuple[int, int]
+    hash_position_int64: tuple[int, int]
     finite: tuple[int, int]
     auxiliary: tuple[int, int]
     moment_fp64: tuple[int, int]
@@ -249,6 +271,7 @@ class _FinishScratch:
     master_delta_fp32: torch.Tensor
     applied_delta_fp32: torch.Tensor
     work_fp64: torch.Tensor
+    hash_position_int64: torch.Tensor
     finite: torch.Tensor
     auxiliary: torch.Tensor
     moment_fp64: torch.Tensor
@@ -380,6 +403,7 @@ def _scratch_layout(elements: int) -> _FinishScratchLayout:
     master_delta_fp32 = reserve(elements, 4, 4)
     applied_delta_fp32 = reserve(elements, 4, 4)
     work_fp64 = reserve(elements, 8, 8)
+    hash_position_int64 = reserve(elements, 8, 8)
     finite = reserve(elements, 1, 1)
     auxiliary = reserve(elements, 1, 1)
     elementwise_bytes = offset
@@ -399,6 +423,7 @@ def _scratch_layout(elements: int) -> _FinishScratchLayout:
         master_delta_fp32=master_delta_fp32,
         applied_delta_fp32=applied_delta_fp32,
         work_fp64=work_fp64,
+        hash_position_int64=hash_position_int64,
         finite=finite,
         auxiliary=auxiliary,
         moment_fp64=moment_fp64,
@@ -636,9 +661,11 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
 
     @property
     def secant_applied_pre_buffer(self) -> torch.Tensor | None:
-        """Return the immutable BF16 pre-materialization snapshot for the active event."""
+        """Return the BF16 pre snapshot until commit reuses it for immutable post bytes."""
 
-        return None if self._snapshot is None else self._snapshot.applied_before
+        if self._snapshot is None or self._snapshot.phase != _SecantAdapterPhase.ARMED:
+            return None
+        return self._snapshot.applied_before
 
     def estimate_snapshot_memory(self) -> SnapshotMemoryEstimate:
         """Return exact retained and bounded peak bytes through accumulation."""
@@ -828,7 +855,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         allocator_delta = self._allocator_delta(allocator_before, allocator_after)
         measurement = SnapshotMemoryMeasurement(
             estimated_bytes=estimate.total_bytes,
-            payload_bytes=estimate.snapshot_bytes,
+            payload_bytes=master_before.nbytes + applied_before.nbytes,
             finish_scratch_bytes=estimate.finish_scratch_bytes,
             allocator_delta_bytes=allocator_delta,
             allocator_peak_delta_bytes=allocator_delta,
@@ -868,8 +895,13 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         """
 
         snapshot = self._snapshot
-        if snapshot is None or snapshot.delta_ready:
+        if snapshot is None:
             self._set_status(DistributedOptimizerEventStatus.SECANT_DELTA_NOT_ARMED)
+            return None
+        if snapshot.phase >= _SecantAdapterPhase.DELTA_COMMITTED:
+            return snapshot.commit_measurement
+        if snapshot.phase != _SecantAdapterPhase.ARMED:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_INVALID_PHASE)
             return None
         if not update_successful:
             self._set_status(DistributedOptimizerEventStatus.UPDATE_SKIPPED)
@@ -903,7 +935,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
                     )
 
                 snapshot.post_fingerprints = torch.empty(
-                    4, dtype=torch.float64, device=snapshot.master_before.device
+                    4, dtype=torch.int64, device=snapshot.master_before.device
                 )
                 self._fingerprint_shards(
                     current_shards,
@@ -919,11 +951,17 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
                     use_main=False,
                     out=snapshot.post_fingerprints[2:],
                 )
+                for index in snapshot.unique_capture_indices:
+                    start, end = snapshot.offsets[index]
+                    snapshot.applied_before[start:end].copy_(
+                        current_shards[index].model_shard.detach().view(-1)
+                    )
                 self._transform_pre_to_delta(snapshot, current_shards, scratch)
-                snapshot.delta_ready = True
+                snapshot.phase = _SecantAdapterPhase.DELTA_COMMITTED
                 measurement = self._measurement_with_peak(snapshot, snapshot.master_before.device)
                 if measurement is not None:
                     snapshot.measurement = measurement
+                snapshot.commit_measurement = measurement
                 return measurement
             finally:
                 self._clear_finish_scratch(scratch)
@@ -940,11 +978,16 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         """
 
         snapshot = self._snapshot
-        if snapshot is None or not snapshot.delta_ready:
+        if snapshot is None:
             self._set_status(DistributedOptimizerEventStatus.SECANT_MIDPOINT_UNAVAILABLE)
             return self._status
+        if snapshot.phase >= _SecantAdapterPhase.MIDPOINT_INSTALLED:
+            return self._status
+        if snapshot.phase != _SecantAdapterPhase.DELTA_COMMITTED:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_INVALID_PHASE)
+            return self._status
 
-        snapshot.midpoint_installed = True
+        snapshot.phase = _SecantAdapterPhase.MIDPOINT_INSTALLED
         try:
             scratch = self._allocate_finish_scratch(snapshot.master_before.device)
             try:
@@ -981,8 +1024,13 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         """
 
         snapshot = self._snapshot
-        if snapshot is None or not snapshot.delta_ready:
+        if snapshot is None:
             self._set_status(DistributedOptimizerEventStatus.SECANT_MIDPOINT_UNAVAILABLE)
+            return self._status
+        if snapshot.phase == _SecantAdapterPhase.RESTORED:
+            return self._status
+        if snapshot.phase != _SecantAdapterPhase.MIDPOINT_INSTALLED:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_INVALID_PHASE)
             return self._status
 
         scratch: _FinishScratch | None = None
@@ -991,12 +1039,16 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             scratch = self._allocate_finish_scratch(snapshot.master_before.device)
             for index in snapshot.unique_capture_indices:
                 shard = snapshot.shards[index]
-                main = shard.main_shard.detach().view(-1)
                 applied = shard.model_shard.detach().view(-1)
+                offset, _ = snapshot.offsets[index]
                 try:
-                    for start in range(0, main.numel(), self.finish_chunk_elements):
-                        end = min(start + self.finish_chunk_elements, main.numel())
-                        self._copy_secant_chunk(applied[start:end], main[start:end], "restore")
+                    for start in range(0, applied.numel(), self.finish_chunk_elements):
+                        end = min(start + self.finish_chunk_elements, applied.numel())
+                        self._copy_secant_chunk(
+                            applied[start:end],
+                            snapshot.applied_before[offset + start : offset + end],
+                            "restore",
+                        )
                 except Exception:
                     copy_failed = True
                     continue
@@ -1009,7 +1061,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         finally:
             if scratch is not None:
                 self._clear_finish_scratch(scratch)
-            snapshot.midpoint_installed = False
+            snapshot.phase = _SecantAdapterPhase.RESTORED
         return self._status
 
     def release_secant_event(self) -> None:
@@ -1146,6 +1198,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             master_delta_fp32=_typed_view(storage, layout.master_delta_fp32, torch.float32),
             applied_delta_fp32=_typed_view(storage, layout.applied_delta_fp32, torch.float32),
             work_fp64=_typed_view(storage, layout.work_fp64, torch.float64),
+            hash_position_int64=_typed_view(storage, layout.hash_position_int64, torch.int64),
             finite=_typed_view(storage, layout.finite, torch.bool),
             auxiliary=_typed_view(storage, layout.auxiliary, torch.bool),
             moment_fp64=_typed_view(storage, layout.moment_fp64, torch.float64),
@@ -1196,33 +1249,105 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         use_main: bool,
         out: torch.Tensor,
     ) -> torch.Tensor:
-        fingerprint = out
-        fingerprint.zero_()
+        if out.dtype != torch.int64 or out.numel() != 2:
+            raise ValueError("post fingerprints require exactly two int64 hash states")
+        seeds = (2611923443488327891, 7046029254386353131)
+        metadata = tuple(
+            token
+            for sequence, index in enumerate(indices)
+            for token in self._fingerprint_metadata(shards, index, sequence)
+        )
+        for hash_index, seed in enumerate(seeds):
+            out[hash_index].fill_(self._host_metadata_hash(metadata, seed))
+
+        element_position = 0
         for index in indices:
             shard = shards[index]
             values = (shard.main_shard if use_main else shard.model_shard).detach().view(-1)
             for start in range(0, values.numel(), self.finish_chunk_elements):
                 end = min(start + self.finish_chunk_elements, values.numel())
-                work = scratch.work_fp64[: end - start]
-                work.copy_(values[start:end])
-                fingerprint[0].add_(work.sum())
-                work.square_()
-                fingerprint[1].add_(work.sum())
-        return fingerprint
+                size = end - start
+                raw_dtype = torch.int32 if values.dtype == torch.float32 else torch.int16
+                raw = values.view(raw_dtype)[start:end]
+                work = scratch.work_fp64[:size].view(torch.int64)
+                temporary = scratch.hash_position_int64[:size]
+                for hash_index, seed in enumerate(seeds):
+                    work.copy_(raw)
+                    torch.arange(element_position + start, element_position + end, out=temporary)
+                    temporary.mul_(1442695040888963407)
+                    work.bitwise_xor_(temporary)
+                    work.bitwise_xor_(seed)
+                    work.mul_(6364136223846793005)
+                    torch.bitwise_right_shift(work, 29, out=temporary)
+                    work.bitwise_xor_(temporary)
+                    work.mul_(1442695040888963407)
+                    torch.bitwise_right_shift(work, 32, out=temporary)
+                    work.bitwise_xor_(temporary)
+                    torch.sum(
+                        work, dim=(0,), dtype=torch.int64, out=scratch.status_int64.squeeze(0)
+                    )
+                    out[hash_index].add_(scratch.status_int64.squeeze(0))
+            element_position += values.numel()
+        return out
+
+    @classmethod
+    def _fingerprint_metadata(
+        cls, shards: tuple[ModelMainParamShard, ...], index: int, sequence: int
+    ) -> tuple[int, ...]:
+        shard = shards[index]
+        pair_key = cls._paired_view_key(shard)
+        aliases = tuple(
+            candidate for candidate in shards if cls._paired_view_key(candidate) == pair_key
+        )
+        tokens = [
+            sequence,
+            len(aliases),
+            sum(candidate.logical_owner for candidate in aliases),
+            sum(candidate.shared for candidate in aliases),
+            sum(candidate.tied for candidate in aliases),
+            sum(candidate.tied_owner for candidate in aliases),
+        ]
+        for tensor in (shard.main_shard, shard.model_shard):
+            dtype_code = {torch.float32: 1, torch.bfloat16: 2}.get(tensor.dtype)
+            if dtype_code is None:
+                raise ValueError("unsupported post-fingerprint dtype")
+            tokens.extend(
+                (
+                    dtype_code,
+                    tensor.ndim,
+                    tensor.storage_offset(),
+                    tensor.numel(),
+                    -1 if tensor.device.index is None else tensor.device.index,
+                    1 if tensor.device.type == "cuda" else 0,
+                    *tensor.shape,
+                    *tensor.stride(),
+                )
+            )
+        return tuple(tokens)
+
+    @staticmethod
+    def _host_metadata_hash(tokens: tuple[int, ...], seed: int) -> int:
+        mask = (1 << 64) - 1
+        value = seed & mask
+        for token in tokens:
+            value ^= token & mask
+            value = (value * 1099511628211) & mask
+            value ^= value >> 32
+        return value if value < (1 << 63) else value - (1 << 64)
 
     def _verify_secant_post(self, snapshot: _SnapshotState, scratch: _FinishScratch) -> None:
         mismatch = scratch.scalar_bool.squeeze(0)
         for index in snapshot.unique_capture_indices:
             shard = snapshot.shards[index]
-            main = shard.main_shard.detach().view(-1)
             applied = shard.model_shard.detach().view(-1)
-            for start in range(0, main.numel(), self.finish_chunk_elements):
-                end = min(start + self.finish_chunk_elements, main.numel())
-                size = end - start
-                expected = scratch.expected_bf16[:size]
-                expected.copy_(main[start:end])
-                torch.ne(expected, applied[start:end], out=scratch.auxiliary[:size])
-                torch.any(scratch.auxiliary[:size], dim=(0,), out=mismatch)
+            offset, _ = snapshot.offsets[index]
+            for start in range(0, applied.numel(), self.finish_chunk_elements):
+                end = min(start + self.finish_chunk_elements, applied.numel())
+                expected = snapshot.applied_before[offset + start : offset + end]
+                current_bits = applied[start:end].view(torch.int16)
+                expected_bits = expected.view(torch.int16)
+                torch.ne(current_bits, expected_bits, out=scratch.auxiliary[: end - start])
+                torch.any(scratch.auxiliary[: end - start], dim=(0,), out=mismatch)
                 scratch.status_int64.copy_(mismatch)
                 scratch.status_int64.mul_(
                     int(DistributedOptimizerEventStatus.SECANT_RESTORE_VERIFY_FAILED)
@@ -1234,14 +1359,14 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             snapshot.unique_capture_indices,
             scratch,
             use_main=True,
-            out=scratch.moment_fp64[:2],
+            out=scratch.moment_fp64[:2].view(torch.int64),
         )
         current_applied = self._fingerprint_shards(
             snapshot.shards,
             snapshot.unique_capture_indices,
             scratch,
             use_main=False,
-            out=scratch.moment_fp64[2:4],
+            out=scratch.moment_fp64[2:4].view(torch.int64),
         )
         post_fingerprints = snapshot.post_fingerprints
         if post_fingerprints is None:
@@ -1267,6 +1392,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         del scratch.master_delta_fp32
         del scratch.applied_delta_fp32
         del scratch.work_fp64
+        del scratch.hash_position_int64
         del scratch.finite
         del scratch.auxiliary
         del scratch.moment_fp64
@@ -1493,6 +1619,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             payload_bytes=(
                 snapshot.master_before.nbytes
                 + snapshot.applied_before.nbytes
+                + (0 if snapshot.post_fingerprints is None else snapshot.post_fingerprints.nbytes)
                 + snapshot.measurement.finish_scratch_bytes
             ),
             allocator_peak_delta_bytes=allocator_peak,
@@ -1534,61 +1661,99 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             shard.local_buffer_range,
             shard.main_shard.untyped_storage().data_ptr(),
             shard.main_shard.storage_offset(),
+            shard.main_shard.shape,
+            shard.main_shard.stride(),
             shard.model_shard.untyped_storage().data_ptr(),
             shard.model_shard.storage_offset(),
+            shard.model_shard.shape,
+            shard.model_shard.stride(),
             shard.main_shard.numel(),
+            shard.model_shard.numel(),
             shard.main_shard.dtype,
             shard.model_shard.dtype,
+        )
+
+    @staticmethod
+    def _tensor_view_key(tensor: torch.Tensor) -> tuple[object, ...]:
+        return (
+            tensor.device,
+            tensor.untyped_storage().data_ptr(),
+            tensor.storage_offset(),
+            tensor.numel(),
+            tensor.dtype,
+            tuple(tensor.shape),
+            tensor.stride(),
+        )
+
+    @classmethod
+    def _paired_view_key(cls, shard: ModelMainParamShard) -> tuple[object, ...]:
+        return cls._tensor_view_key(shard.main_shard), cls._tensor_view_key(shard.model_shard)
+
+    @staticmethod
+    def _physical_interval(tensor: torch.Tensor) -> tuple[tuple[torch.device, int], int, int]:
+        element_size = tensor.element_size()
+        start = tensor.storage_offset() * element_size
+        return (
+            (tensor.device, tensor.untyped_storage().data_ptr()),
+            start,
+            start + tensor.numel() * element_size,
         )
 
     @staticmethod
     def _capture_layout(
         shards: tuple[ModelMainParamShard, ...]
     ) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
-        """Assign one shared snapshot range to each exact physical owner alias."""
+        """Canonicalize exact paired aliases and reject every other physical overlap."""
 
-        offsets: list[tuple[int, int]] = []
-        unique_indices: list[int] = []
-        ranges: dict[tuple[object, ...], tuple[int, int]] = {}
-        offset = 0
-        for index, shard in enumerate(shards):
-            key = (
-                shard.main_shard.device,
-                shard.main_shard.untyped_storage().data_ptr(),
-                shard.main_shard.storage_offset(),
-                shard.main_shard.numel(),
-                shard.main_shard.dtype,
-                shard.model_shard.device,
-                shard.model_shard.untyped_storage().data_ptr(),
-                shard.model_shard.storage_offset(),
-                shard.model_shard.numel(),
-                shard.model_shard.dtype,
+        for shard in shards:
+            if shard.main_shard.numel() != shard.model_shard.numel():
+                raise ValueError("paired main/model optimizer views require equal element counts")
+            if not shard.main_shard.is_contiguous() or not shard.model_shard.is_contiguous():
+                raise ValueError("optimizer owner views must be contiguous")
+
+        for tensors in (
+            tuple(shard.main_shard for shard in shards),
+            tuple(shard.model_shard for shard in shards),
+        ):
+            intervals: dict[tuple[torch.device, int], list[tuple[int, int, tuple[object, ...]]]] = (
+                {}
             )
-            existing = ranges.get(key)
-            if existing is not None:
-                offsets.append(existing)
-                continue
-            end = offset + shard.main_shard.numel()
+            for tensor in tensors:
+                storage, start, end = Bf16DistributedOptimizerDiagnosticAdapter._physical_interval(
+                    tensor
+                )
+                key = Bf16DistributedOptimizerDiagnosticAdapter._tensor_view_key(tensor)
+                for other_start, other_end, other_key in intervals.setdefault(storage, []):
+                    if start < other_end and other_start < end and key != other_key:
+                        raise ValueError("non-exact optimizer tensor views physically overlap")
+                intervals[storage].append((start, end, key))
+
+        main_to_model: dict[tuple[object, ...], set[tuple[object, ...]]] = {}
+        model_to_main: dict[tuple[object, ...], set[tuple[object, ...]]] = {}
+        groups: dict[tuple[object, ...], list[int]] = {}
+        for index, shard in enumerate(shards):
+            main_key, model_key = Bf16DistributedOptimizerDiagnosticAdapter._paired_view_key(shard)
+            main_to_model.setdefault(main_key, set()).add(model_key)
+            model_to_main.setdefault(model_key, set()).add(main_key)
+            groups.setdefault((main_key, model_key), []).append(index)
+        if any(len(models) != 1 for models in main_to_model.values()) or any(
+            len(mains) != 1 for mains in model_to_main.values()
+        ):
+            raise ValueError("main/model aliases do not form exact paired views")
+
+        offsets: list[tuple[int, int] | None] = [None] * len(shards)
+        unique_indices: list[int] = []
+        offset = 0
+        for _, indices in sorted(groups.items(), key=lambda item: repr(item[0])):
+            representative = min(indices)
+            end = offset + shards[representative].main_shard.numel()
             current = (offset, end)
-            ranges[key] = current
-            offsets.append(current)
-            unique_indices.append(index)
+            for index in indices:
+                offsets[index] = current
+            unique_indices.append(representative)
             offset = end
-        return tuple(offsets), tuple(unique_indices)
+        return tuple(value for value in offsets if value is not None), tuple(unique_indices)
 
     @staticmethod
     def _validate_unique_local_ownership(shards: tuple[ModelMainParamShard, ...]) -> None:
-        intervals: dict[tuple[torch.device, int], list[tuple[int, int]]] = {}
-        for shard in shards:
-            if not shard.logical_owner:
-                continue
-            storage_identity = (
-                shard.main_shard.device,
-                shard.main_shard.untyped_storage().data_ptr(),
-            )
-            start = shard.main_shard.storage_offset()
-            end = start + shard.main_shard.numel()
-            existing = intervals.setdefault(storage_identity, [])
-            if any(start < other_end and other_start < end for other_start, other_end in existing):
-                raise ValueError("logical optimizer owner shards overlap")
-            existing.append((start, end))
+        Bf16DistributedOptimizerDiagnosticAdapter._capture_layout(shards)

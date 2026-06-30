@@ -46,6 +46,7 @@ _EXPORT_MODULES = {
     "SecantLocalTransaction": "secant",
     "SecantMathStatus": "secant",
     "SecantMemoryEstimate": "secant",
+    "SecantMemoryEstimateError": "secant",
     "SecantMemoryInputs": "secant",
     "SecantObservation": "secant",
     "SecantOptimizerLayout": "secant",
