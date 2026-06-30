@@ -8,7 +8,10 @@ import torch
 import torch.distributed as dist
 
 import megatron.training.diagnostics.accumulator as accumulator_module
-from megatron.training.diagnostics.accumulator import PackedSufficientStatistics
+from megatron.training.diagnostics.accumulator import (
+    PackedSufficientStatistics,
+    ReductionBinding,
+)
 from megatron.training.diagnostics.schema import Tier0Reason
 
 
@@ -35,9 +38,18 @@ class _PeerReducer:
             raise AssertionError(f"unexpected reduction operation: {op}")
 
 
-def _accumulator(*slot_names: str) -> PackedSufficientStatistics:
+def _accumulator(
+    *slot_names: str, reduction_binding: ReductionBinding | None = None
+) -> PackedSufficientStatistics:
     return PackedSufficientStatistics(
-        tuple(slot_names), "cpu", descriptor_hash=f"test:{slot_names!r}"
+        tuple(slot_names),
+        "cpu",
+        descriptor_hash=f"test:{slot_names!r}",
+        reduction_binding=(
+            ReductionBinding.flat_world(None)
+            if reduction_binding is None
+            else reduction_binding
+        ),
     )
 
 
@@ -81,14 +93,18 @@ def test_unequal_populations_masks_and_microbatches_match_concatenated_reference
 def test_zero_contributor_rank_and_injected_process_group_preserve_fixed_collectives() -> (
     None
 ):
-    local = _accumulator("residual", "qkv")
-    local.add_masked_tensor("residual", torch.empty(0))
     peer = _accumulator("residual", "qkv")
     peer.add_masked_tensor("qkv", torch.tensor([2.0, 4.0]))
     group = object()
     reducer = _PeerReducer(peer, group)
+    local = _accumulator(
+        "residual",
+        "qkv",
+        reduction_binding=ReductionBinding.flat_world(group, reducer=reducer),
+    )
+    local.add_masked_tensor("residual", torch.empty(0))
 
-    local.reduce_(group=group, reducer=reducer)
+    local.reduce_()
 
     assert reducer.operations == [
         dist.ReduceOp.SUM,
@@ -195,16 +211,19 @@ def test_invalid_masks_are_neutral_and_surface_packed_mask_mismatch(
 
 
 def test_mask_mismatch_reduces_collectively_without_changing_collective_count() -> None:
-    local = _accumulator("masked")
-    local.add_masked_tensor("masked", torch.tensor([3.0, 4.0]))
     peer = _accumulator("masked")
     peer.add_masked_tensor(
         "masked", torch.tensor([100.0, 200.0]), mask=torch.tensor([-1.0, 1.0])
     )
     group = object()
     reducer = _PeerReducer(peer, group)
+    local = _accumulator(
+        "masked",
+        reduction_binding=ReductionBinding.flat_world(group, reducer=reducer),
+    )
+    local.add_masked_tensor("masked", torch.tensor([3.0, 4.0]))
 
-    local.reduce_(group=group, reducer=reducer)
+    local.reduce_()
 
     assert reducer.operations == [
         dist.ReduceOp.SUM,
@@ -235,12 +254,18 @@ def test_zero_denominators_are_invalid_nan_not_zero() -> None:
 
 
 def test_pooled_cosine_avoids_known_mean_of_rank_cosines_sign_flip() -> None:
-    rank0 = _accumulator("cosine")
-    rank0.add_masked_pair("cosine", torch.ones(10), torch.ones(10))
     rank1 = _accumulator("cosine")
     rank1.add_masked_pair(
         "cosine", torch.tensor([10.0, 0.0]), torch.tensor([-8.0, 6.0])
     )
+    group = object()
+    rank0 = _accumulator(
+        "cosine",
+        reduction_binding=ReductionBinding.flat_world(
+            group, reducer=_PeerReducer(rank1, group)
+        ),
+    )
+    rank0.add_masked_pair("cosine", torch.ones(10), torch.ones(10))
 
     rank0_local = _accumulator("cosine")
     rank0_local.sum_pack.copy_(rank0.sum_pack)
@@ -252,8 +277,7 @@ def test_pooled_cosine_avoids_known_mean_of_rank_cosines_sign_flip() -> None:
         rank0_local.cosine("cosine").value + rank1.cosine("cosine").value
     ) / 2
 
-    group = object()
-    rank0.reduce_(group=group, reducer=_PeerReducer(rank1, group))
+    rank0.reduce_()
 
     assert mean_of_local_cosines > 0
     assert rank0.cosine("cosine").value < 0

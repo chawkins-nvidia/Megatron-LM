@@ -2,7 +2,14 @@
 
 """Scalable, topology-aware training diagnostic primitives."""
 
-from .accumulator import DerivedStatistic, PackedSlots, PackedSufficientStatistics
+from .accumulator import (
+    DerivedStatistic,
+    PackedSlots,
+    PackedSufficientStatistics,
+    ProcessGroupIdentity,
+    ReductionBinding,
+    ReductionKind,
+)
 from .registry import (
     DenominatorKind,
     MaskKind,
@@ -12,7 +19,6 @@ from .registry import (
     NormalizationKind,
     Ownership,
     PartitionAxis,
-    ReductionKind,
     ReplicationAxis,
     StatisticKind,
 )
@@ -40,6 +46,8 @@ __all__ = [
     "PackedSlots",
     "PackedSufficientStatistics",
     "PartitionAxis",
+    "ProcessGroupIdentity",
+    "ReductionBinding",
     "ReductionKind",
     "ReplicationAxis",
     "SCHEMA_PREFIX",

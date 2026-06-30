@@ -3,6 +3,7 @@
 """Device-resident packed sufficient statistics for scalable diagnostics."""
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 import torch
@@ -43,6 +44,72 @@ class PackedReducer(Protocol):
         """
 
         ...
+
+
+class ProcessGroupIdentity(StrEnum):
+    """Known logical process-group identities for diagnostic reduction."""
+
+    WORLD = "world"
+    DATA_PARALLEL = "data_parallel"
+
+
+class ReductionKind(StrEnum):
+    """Fixed collective operations used by an accumulator."""
+
+    PACKED_SUM_MAX_MIN = "packed_sum_max_min"
+    HIERARCHICAL_PACKED_SUM_MAX_MIN = "hierarchical_packed_sum_max_min"
+
+
+@dataclass(frozen=True)
+class ReductionBinding:
+    """Bind a declared reduction contract to its runtime collective.
+
+    Attributes:
+        process_group_identity: Logical identity of the bound process group.
+        reduction_kind: Packed collective algorithm implemented by the binding.
+        group: Runtime process group, or ``None`` for the default world group.
+        reducer: Optional injected collective callable used by tests.
+    """
+
+    process_group_identity: ProcessGroupIdentity
+    reduction_kind: ReductionKind
+    group: object | None
+    reducer: PackedReducer | None = None
+
+    def __post_init__(self) -> None:
+        """Require typed identities before this binding reaches an accumulator.
+
+        Raises:
+            ValueError: If either identity is not its declared enum type.
+        """
+
+        if not isinstance(self.process_group_identity, ProcessGroupIdentity):
+            raise ValueError(
+                "reduction bindings require a typed process-group identity"
+            )
+        if not isinstance(self.reduction_kind, ReductionKind):
+            raise ValueError("reduction bindings require a typed reduction kind")
+
+    @classmethod
+    def flat_world(
+        cls, group: object | None, *, reducer: PackedReducer | None = None
+    ) -> "ReductionBinding":
+        """Create the supported flat world SUM/MAX/MIN binding.
+
+        Args:
+            group: Runtime world process group, or ``None`` for the default world group.
+            reducer: Optional injected collective callable used by tests.
+
+        Returns:
+            A typed binding for the flat packed world reduction.
+        """
+
+        return cls(
+            process_group_identity=ProcessGroupIdentity.WORLD,
+            reduction_kind=ReductionKind.PACKED_SUM_MAX_MIN,
+            group=group,
+            reducer=reducer,
+        )
 
 
 @dataclass(frozen=True)
@@ -151,9 +218,8 @@ class PackedSufficientStatistics:
         device: torch.device | str,
         *,
         descriptor_hash: str,
+        reduction_binding: ReductionBinding,
         schema_identity: str = SCHEMA_PREFIX.rstrip("/"),
-        process_group_identity: str = "unbound",
-        reduction_identity: str = "packed_sum_max_min",
     ) -> None:
         """Allocate neutral packed buffers in a stable slot order.
 
@@ -161,28 +227,30 @@ class PackedSufficientStatistics:
             slot_names: Unique logical metric names in collective slot order.
             device: CPU or CUDA device used for accumulation and reduction.
             descriptor_hash: Rank-independent descriptor hash.
+            reduction_binding: Typed runtime binding for the declared collective.
             schema_identity: Versioned diagnostic schema identity.
-            process_group_identity: Stable name of the intended process group.
-            reduction_identity: Stable name of the packed reduction contract.
 
         Raises:
-            ValueError: If slot names or identities are invalid.
+            ValueError: If slot names, identities, or the reduction binding are invalid.
         """
 
         if len(slot_names) != len(set(slot_names)):
             raise ValueError("packed statistic slot names must be unique")
-        if (
-            not descriptor_hash
-            or not schema_identity
-            or not process_group_identity
-            or not reduction_identity
-        ):
+        if not descriptor_hash or not schema_identity:
             raise ValueError("packed statistic identities must be nonempty")
+        if reduction_binding is None:
+            raise ValueError("packed statistics require a reduction binding")
+        if (
+            reduction_binding.process_group_identity != ProcessGroupIdentity.WORLD
+            or reduction_binding.reduction_kind != ReductionKind.PACKED_SUM_MAX_MIN
+        ):
+            raise ValueError(
+                "only the flat packed world SUM/MAX/MIN reduction is implemented"
+            )
         self.slot_names = slot_names
         self.descriptor_hash = descriptor_hash
         self.schema_identity = schema_identity
-        self.process_group_identity = process_group_identity
-        self.reduction_identity = reduction_identity
+        self.reduction_binding = reduction_binding
         self._slot_indices = {name: index for index, name in enumerate(slot_names)}
         self.sum_pack = torch.zeros(
             len(slot_names) * _SUM_FIELD_COUNT, dtype=torch.float64, device=device
@@ -200,6 +268,18 @@ class PackedSufficientStatistics:
         """Return whether the packs completed their reduction phase."""
 
         return self._reduced
+
+    @property
+    def process_group_identity(self) -> ProcessGroupIdentity:
+        """Return the process-group identity carried by the runtime binding."""
+
+        return self.reduction_binding.process_group_identity
+
+    @property
+    def reduction_kind(self) -> ReductionKind:
+        """Return the packed reduction kind carried by the runtime binding."""
+
+        return self.reduction_binding.reduction_kind
 
     def slots(self, slot: str | int) -> PackedSlots:
         """Resolve a logical name or integer slot to packed offsets.
@@ -225,6 +305,7 @@ class PackedSufficientStatistics:
         *,
         mask: torch.Tensor | None = None,
         replication_multiplicity: int = 1,
+        require_mask: bool = False,
     ) -> None:
         """Add masked tensor moments without deriving a local metric.
 
@@ -237,6 +318,7 @@ class PackedSufficientStatistics:
             values: Tensor observation, rounded to FP32 before accumulation.
             mask: Optional same-device broadcastable nonnegative finite weights.
             replication_multiplicity: Number of identical logical replicas.
+            require_mask: Whether a missing mask is a packed mask-contract failure.
 
         Raises:
             RuntimeError: If accumulation already completed.
@@ -249,7 +331,9 @@ class PackedSufficientStatistics:
         self._validate_multiplicity(replication_multiplicity)
         slots = self.slots(slot)
         values_fp32 = values.detach().to(dtype=torch.float32)
-        weights = self._weights_like(values_fp32, mask, slots)
+        weights = self._weights_like(
+            values_fp32, mask, slots, require_mask=require_mask
+        )
         if values_fp32.numel() == 0:
             return
 
@@ -311,6 +395,7 @@ class PackedSufficientStatistics:
         *,
         mask: torch.Tensor | None = None,
         replication_multiplicity: int = 1,
+        require_mask: bool = False,
     ) -> None:
         """Add pooled dot, cosine, and relative-norm moments for a pair.
 
@@ -320,6 +405,7 @@ class PackedSufficientStatistics:
             rhs: Denominator-side tensor observation.
             mask: Optional same-device broadcastable nonnegative finite weights.
             replication_multiplicity: Number of identical logical replicas.
+            require_mask: Whether a missing mask is a packed mask-contract failure.
 
         Raises:
             RuntimeError: If accumulation already completed.
@@ -334,7 +420,7 @@ class PackedSufficientStatistics:
         lhs_fp32, rhs_fp32 = torch.broadcast_tensors(
             lhs.detach().to(dtype=torch.float32), rhs.detach().to(dtype=torch.float32)
         )
-        weights = self._weights_like(lhs_fp32, mask, slots)
+        weights = self._weights_like(lhs_fp32, mask, slots, require_mask=require_mask)
         if lhs_fp32.numel() == 0:
             return
 
@@ -415,6 +501,7 @@ class PackedSufficientStatistics:
         *,
         mask: torch.Tensor | None = None,
         replication_multiplicity: int = 1,
+        require_mask: bool = False,
     ) -> None:
         """Add update-delta moments with the pre-update tensor as denominator.
 
@@ -424,6 +511,7 @@ class PackedSufficientStatistics:
             after: Post-update tensor.
             mask: Optional same-device broadcastable nonnegative finite weights.
             replication_multiplicity: Number of identical logical replicas.
+            require_mask: Whether a missing mask is a packed mask-contract failure.
 
         Raises:
             RuntimeError: If accumulation already completed.
@@ -438,16 +526,11 @@ class PackedSufficientStatistics:
             before_fp32,
             mask=mask,
             replication_multiplicity=replication_multiplicity,
+            require_mask=require_mask,
         )
 
-    def reduce_(
-        self, *, group: object | None = None, reducer: PackedReducer | None = None
-    ) -> "PackedSufficientStatistics":
+    def reduce_(self) -> "PackedSufficientStatistics":
         """Reduce the three fixed packs with SUM, MAX, and MIN.
-
-        Args:
-            group: Process group matching ``process_group_identity``.
-            reducer: Optional test reducer; defaults to ``torch.distributed.all_reduce``.
 
         Returns:
             This accumulator after in-place reduction.
@@ -457,10 +540,11 @@ class PackedSufficientStatistics:
         """
 
         self._ensure_accumulating()
-        reduce_call = _torch_all_reduce if reducer is None else reducer
-        reduce_call(self.sum_pack, op=dist.ReduceOp.SUM, group=group)
-        reduce_call(self.max_pack, op=dist.ReduceOp.MAX, group=group)
-        reduce_call(self.min_pack, op=dist.ReduceOp.MIN, group=group)
+        binding = self.reduction_binding
+        reduce_call = _torch_all_reduce if binding.reducer is None else binding.reducer
+        reduce_call(self.sum_pack, op=dist.ReduceOp.SUM, group=binding.group)
+        reduce_call(self.max_pack, op=dist.ReduceOp.MAX, group=binding.group)
+        reduce_call(self.min_pack, op=dist.ReduceOp.MIN, group=binding.group)
         self._reduced = True
         return self
 
@@ -725,9 +809,17 @@ class PackedSufficientStatistics:
         return slot
 
     def _weights_like(
-        self, values: torch.Tensor, mask: torch.Tensor | None, slots: PackedSlots
+        self,
+        values: torch.Tensor,
+        mask: torch.Tensor | None,
+        slots: PackedSlots,
+        *,
+        require_mask: bool,
     ) -> torch.Tensor:
         if mask is None:
+            if require_mask:
+                self.sum_pack[slots.mask_error].add_(1)
+                return torch.zeros_like(values, dtype=torch.float32)
             return torch.ones_like(values, dtype=torch.float32)
         if mask.device != values.device or mask.is_complex():
             self.sum_pack[slots.mask_error].add_(1)

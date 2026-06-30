@@ -10,7 +10,13 @@ from typing import Iterable
 
 import torch
 
-from .accumulator import PackedSlots, PackedSufficientStatistics
+from .accumulator import (
+    PackedSlots,
+    PackedSufficientStatistics,
+    ProcessGroupIdentity,
+    ReductionBinding,
+    ReductionKind,
+)
 from .schema import SCHEMA_PREFIX
 
 
@@ -91,13 +97,6 @@ class NormalizationKind(StrEnum):
     LOSS_SCALE_AND_GLOBAL_VALID_TOKENS = "loss_scale_and_global_valid_tokens"
 
 
-class ReductionKind(StrEnum):
-    """Fixed collective operations used by an accumulator."""
-
-    PACKED_SUM_MAX_MIN = "packed_sum_max_min"
-    HIERARCHICAL_PACKED_SUM_MAX_MIN = "hierarchical_packed_sum_max_min"
-
-
 @dataclass(frozen=True)
 class MetricDescriptor:
     """Describe one logical metric's complete, rank-independent semantics.
@@ -131,7 +130,7 @@ class MetricDescriptor:
     statistic_kind: StatisticKind
     denominator_kind: DenominatorKind
     normalization_kind: NormalizationKind
-    process_group_identity: str
+    process_group_identity: ProcessGroupIdentity
     reduction_kind: ReductionKind
     tied_owner_identity: str | None
     packed_slots: PackedSlots
@@ -162,6 +161,22 @@ class MetricDescriptor:
             raise ValueError("tied-parameter ownership requires a tied-owner identity")
         if self.tied_owner_identity is not None and not self.tied_owner_identity:
             raise ValueError("tied-owner identities must be nonempty")
+        if not isinstance(self.process_group_identity, ProcessGroupIdentity):
+            raise ValueError(
+                "metric descriptors require a typed process-group identity"
+            )
+        if not isinstance(self.reduction_kind, ReductionKind):
+            raise ValueError("metric descriptors require a typed reduction kind")
+        if self.mask_kind == MaskKind.PARAMETER:
+            raise ValueError("parameter and unmasked metrics must use mask kind none")
+        if self.normalization_kind != NormalizationKind.NONE:
+            raise ValueError(
+                "non-none normalization requires a typed normalization adapter"
+            )
+        if self.process_group_identity != ProcessGroupIdentity.WORLD:
+            raise ValueError("only world diagnostic reduction is implemented")
+        if self.reduction_kind != ReductionKind.PACKED_SUM_MAX_MIN:
+            raise ValueError("hierarchical diagnostic reduction is not implemented")
 
         expected_denominator = {
             StatisticKind.TENSOR_MOMENTS: DenominatorKind.SELECTED_ELEMENTS,
@@ -181,18 +196,22 @@ class MetricRegistry:
         self,
         descriptors: Iterable[MetricDescriptor],
         *,
+        reduction_binding: ReductionBinding,
         local_owners: Iterable[bool] | None = None,
     ) -> None:
         """Validate descriptors and retain neutral slots for non-owning ranks.
 
         Args:
             descriptors: Rank-independent descriptors in collective slot order.
+            reduction_binding: Typed runtime binding for this packed registry.
             local_owners: Optional rank-local contribution decision per descriptor.
 
         Raises:
             ValueError: If descriptors, slots, reductions, or ownership lengths disagree.
         """
 
+        if reduction_binding is None:
+            raise ValueError("a metric registry requires a reduction binding")
         self.descriptors = tuple(descriptors)
         names = tuple(descriptor.logical_name for descriptor in self.descriptors)
         if len(names) != len(set(names)):
@@ -211,8 +230,25 @@ class MetricRegistry:
             raise ValueError(
                 "one packed registry must use one process-group and reduction identity"
             )
-        self.process_group_identity = next(iter(process_groups), "unbound")
+        self.process_group_identity = next(
+            iter(process_groups), ProcessGroupIdentity.WORLD
+        )
         self.reduction_kind = next(iter(reductions), ReductionKind.PACKED_SUM_MAX_MIN)
+        if (
+            self.process_group_identity != ProcessGroupIdentity.WORLD
+            or self.reduction_kind != ReductionKind.PACKED_SUM_MAX_MIN
+        ):
+            raise ValueError(
+                "only the flat packed world SUM/MAX/MIN reduction is implemented"
+            )
+        if (
+            reduction_binding.process_group_identity != self.process_group_identity
+            or reduction_binding.reduction_kind != self.reduction_kind
+        ):
+            raise ValueError(
+                "reduction binding does not match the metric descriptor contract"
+            )
+        self.reduction_binding = reduction_binding
 
         owners = (
             tuple(True for _ in self.descriptors)
@@ -223,17 +259,22 @@ class MetricRegistry:
             raise ValueError("local ownership must have one entry per descriptor")
         self.local_owners = owners
         self._indices = {name: index for index, name in enumerate(names)}
+        self._slot_names = names
+        self._descriptor_hash = self._serialize_descriptor_hash()
 
     @property
     def slot_names(self) -> tuple[str, ...]:
         """Return the fixed collective slot order."""
 
-        return tuple(descriptor.logical_name for descriptor in self.descriptors)
+        return self._slot_names
 
     @property
     def descriptor_hash(self) -> str:
         """Return a SHA-256 hash of all static, rank-independent semantics."""
 
+        return self._descriptor_hash
+
+    def _serialize_descriptor_hash(self) -> str:
         records = []
         for descriptor in self.descriptors:
             records.append(
@@ -282,12 +323,11 @@ class MetricRegistry:
         """
 
         return PackedSufficientStatistics(
-            self.slot_names,
+            self._slot_names,
             device,
-            descriptor_hash=self.descriptor_hash,
+            descriptor_hash=self._descriptor_hash,
+            reduction_binding=self.reduction_binding,
             schema_identity=SCHEMA_PREFIX.rstrip("/"),
-            process_group_identity=self.process_group_identity,
-            reduction_identity=self.reduction_kind.value,
         )
 
     def owns(self, logical_name: str) -> bool:
@@ -331,6 +371,8 @@ class MetricRegistry:
                 values,
                 mask=mask,
                 replication_multiplicity=descriptor.replication_multiplicity,
+                require_mask=descriptor.mask_kind
+                in (MaskKind.TOKEN, MaskKind.SEQUENCE_PARALLEL_TOKEN),
             )
 
     def add_masked_pair(
@@ -365,6 +407,8 @@ class MetricRegistry:
                 rhs,
                 mask=mask,
                 replication_multiplicity=descriptor.replication_multiplicity,
+                require_mask=descriptor.mask_kind
+                in (MaskKind.TOKEN, MaskKind.SEQUENCE_PARALLEL_TOKEN),
             )
 
     def add_update(
@@ -399,6 +443,8 @@ class MetricRegistry:
                 after,
                 mask=mask,
                 replication_multiplicity=descriptor.replication_multiplicity,
+                require_mask=descriptor.mask_kind
+                in (MaskKind.TOKEN, MaskKind.SEQUENCE_PARALLEL_TOKEN),
             )
 
     def _operation(
@@ -418,6 +464,10 @@ class MetricRegistry:
             )
         if descriptor.mask_kind == MaskKind.NONE and mask is not None:
             raise ValueError(f"{logical_name} does not accept a mask")
+        if descriptor.normalization_kind != NormalizationKind.NONE:
+            raise ValueError(
+                f"{logical_name} requires an unavailable typed normalization adapter"
+            )
         return index, descriptor
 
     def _index(self, logical_name: str) -> int:
@@ -427,15 +477,14 @@ class MetricRegistry:
             raise KeyError(f"unknown metric descriptor: {logical_name}") from error
 
     def _validate_accumulator(self, accumulator: PackedSufficientStatistics) -> None:
-        if accumulator.slot_names != self.slot_names:
+        if accumulator.slot_names is not self._slot_names:
             raise ValueError(
                 "accumulator slot order does not match the metric registry"
             )
         if (
             accumulator.schema_identity != SCHEMA_PREFIX.rstrip("/")
-            or accumulator.descriptor_hash != self.descriptor_hash
-            or accumulator.process_group_identity != self.process_group_identity
-            or accumulator.reduction_identity != self.reduction_kind.value
+            or accumulator.descriptor_hash != self._descriptor_hash
+            or accumulator.reduction_binding is not self.reduction_binding
         ):
             raise ValueError(
                 "accumulator descriptor/schema identity does not match the metric registry"

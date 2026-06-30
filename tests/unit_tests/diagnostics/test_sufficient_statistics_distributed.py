@@ -19,7 +19,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.training.diagnostics.accumulator import PackedSufficientStatistics
+from megatron.training.diagnostics.accumulator import (
+    PackedSufficientStatistics,
+    ReductionBinding,
+)
 
 
 @pytest.fixture(scope="module")
@@ -47,14 +50,17 @@ def test_default_all_reduce_path_pools_real_multi_rank_gloo_statistics(
     group = dist.new_group(backend="gloo")
     rank = dist.get_rank()
     accumulator = PackedSufficientStatistics(
-        ("gloo",), "cpu", descriptor_hash="distributed-gloo-v1"
+        ("gloo",),
+        "cpu",
+        descriptor_hash="distributed-gloo-v1",
+        reduction_binding=ReductionBinding.flat_world(group),
     )
     if rank == 0:
         accumulator.add_masked_tensor("gloo", torch.tensor([1.0, 2.0]))
     elif rank == 1:
         accumulator.add_masked_tensor("gloo", torch.tensor([3.0, 4.0]))
 
-    accumulator.reduce_(group=group)
+    accumulator.reduce_()
 
     assert accumulator.sum_pack.dtype == torch.float64
     assert accumulator.max_pack.dtype == torch.float32
@@ -82,14 +88,17 @@ def test_default_all_reduce_path_supports_nccl_dtypes_and_zero_contributor(
     torch.cuda.set_device(device)
     group = dist.new_group(backend="nccl")
     accumulator = PackedSufficientStatistics(
-        ("nccl",), device, descriptor_hash="distributed-nccl-v1"
+        ("nccl",),
+        device,
+        descriptor_hash="distributed-nccl-v1",
+        reduction_binding=ReductionBinding.flat_world(group),
     )
     if dist.get_rank() == 0:
         accumulator.add_masked_tensor(
             "nccl", torch.tensor([2.0, 4.0], dtype=torch.bfloat16, device=device)
         )
 
-    accumulator.reduce_(group=group)
+    accumulator.reduce_()
 
     assert accumulator.sum_pack.dtype == torch.float64
     assert accumulator.sum_pack.device == device
