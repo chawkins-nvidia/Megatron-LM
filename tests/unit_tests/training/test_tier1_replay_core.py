@@ -4,12 +4,16 @@ import contextlib
 import math
 import random
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.datasets.data_samplers import (
     MegatronPretrainingRandomSampler,
     MegatronPretrainingSampler,
@@ -28,11 +32,14 @@ from megatron.training.diagnostics.diagnostic_replay import (
     RecordedBatch,
     ReplayIterator,
     ReplayMemoryConfig,
+    ReplayMemoryPolicy,
+    ReplayPreflightError,
     ReplayRestorationError,
     ReplayStateGuard,
     SamplePopulation,
     StableSampleDataset,
     Tier1ReplayEngine,
+    _systematic_positions,
     broadcast_replay_plan,
     build_distributed_source_plan,
     build_local_replay_plan,
@@ -62,24 +69,14 @@ class _MappingDataset(Dataset):
 
 
 def _raw_batch(
-    indices: tuple[int, ...] = (3, 7),
-    *,
-    epoch: int = 2,
-    sequence_length: int = 8,
+    indices: tuple[int, ...] = (3, 7), *, epoch: int = 2, sequence_length: int = 8
 ) -> dict[str, torch.Tensor]:
     batch = len(indices)
     return {
-        "tokens": torch.arange(batch * sequence_length, dtype=torch.int64).view(
-            batch, -1
-        ),
-        "labels": torch.arange(batch * sequence_length, dtype=torch.int64).view(
-            batch, -1
-        )
-        + 1,
+        "tokens": torch.arange(batch * sequence_length, dtype=torch.int64).view(batch, -1),
+        "labels": torch.arange(batch * sequence_length, dtype=torch.int64).view(batch, -1) + 1,
         "loss_mask": torch.ones(batch, sequence_length, dtype=torch.float32),
-        "position_ids": torch.arange(sequence_length, dtype=torch.int64).expand(
-            batch, -1
-        ),
+        "position_ids": torch.arange(sequence_length, dtype=torch.int64).expand(batch, -1),
         SAMPLE_INDEX_FIELD: torch.tensor(indices, dtype=torch.int64),
         SAMPLE_EPOCH_FIELD: torch.full((batch,), epoch, dtype=torch.int64),
     }
@@ -92,10 +89,7 @@ def _plan(*, target_microbatches: int = 2, sequence_length: int = 8):
         recorded, populations, probe_tokens=2, run_seed=11, event_id=5
     )
     return build_local_replay_plan(
-        recorded,
-        selected,
-        micro_batch_size=2,
-        target_microbatches=target_microbatches,
+        recorded, selected, micro_batch_size=2, target_microbatches=target_microbatches
     )
 
 
@@ -152,23 +146,17 @@ def test_cyclic_identity_crosses_persistent_worker_epochs_and_resume(
         data_parallel_size=2,
         data_sharding=data_sharding,
     )
-    loader = DataLoader(
-        dataset, batch_sampler=sampler, num_workers=2, persistent_workers=True
-    )
+    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=2, persistent_workers=True)
 
     first = [
         (int(epoch), int(index))
         for batch in loader
-        for epoch, index in zip(
-            batch[SAMPLE_EPOCH_FIELD], batch[SAMPLE_INDEX_FIELD], strict=True
-        )
+        for epoch, index in zip(batch[SAMPLE_EPOCH_FIELD], batch[SAMPLE_INDEX_FIELD], strict=True)
     ]
     second = [
         (int(epoch), int(index))
         for batch in loader
-        for epoch, index in zip(
-            batch[SAMPLE_EPOCH_FIELD], batch[SAMPLE_INDEX_FIELD], strict=True
-        )
+        for epoch, index in zip(batch[SAMPLE_EPOCH_FIELD], batch[SAMPLE_INDEX_FIELD], strict=True)
     ]
     resumed = MegatronPretrainingRandomSampler(
         dataset,
@@ -186,10 +174,7 @@ def test_cyclic_identity_crosses_persistent_worker_epochs_and_resume(
     assert {epoch for epoch, _index in first} == {0}
     assert {epoch for epoch, _index in second} == {1}
     assert {identity.epoch for identity in third} == {2}
-    assert (
-        len(set(first + second + [(item.epoch, item.sampler_index) for item in third]))
-        == 36
-    )
+    assert len(set(first + second + [(item.epoch, item.sampler_index) for item in third])) == 36
 
 
 def test_replay_does_not_advance_sampler_and_masks_filler_deterministically() -> None:
@@ -208,13 +193,9 @@ def test_replay_does_not_advance_sampler_and_masks_filler_deterministically() ->
         SamplePopulation(recorded[0].samples[0].sample_id, 8),
         SamplePopulation(recorded[0].samples[1].sample_id, 8),
     )
-    selected = select_local_token_ids(
-        recorded, populations, probe_tokens=1, run_seed=3, event_id=9
-    )
+    selected = select_local_token_ids(recorded, populations, probe_tokens=1, run_seed=3, event_id=9)
 
-    plan = build_local_replay_plan(
-        recorded, selected, micro_batch_size=2, target_microbatches=3
-    )
+    plan = build_local_replay_plan(recorded, selected, micro_batch_size=2, target_microbatches=3)
 
     assert sampler.consumed_samples == consumed
     assert plan.num_microbatches == 3
@@ -224,6 +205,37 @@ def test_replay_does_not_advance_sampler_and_masks_filler_deterministically() ->
     assert plan.microbatches[1].sample_ids == plan.microbatches[2].sample_ids
 
 
+def test_systematic_grid_is_exactly_uniform_and_seed_replay_is_unbiased() -> None:
+    exhaustive = [_systematic_positions(total=7, selected=3, offset=offset) for offset in range(7)]
+    assert [sum(position in grid for grid in exhaustive) for position in range(7)] == [3] * 7
+
+    raw = _raw_batch(indices=(10, 20), sequence_length=2)
+    raw["loss_mask"] = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
+    recorded = (RecordedBatch.from_raw(raw),)
+    populations = local_sample_populations(recorded)
+    counts = {10: 0, 20: 0}
+    for seed in range(6000):
+        selected = select_local_token_ids(
+            recorded, populations, probe_tokens=1, run_seed=seed, event_id=9
+        )
+        replayed = select_local_token_ids(
+            recorded, populations, probe_tokens=1, run_seed=seed, event_id=9
+        )
+        assert selected == replayed
+        counts[selected[0].sample.sampler_index] += 1
+
+    assert counts[10] / 6000 == pytest.approx(1 / 3, abs=0.025)
+    assert counts[20] / 6000 == pytest.approx(2 / 3, abs=0.025)
+
+
+def test_raw_replay_fields_are_fixed_and_attention_masks_fail_closed() -> None:
+    raw = _raw_batch()
+    raw["attention_mask"] = torch.ones(2, 1, 8, 8, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="exactly the fixed"):
+        RecordedBatch.from_raw(raw)
+
+
 def test_fixed_plan_codec_constructs_equal_neutral_non_source_plan() -> None:
     source = _plan()
     codec = FixedPlanCodec(8, 4, 2, 8)
@@ -231,11 +243,7 @@ def test_fixed_plan_codec_constructs_equal_neutral_non_source_plan() -> None:
     readiness = ReadinessConsensus(binding)
 
     received = broadcast_replay_plan(
-        source,
-        codec=codec,
-        binding=binding,
-        source_group_rank=0,
-        readiness=readiness,
+        source, codec=codec, binding=binding, source_group_rank=0, readiness=readiness
     )
     integer, mask = codec.allocate("cpu")
     codec.encode(source, integer, mask)
@@ -252,9 +260,7 @@ def test_bounded_population_workspace_builds_deterministic_source_plan() -> None
     recorded = (RecordedBatch.from_raw(_raw_batch()),)
     binding = CollectiveBinding("dp", None, 1)
     readiness = ReadinessConsensus(binding)
-    workspace = PopulationCollectiveWorkspace(
-        binding, maximum_local_samples=4, device="cpu"
-    )
+    workspace = PopulationCollectiveWorkspace(binding, maximum_local_samples=4, device="cpu")
 
     first = build_distributed_source_plan(
         recorded,
@@ -283,13 +289,8 @@ def test_bounded_population_workspace_builds_deterministic_source_plan() -> None
 
 @pytest.mark.parametrize("sequence_length", (128, 1024))
 @pytest.mark.parametrize("micro_batch_size", (1, 4))
-def test_cp_sp_mask_slicing_matches_layout(
-    sequence_length: int, micro_batch_size: int
-) -> None:
-    mask = (
-        torch.arange(micro_batch_size * sequence_length).view(micro_batch_size, -1) % 3
-        == 0
-    )
+def test_cp_sp_mask_slicing_matches_layout(sequence_length: int, micro_batch_size: int) -> None:
+    mask = torch.arange(micro_batch_size * sequence_length).view(micro_batch_size, -1) % 3 == 0
     cp, sp = slice_replay_mask(
         mask,
         context_parallel_size=4,
@@ -345,9 +346,7 @@ def _raise_fault() -> None:
         "overlap_verify",
     ),
 )
-def test_every_restore_stage_fault_still_attempts_later_restorations(
-    stage: str,
-) -> None:
+def test_every_restore_stage_fault_still_attempts_later_restorations(stage: str) -> None:
     model = _StatefulModel()
     tracker = _Tracker()
     plan = _plan(target_microbatches=1)
@@ -406,6 +405,7 @@ def test_iterator_and_sampler_identity_are_restored_independently() -> None:
 
     with ReplayStateGuard(
         (model,),
+        mutable_buffer_names=("cache",),
         replay_iterators=(replay_iterator,),
         samplers=(sampler,),
         tracker_getter=lambda: tracker,
@@ -422,7 +422,9 @@ def test_iterator_and_sampler_identity_are_restored_independently() -> None:
 def test_bogus_rng_tracker_is_rejected_before_replay() -> None:
     model = _StatefulModel()
     with pytest.raises(TypeError, match="get_states/set_states"):
-        with ReplayStateGuard((model,), tracker_getter=lambda: object()):
+        with ReplayStateGuard(
+            (model,), mutable_buffer_names=("cache",), tracker_getter=lambda: object()
+        ):
             pass
 
 
@@ -433,9 +435,41 @@ def test_active_overlap_state_is_rejected_before_capture() -> None:
 
     with pytest.raises(ValueError, match="quiescent overlap"):
         with ReplayStateGuard(
-            (model,), overlap_objects=(overlap,), tracker_getter=lambda: tracker
+            (model,),
+            mutable_buffer_names=("cache",),
+            overlap_objects=(overlap,),
+            tracker_getter=lambda: tracker,
         ):
             pass
+
+
+def test_undeclared_registered_buffer_is_rejected_before_mutation() -> None:
+    model = _StatefulModel()
+    tracker = _Tracker()
+
+    with pytest.raises(ValueError, match="registered model buffers"):
+        with ReplayStateGuard((model,), tracker_getter=lambda: tracker):
+            model.cache.fill_(99)
+
+    assert model.cache.item() == 2
+
+
+def test_declared_buffer_registry_and_lazily_created_cache_are_restored() -> None:
+    model = _StatefulModel()
+    tracker = _Tracker()
+    original_cache = model.cache
+
+    with ReplayStateGuard(
+        (model,), mutable_buffer_names=("cache",), tracker_getter=lambda: tracker
+    ):
+        model.cache = torch.tensor([99.0])
+        model.register_buffer("replay_only", torch.tensor([7.0]))
+        model._decoder_hidden_states_cache = torch.tensor([5.0])
+
+    assert model.cache is original_cache
+    assert model.cache.item() == 2
+    assert "replay_only" not in model._buffers
+    assert not hasattr(model, "_decoder_hidden_states_cache")
 
 
 class _Probe:
@@ -462,9 +496,7 @@ class _Probe:
         return None
 
 
-def test_pp2_noninterleaved_schedule_runs_multiple_microbatches_and_accumulation() -> (
-    None
-):
+def test_pp2_noninterleaved_schedule_runs_multiple_microbatches_and_accumulation() -> None:
     plan = _plan(target_microbatches=3)
     model = torch.nn.Identity()
     accumulation = []
@@ -540,19 +572,40 @@ def test_interleaved_schedule_is_rejected() -> None:
         )
 
 
-def test_engine_prepare_makes_memory_preflight_mandatory() -> None:
+def _dense_gpt_stub() -> GPTModel:
+    model = GPTModel.__new__(GPTModel)
+    torch.nn.Module.__init__(model)
+    model.config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        transformer_impl="local",
+        params_dtype=torch.float32,
+    )
+    model.model_type = ModelType.encoder_or_decoder
+    model.mtp_process = False
+    return model
+
+
+def test_engine_prepare_makes_memory_preflight_mandatory_and_engine_owned() -> None:
     binding = CollectiveBinding("world", None, 1)
     tracker = _Tracker()
+    model = _dense_gpt_stub()
     engine = Tier1ReplayEngine(
-        (torch.nn.Identity(),),
-        readiness=ReadinessConsensus(binding),
-        tracker_getter=lambda: tracker,
+        (model,), readiness=ReadinessConsensus(binding), tracker_getter=lambda: tracker
     )
     probe = _Probe(2)
-    schedule = type("Schedule", (), {"p2p_started": False, "completed": False})()
-    schedule.__call__ = lambda plan, response_probe, phase: None
-    estimate = estimate_replay_memory(
-        _memory_config(sequence_length=128, hidden_size=256, ffn_hidden_size=1024)
+    probe.global_layers = 1
+    probe.descriptors = (SimpleNamespace(global_layer=0),)
+    schedule = NonInterleavedReplaySchedule(
+        forward_backward_func=lambda **kwargs: None,
+        forward_step_func=lambda *args: None,
+        model=(model,),
+        sequence_length=8,
+        micro_batch_size=2,
+        probe_device="cpu",
+        tensor_parallel_rank=0,
+        tensor_parallel_size=1,
     )
 
     with pytest.raises(ReplayPreflightError, match="failed collectively"):
@@ -560,8 +613,19 @@ def test_engine_prepare_makes_memory_preflight_mandatory() -> None:
             plan=_plan(),
             probe=probe,
             schedule=schedule,
-            memory_estimate=estimate,
+            memory_policy=ReplayMemoryPolicy(),
             maximum_extra_bytes=0,
+            currently_reserved_bytes=0,
+            total_device_bytes=2**40,
+        )
+
+    with pytest.raises(TypeError, match="memory_estimate"):
+        engine.prepare(
+            plan=_plan(),
+            probe=probe,
+            schedule=schedule,
+            memory_estimate=ReplayMemoryConfig,  # type: ignore[call-arg]
+            maximum_extra_bytes=2**40,
             currently_reserved_bytes=0,
             total_device_bytes=2**40,
         )
@@ -580,7 +644,9 @@ def _memory_config(**overrides) -> ReplayMemoryConfig:
         local_layers=16,
         hidden_size=4096,
         ffn_hidden_size=16384,
+        num_attention_heads=32,
         selected_tokens=256,
+        replay_microbatches=64,
         element_size=2,
         rng_snapshot_bytes=8192,
         model_state_bytes=32768,
@@ -589,6 +655,10 @@ def _memory_config(**overrides) -> ReplayMemoryConfig:
         headroom_fraction=0.1,
     )
     values.update(overrides)
+    if "replay_microbatches" not in overrides:
+        values["replay_microbatches"] = math.ceil(
+            min(values["global_batch_size"], values["selected_tokens"]) / values["micro_batch_size"]
+        )
     return ReplayMemoryConfig(**values)
 
 
@@ -596,9 +666,7 @@ def test_memory_prediction_bounds_all_fake_device_allocations() -> None:
     estimate = estimate_replay_memory(
         _memory_config(sequence_length=128, hidden_size=256, ffn_hidden_size=1024)
     )
-    allocations = [
-        torch.empty(value, dtype=torch.uint8) for _name, value in estimate.terms
-    ]
+    allocations = [torch.empty(value, dtype=torch.uint8) for _name, value in estimate.terms]
     measured = sum(tensor.numel() * tensor.element_size() for tensor in allocations)
 
     assert measured == sum(value for _name, value in estimate.terms)
@@ -606,9 +674,34 @@ def test_memory_prediction_bounds_all_fake_device_allocations() -> None:
     assert estimate.predicted_allocated_bytes <= estimate.predicted_reserved_bytes
 
 
-def test_memory_model_scales_all_topology_dimensions_without_dp_cp_duplication() -> (
-    None
-):
+def test_memory_model_counts_every_padded_replay_microbatch() -> None:
+    one = estimate_replay_memory(
+        _memory_config(
+            sequence_length=128,
+            hidden_size=256,
+            ffn_hidden_size=1024,
+            selected_tokens=1,
+            global_batch_size=1,
+            micro_batch_size=1,
+            replay_microbatches=1,
+        )
+    )
+    padded = estimate_replay_memory(
+        _memory_config(
+            sequence_length=128,
+            hidden_size=256,
+            ffn_hidden_size=1024,
+            selected_tokens=1,
+            global_batch_size=1,
+            micro_batch_size=1,
+            replay_microbatches=4,
+        )
+    )
+
+    assert padded.term("host_replay_inputs") == 4 * one.term("host_replay_inputs")
+
+
+def test_memory_model_scales_all_topology_dimensions_without_dp_cp_duplication() -> None:
     base = estimate_replay_memory(_memory_config())
     longer = estimate_replay_memory(_memory_config(sequence_length=2048))
     larger_mbs = estimate_replay_memory(_memory_config(micro_batch_size=8))
@@ -617,22 +710,17 @@ def test_memory_model_scales_all_topology_dimensions_without_dp_cp_duplication()
     )
     more_dp = estimate_replay_memory(_memory_config(data_parallel_size=16))
     more_tp = estimate_replay_memory(_memory_config(tensor_parallel_size=8))
-    more_pp = estimate_replay_memory(
-        _memory_config(pipeline_parallel_size=4, local_layers=8)
-    )
+    more_pp = estimate_replay_memory(_memory_config(pipeline_parallel_size=4, local_layers=8))
     more_cp = estimate_replay_memory(_memory_config(context_parallel_size=4))
 
     assert longer.predicted_allocated_bytes > base.predicted_allocated_bytes
-    assert larger_mbs.term("device_full_and_cp_inputs") > base.term(
-        "device_full_and_cp_inputs"
-    )
+    assert larger_mbs.term("device_full_and_cp_inputs") > base.term("device_full_and_cp_inputs")
     assert larger_gbs.term("host_replay_inputs") > base.term("host_replay_inputs")
-    assert more_dp.term("retained_response_rows") < base.term("retained_response_rows")
+    assert more_dp.term("retained_response_rows") == base.term("retained_response_rows")
     assert more_tp.term("retained_response_rows") < base.term("retained_response_rows")
     assert more_pp.term("retained_response_rows") < base.term("retained_response_rows")
-    assert more_cp.term("device_full_and_cp_inputs") < base.term(
-        "device_full_and_cp_inputs"
-    )
+    assert more_cp.term("device_full_and_cp_inputs") < base.term("device_full_and_cp_inputs")
+    assert more_cp.term("retained_response_rows") == base.term("retained_response_rows")
 
 
 def test_modeled_world_size_1024_has_bounded_cardinality() -> None:
@@ -658,4 +746,29 @@ def test_modeled_world_size_1024_has_bounded_cardinality() -> None:
     )
     assert len(estimate.terms) == 11
     assert estimate.term("packed_statistics") == estimate.term("reduction_arena")
-    assert estimate.term("packed_statistics") == config.global_layers * 5 * 96
+    assert estimate.term("packed_statistics") == config.global_layers * 8 * 96
+
+
+def test_memory_bound_covers_tp0_and_dp_cp_concentration() -> None:
+    concentrated = estimate_replay_memory(
+        _memory_config(
+            selected_tokens=1,
+            global_batch_size=1,
+            data_parallel_size=4,
+            context_parallel_size=2,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            global_layers=1,
+            local_layers=1,
+            hidden_size=16,
+            ffn_hidden_size=64,
+            num_attention_heads=4,
+            sequence_length=8,
+            micro_batch_size=1,
+            element_size=4,
+        )
+    )
+
+    expected_response = (16 + 24 + 16 + 32 + 16) * 4
+    assert concentrated.term("retained_response_rows") == expected_response
+    assert concentrated.term("retained_response_rows") >= 416

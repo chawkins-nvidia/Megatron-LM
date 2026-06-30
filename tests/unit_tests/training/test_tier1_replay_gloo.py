@@ -44,15 +44,9 @@ def _raw_batch():
 def _source_plan():
     recorded = (RecordedBatch.from_raw(_raw_batch()),)
     selected = select_local_token_ids(
-        recorded,
-        local_sample_populations(recorded),
-        probe_tokens=3,
-        run_seed=19,
-        event_id=4,
+        recorded, local_sample_populations(recorded), probe_tokens=3, run_seed=19, event_id=4
     )
-    return build_local_replay_plan(
-        recorded, selected, micro_batch_size=2, target_microbatches=2
-    )
+    return build_local_replay_plan(recorded, selected, micro_batch_size=2, target_microbatches=2)
 
 
 def _write_result(directory: str, rank: int, result: str) -> None:
@@ -61,6 +55,12 @@ def _write_result(directory: str, rank: int, result: str) -> None:
 
 def _init(rank: int, init_method: str) -> None:
     dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2)
+
+
+def _shutdown() -> None:
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def _plan_worker(rank: int, init_method: str, directory: str) -> None:
@@ -75,12 +75,8 @@ def _plan_worker(rank: int, init_method: str, directory: str) -> None:
             source_group_rank=0,
             readiness=readiness,
         )
-        verify_replay_plan_consensus(
-            plan, binding=binding, readiness=readiness, device="cpu"
-        )
-        digest = torch.tensor(
-            list(bytes.fromhex(plan.metadata.descriptor_hash)), dtype=torch.uint8
-        )
+        verify_replay_plan_consensus(plan, binding=binding, readiness=readiness, device="cpu")
+        digest = torch.tensor(list(bytes.fromhex(plan.metadata.descriptor_hash)), dtype=torch.uint8)
         minimum = digest.clone()
         maximum = digest.clone()
         dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
@@ -91,7 +87,7 @@ def _plan_worker(rank: int, init_method: str, directory: str) -> None:
         assert len(plan.microbatches) == (2 if rank == 0 else 0)
         _write_result(directory, rank, "ok")
     finally:
-        dist.destroy_process_group()
+        _shutdown()
 
 
 def _descriptor_worker(rank: int, init_method: str, directory: str) -> None:
@@ -108,7 +104,7 @@ def _descriptor_worker(rank: int, init_method: str, directory: str) -> None:
             verify_response_descriptor_consensus(probe.accumulator)
         _write_result(directory, rank, "rejected")
     finally:
-        dist.destroy_process_group()
+        _shutdown()
 
 
 def _readiness_worker(rank: int, init_method: str, directory: str) -> None:
@@ -120,12 +116,15 @@ def _readiness_worker(rank: int, init_method: str, directory: str) -> None:
             readiness.settle(local_error, "capture")
         _write_result(directory, rank, "settled")
     finally:
-        dist.destroy_process_group()
+        _shutdown()
 
 
 class _Probe:
     expected_hook_calls = 2
     descriptor_hash = "test"
+
+    def __init__(self, release_fault: bool = False) -> None:
+        self.release_fault = release_fault
 
     @contextlib.contextmanager
     def capture_pre(self):
@@ -142,6 +141,8 @@ class _Probe:
         return self
 
     def release(self):
+        if self.release_fault:
+            raise RuntimeError("injected probe release fault")
         return None
 
 
@@ -155,7 +156,7 @@ class _FaultSchedule:
     def __call__(self, plan, probe, phase):
         self.p2p_started = True
         dist.barrier()
-        if self.fault == "schedule" and self.rank == 0:
+        if self.fault in ("schedule", "cleanup_schedule") and self.rank == 0:
             raise RuntimeError("injected schedule fault")
         self.completed = True
 
@@ -180,9 +181,7 @@ class _FatalRaised(RuntimeError):
     pass
 
 
-def _transaction_worker(
-    rank: int, init_method: str, directory: str, fault: str
-) -> None:
+def _transaction_worker(rank: int, init_method: str, directory: str, fault: str) -> None:
     _init(rank, init_method)
     tracker = _FailOnSecondSetTracker(fail=fault == "restore" and rank == 0)
 
@@ -197,7 +196,7 @@ def _transaction_worker(
     transaction = Tier1ReplayTransaction(
         models=(torch.nn.Identity(),),
         plan=_source_plan(),
-        probe=_Probe(),
+        probe=_Probe(release_fault=fault == "cleanup_schedule" and rank == 0),
         schedule=_FaultSchedule(rank, fault),
         readiness=ReadinessConsensus(CollectiveBinding("world", None, 2)),
         mutable_buffer_names=(),
@@ -221,16 +220,46 @@ def _run_two_rank(tmp_path: Path, worker, *args: str) -> list[str]:
     init_file = tmp_path / "gloo-init"
     result_dir = tmp_path / "results"
     result_dir.mkdir()
-    mp.spawn(
-        worker,
-        args=(f"file://{init_file}", str(result_dir), *args),
-        nprocs=2,
-        join=True,
+    mp.spawn(worker, args=(f"file://{init_file}", str(result_dir), *args), nprocs=2, join=True)
+    return [(result_dir / f"rank-{rank}.txt").read_text(encoding="utf-8") for rank in range(2)]
+
+
+def _pre_schedule_fault_worker(rank: int, init_method: str, directory: str, fault: str) -> None:
+    _init(rank, init_method)
+    tracker: object = _FailOnSecondSetTracker(fail=False)
+    model: torch.nn.Module = torch.nn.Identity()
+    overlap_objects: tuple[object, ...] = ()
+    if rank == 0 and fault == "model":
+        model.register_buffer("undeclared_cache", torch.tensor([1.0]))
+    if rank == 0 and fault == "overlap":
+        overlap_objects = (type("Overlap", (), {"param_gather_handle": object()})(),)
+    if rank == 0 and fault == "tracker":
+        tracker = object()
+    schedule = _FaultSchedule(rank, "none")
+    transaction = Tier1ReplayTransaction(
+        models=(model,),
+        plan=_source_plan(),
+        probe=_Probe(),
+        schedule=schedule,
+        readiness=ReadinessConsensus(CollectiveBinding("world", None, 2)),
+        mutable_buffer_names=(),
+        tracker_getter=lambda: tracker,
+        cuda_device=None,
+        samplers=(),
+        overlap_objects=overlap_objects,
+        fatal_abort=lambda error: (_ for _ in ()).throw(_FatalRaised(str(error))),
     )
-    return [
-        (result_dir / f"rank-{rank}.txt").read_text(encoding="utf-8")
-        for rank in range(2)
-    ]
+    try:
+        transaction.run_pre()
+    except ReplayPreflightError:
+        _write_result(
+            directory,
+            rank,
+            "settled-no-schedule" if not schedule.p2p_started else "schedule-called",
+        )
+    finally:
+        if dist.is_initialized():
+            _shutdown()
 
 
 def test_two_rank_tp_source_non_source_plan_equality(tmp_path: Path) -> None:
@@ -245,8 +274,16 @@ def test_two_rank_one_rank_capture_fault_settles_without_hang(tmp_path: Path) ->
     assert _run_two_rank(tmp_path, _readiness_worker) == ["settled", "settled"]
 
 
-@pytest.mark.parametrize("fault", ("schedule", "restore"))
-def test_two_rank_post_p2p_fault_is_fatal_on_every_rank(
+@pytest.mark.parametrize("fault", ("overlap", "model", "tracker"))
+def test_two_rank_guard_fault_settles_before_peer_barrier_schedule(
     tmp_path: Path, fault: str
 ) -> None:
+    assert _run_two_rank(tmp_path, _pre_schedule_fault_worker, fault) == [
+        "settled-no-schedule",
+        "settled-no-schedule",
+    ]
+
+
+@pytest.mark.parametrize("fault", ("schedule", "restore", "cleanup_schedule"))
+def test_two_rank_post_p2p_fault_is_fatal_on_every_rank(tmp_path: Path, fault: str) -> None:
     assert _run_two_rank(tmp_path, _transaction_worker, fault) == ["fatal", "fatal"]

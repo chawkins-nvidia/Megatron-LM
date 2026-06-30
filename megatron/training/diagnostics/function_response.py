@@ -44,9 +44,18 @@ class ResponseFamily(StrEnum):
 
 RESPONSE_FAMILIES: tuple[ResponseFamily, ...] = tuple(ResponseFamily)
 _FAMILY_INDEX = {family: index for index, family in enumerate(RESPONSE_FAMILIES)}
-_RESIDUAL_DEPTH_NAMES = ("first", "q25", "mid", "q75", "last")
+_RESIDUAL_DEPTH_NAMES = ("first", "q1", "middle", "q3", "last")
 _QUANTILE_NAMES = ("p10", "p50", "p90")
-TIER1_PREFIX = "diag/v2/tier1/"
+_ATTENTION_METRICS = ("logit_abs", "entropy", "collapse")
+_STARVATION_FAMILIES = (
+    ResponseFamily.QKV,
+    ResponseFamily.ATTN_OUT,
+    ResponseFamily.FC1,
+    ResponseFamily.FC2,
+    ResponseFamily.RESIDUAL,
+)
+TIER1_PREFIX = "diag/v2/t1/response/"
+TIER1_ATTENTION_PREFIX = "diag/v2/t1/attention/"
 TIER1_KEYS: tuple[str, ...] = (
     *(
         f"{TIER1_PREFIX}residual/dy_rel/{name}"
@@ -57,8 +66,12 @@ TIER1_KEYS: tuple[str, ...] = (
         for family in ("qkv", "attn_out", "fc1", "fc2")
         for name in _QUANTILE_NAMES
     ),
-    *(f"{TIER1_PREFIX}{family.value}/starved_fraction" for family in RESPONSE_FAMILIES),
-    *(f"{TIER1_PREFIX}{family.value}/valid_fraction" for family in RESPONSE_FAMILIES),
+    *(f"{TIER1_PREFIX}{family.value}/starved_fraction" for family in _STARVATION_FAMILIES),
+    f"{TIER1_ATTENTION_PREFIX}logit_abs_p50",
+    f"{TIER1_ATTENTION_PREFIX}logit_abs_p90",
+    f"{TIER1_ATTENTION_PREFIX}entropy_p10",
+    f"{TIER1_ATTENTION_PREFIX}entropy_p50",
+    f"{TIER1_ATTENTION_PREFIX}collapse_fraction",
 )
 
 
@@ -129,22 +142,15 @@ def discover_response_hooks(
                         global_layer=global_layer,
                         family=family,
                         module=modules[family],
-                        owner=feature_sharded
-                        or sequence_parallel
-                        or tensor_parallel_rank == 0,
+                        owner=feature_sharded or sequence_parallel or tensor_parallel_rank == 0,
                         sequence_sharded=sequence_sharded,
                         affine_bias_output=family != ResponseFamily.RESIDUAL,
                     )
                 )
     if discovered != set(expected):
-        raise ValueError(
-            f"missing local response layers: {sorted(set(expected) - discovered)}"
-        )
+        raise ValueError(f"missing local response layers: {sorted(set(expected) - discovered)}")
     descriptors.sort(
-        key=lambda descriptor: (
-            descriptor.global_layer,
-            _FAMILY_INDEX[descriptor.family],
-        )
+        key=lambda descriptor: (descriptor.global_layer, _FAMILY_INDEX[descriptor.family])
     )
     return tuple(descriptors)
 
@@ -154,9 +160,7 @@ def _validate_descriptor_order(descriptors: Sequence[ResponseHookDescriptor]) ->
     if len(keys) != len(set(keys)):
         raise ValueError("response hook descriptors contain duplicate global slots")
     if keys != tuple(sorted(keys, key=lambda key: (key[0], _FAMILY_INDEX[key[1]]))):
-        raise ValueError(
-            "response hook descriptors are not in canonical global slot order"
-        )
+        raise ValueError("response hook descriptors are not in canonical global slot order")
 
 
 def _response_registry(
@@ -164,6 +168,7 @@ def _response_registry(
     *,
     global_layers: int,
     sequence_parallel: bool,
+    attention_owner: bool,
     reduction_binding: ReductionBinding,
 ) -> MetricRegistry:
     _validate_descriptor_order(descriptors)
@@ -214,9 +219,34 @@ def _response_registry(
                 )
             )
             owners.append(bool(hook is not None and hook.owner))
-    return MetricRegistry(
-        metrics, reduction_binding=reduction_binding, local_owners=owners
-    )
+    for layer in range(global_layers):
+        for metric in _ATTENTION_METRICS:
+            metrics.append(
+                MetricDescriptor(
+                    logical_name=f"tier1/attention/layer/{layer}/{metric}",
+                    family=MetricFamily.ATTN_OUT,
+                    global_layer=layer,
+                    partition_axes=(
+                        PartitionAxis.DATA_SAMPLE,
+                        PartitionAxis.PIPELINE_LAYER,
+                        PartitionAxis.CONTEXT_SEQUENCE,
+                        PartitionAxis.TENSOR_FEATURE,
+                    ),
+                    replication_axes=(),
+                    replication_multiplicity=1,
+                    ownership=Ownership.PIPELINE_STAGE,
+                    mask_kind=MaskKind.NONE,
+                    statistic_kind=StatisticKind.TENSOR_MOMENTS,
+                    denominator_kind=DenominatorKind.SELECTED_ELEMENTS,
+                    normalization_kind=NormalizationKind.NONE,
+                    process_group_identity=reduction_binding.process_group_identity,
+                    reduction_kind=reduction_binding.reduction_kind,
+                    tied_owner_identity=None,
+                    packed_slots=PackedSlots.for_index(len(metrics)),
+                )
+            )
+            owners.append(attention_owner and layer in {key[0] for key in local})
+    return MetricRegistry(metrics, reduction_binding=reduction_binding, local_owners=owners)
 
 
 @dataclass
@@ -254,9 +284,7 @@ def verify_response_descriptor_consensus(
     )
     digest = bytes.fromhex(accumulator.descriptor_hash)
     wire = torch.tensor(
-        [len(accumulator.registry.slot_names), *digest],
-        dtype=torch.int64,
-        device=device,
+        [len(accumulator.registry.slot_names), *digest], dtype=torch.int64, device=device
     )
     minimum = wire.clone()
     maximum = wire.clone()
@@ -321,6 +349,7 @@ class FunctionResponseProbe:
         device: torch.device | str,
         expected_hook_calls: int,
         sequence_parallel: bool = False,
+        attention_owner: bool = True,
         reduction_binding: ReductionBinding | None = None,
         scratch_element_capacity: int = 16 * 1024,
     ) -> None:
@@ -337,6 +366,7 @@ class FunctionResponseProbe:
             self.descriptors,
             global_layers=global_layers,
             sequence_parallel=sequence_parallel,
+            attention_owner=attention_owner,
             reduction_binding=binding,
         )
         statistics = PackedSufficientStatistics(
@@ -350,6 +380,7 @@ class FunctionResponseProbe:
         self._pre_rows: dict[tuple[int, ResponseFamily], list[torch.Tensor]] = {}
         self._pre_calls: dict[tuple[int, ResponseFamily], int] = {}
         self._post_calls: dict[tuple[int, ResponseFamily], int] = {}
+        self._attention_calls: dict[int, int] = {}
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._phase: str | None = None
         self._full_mask: torch.Tensor | None = None
@@ -363,19 +394,13 @@ class FunctionResponseProbe:
         return self.registry.descriptor_hash
 
     def set_masks(
-        self,
-        full_mask: torch.Tensor,
-        *,
-        sequence_parallel_mask: torch.Tensor | None = None,
+        self, full_mask: torch.Tensor, *, sequence_parallel_mask: torch.Tensor | None = None
     ) -> None:
         """Set CP-local and optional SP-local masks for one schedule microbatch."""
 
         if full_mask.device != self.device:
             raise ValueError("response mask is on the wrong device")
-        if (
-            sequence_parallel_mask is not None
-            and sequence_parallel_mask.device != self.device
-        ):
+        if sequence_parallel_mask is not None and sequence_parallel_mask.device != self.device:
             raise ValueError("sequence-parallel response mask is on the wrong device")
         self._full_mask = full_mask
         self._sequence_mask = sequence_parallel_mask
@@ -397,9 +422,7 @@ class FunctionResponseProbe:
     @contextlib.contextmanager
     def _capture(self, phase: str) -> Iterator[None]:
         if self._phase is not None or self._finalized:
-            raise RuntimeError(
-                "response capture phases cannot overlap or follow finalize"
-            )
+            raise RuntimeError("response capture phases cannot overlap or follow finalize")
         self._phase = phase
         try:
             for descriptor in self.descriptors:
@@ -416,25 +439,81 @@ class FunctionResponseProbe:
             self._sequence_mask = None
 
     def _make_hook(self, descriptor: ResponseHookDescriptor):
-        def hook(
-            _module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any
-        ) -> None:
+        def hook(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
             try:
                 self._observe(descriptor, output)
             except (RuntimeError, TypeError, ValueError):
                 self.registry.mark_observation_error(
-                    self.accumulator.statistics,
-                    self.registry.slot_names[self._slot(descriptor)],
+                    self.accumulator.statistics, self.registry.slot_names[self._slot(descriptor)]
                 )
                 raise
 
         return hook
 
     def _slot(self, descriptor: ResponseHookDescriptor) -> int:
+        return descriptor.global_layer * len(RESPONSE_FAMILIES) + _FAMILY_INDEX[descriptor.family]
+
+    def _attention_slot(self, layer: int, metric: str) -> int:
         return (
-            descriptor.global_layer * len(RESPONSE_FAMILIES)
-            + _FAMILY_INDEX[descriptor.family]
+            self.global_layers * len(RESPONSE_FAMILIES)
+            + layer * len(_ATTENTION_METRICS)
+            + _ATTENTION_METRICS.index(metric)
         )
+
+    def observe_attention(
+        self,
+        layer: int,
+        logits: torch.Tensor,
+        probabilities: torch.Tensor,
+        *,
+        collapse_threshold: float = 0.9,
+    ) -> None:
+        """Accumulate selected-query attention statistics on the canonical pack.
+
+        The integration hook calls this with pre-softmax logits and normalized
+        probabilities shaped ``[batch, heads, query, key]`` during the post
+        replay.  Quantiles are later taken across pooled per-layer means; no
+        response value is relabeled as an attention statistic.
+        """
+
+        if self._phase != "post":
+            raise RuntimeError("attention observations belong to post replay")
+        if not 0 <= layer < self.global_layers:
+            raise ValueError("attention observation has an invalid global layer")
+        if (
+            logits.shape != probabilities.shape
+            or logits.ndim != 4
+            or logits.device != self.device
+            or probabilities.device != self.device
+        ):
+            raise ValueError("attention logits/probabilities have an invalid layout")
+        if not 0 < collapse_threshold <= 1:
+            raise ValueError("attention collapse threshold must be in (0, 1]")
+        mask = self._full_mask
+        if mask is None or mask.shape != (logits.shape[0], logits.shape[2]):
+            raise ValueError("attention observation does not match its selected-token mask")
+        selected = mask if mask.dtype == torch.bool else mask != 0
+        selected_logits = logits.permute(0, 2, 1, 3)[selected]
+        selected_probabilities = probabilities.permute(0, 2, 1, 3)[selected]
+        logit_abs = selected_logits.abs().mean(dim=-1)
+        entropy = -(
+            selected_probabilities
+            * selected_probabilities.clamp_min(torch.finfo(torch.float32).tiny).log()
+        ).sum(dim=-1)
+        collapse = (selected_probabilities.amax(dim=-1) >= collapse_threshold).to(
+            dtype=torch.float32
+        )
+        for metric, values in (
+            ("logit_abs", logit_abs),
+            ("entropy", entropy),
+            ("collapse", collapse),
+        ):
+            self.registry.add_masked_tensor(
+                self.accumulator.statistics,
+                self.registry.slot_names[self._attention_slot(layer, metric)],
+                values,
+            )
+        self._attention_calls[layer] = self._attention_calls.get(layer, 0) + 1
 
     def _observe(self, descriptor: ResponseHookDescriptor, output: Any) -> None:
         if self._phase not in ("pre", "post"):
@@ -459,21 +538,15 @@ class FunctionResponseProbe:
             self._pre_rows.pop(descriptor.key, None)
         logical_name = self.registry.slot_names[self._slot(descriptor)]
         if before is None or before.shape != rows.shape:
-            self.registry.mark_observation_error(
-                self.accumulator.statistics, logical_name
-            )
+            self.registry.mark_observation_error(self.accumulator.statistics, logical_name)
             return
-        self.registry.add_update(
-            self.accumulator.statistics, logical_name, before, rows.detach()
-        )
+        self.registry.add_update(self.accumulator.statistics, logical_name, before, rows.detach())
 
     def finalize(self) -> ResponseAccumulator:
         """Mark exact hook-cardinality errors and return neutral global slots."""
 
         if self._phase is not None or self._finalized:
-            raise RuntimeError(
-                "response probe finalizes exactly once after both schedules"
-            )
+            raise RuntimeError("response probe finalizes exactly once after both schedules")
         for descriptor in self.descriptors:
             if (
                 self._pre_calls.get(descriptor.key, 0) != self.expected_hook_calls
@@ -481,9 +554,16 @@ class FunctionResponseProbe:
                 or descriptor.key in self._pre_rows
             ):
                 self.registry.mark_observation_error(
-                    self.accumulator.statistics,
-                    self.registry.slot_names[self._slot(descriptor)],
+                    self.accumulator.statistics, self.registry.slot_names[self._slot(descriptor)]
                 )
+        local_layers = {descriptor.global_layer for descriptor in self.descriptors}
+        for layer in local_layers:
+            if self._attention_calls.get(layer, 0) != self.expected_hook_calls:
+                for metric in _ATTENTION_METRICS:
+                    self.registry.mark_observation_error(
+                        self.accumulator.statistics,
+                        self.registry.slot_names[self._attention_slot(layer, metric)],
+                    )
         self._pre_rows.clear()
         self._finalized = True
         return self.accumulator
@@ -530,9 +610,7 @@ class FunctionResponseResult:
         """Derive ratios only after canonical packed reduction/finalization."""
 
         if not accumulator.statistics.reduced:
-            raise RuntimeError(
-                "Tier-1 response statistics must be reduced before derivation"
-            )
+            raise RuntimeError("Tier-1 response statistics must be reduced before derivation")
         values = torch.empty(
             (accumulator.global_layers, len(RESPONSE_FAMILIES)),
             dtype=torch.float64,
@@ -552,23 +630,19 @@ class FunctionResponseResult:
                 )
                 valid[layer, family] = slot_valid
                 values[layer, family] = torch.where(
-                    slot_valid,
-                    statistic.value,
-                    torch.full_like(statistic.value, torch.nan),
+                    slot_valid, statistic.value, torch.full_like(statistic.value, torch.nan)
                 )
                 count[layer, family] = accumulator.statistics.sum_pack[packed.count]
                 delta[layer, family] = accumulator.statistics.sum_pack[packed.lhs_sumsq]
         return cls(values, valid, count, delta)
 
 
-def derive_tier1_summaries(accumulator: ResponseAccumulator) -> dict[str, float]:
+def derive_tier1_summaries(accumulator: ResponseAccumulator) -> dict[str, torch.Tensor]:
     """Derive the exact fixed 30-key Tier-1 payload from pooled sufficient sums."""
 
     result = FunctionResponseResult.from_reduced(accumulator)
-    values_by_key: dict[str, float] = {}
-    quantiles = torch.tensor(
-        (0.1, 0.5, 0.9), dtype=torch.float64, device=result.dy_rel.device
-    )
+    values_by_key: dict[str, torch.Tensor] = {}
+    quantiles = torch.tensor((0.1, 0.5, 0.9), dtype=torch.float64, device=result.dy_rel.device)
     for family in RESPONSE_FAMILIES:
         family_index = _FAMILY_INDEX[family]
         response = result.dy_rel[:, family_index]
@@ -584,33 +658,69 @@ def derive_tier1_summaries(accumulator: ResponseAccumulator) -> dict[str, float]
                 last,
             )
             for name, index in zip(_RESIDUAL_DEPTH_NAMES, anchors, strict=True):
-                values_by_key[f"{prefix}/dy_rel/{name}"] = float(response[index])
-        selected = response[validity]
-        values = (
-            torch.quantile(selected, quantiles)
-            if selected.numel()
-            else torch.full(
-                (3,), torch.nan, dtype=torch.float64, device=response.device
-            )
-        )
+                values_by_key[f"{prefix}/dy_rel/{name}"] = response[index]
+        values = torch.nanquantile(response, quantiles)
         for name, value in zip(_QUANTILE_NAMES, values, strict=True):
-            values_by_key[f"{prefix}/dy_rel/{name}"] = float(value)
+            values_by_key[f"{prefix}/dy_rel/{name}"] = value
         contributors = validity
-        values_by_key[f"{prefix}/starved_fraction"] = (
-            float(
-                (result.delta_square_sum[:, family_index][contributors] == 0)
-                .double()
-                .mean()
+        contributor_count = contributors.sum(dtype=torch.float64)
+        values_by_key[f"{prefix}/starved_fraction"] = torch.where(
+            contributor_count > 0,
+            ((result.delta_square_sum[:, family_index] == 0) & contributors).sum(
+                dtype=torch.float64
             )
-            if contributors.any()
-            else math.nan
+            / contributor_count,
+            torch.full((), torch.nan, dtype=torch.float64, device=response.device),
         )
-        values_by_key[f"{prefix}/valid_fraction"] = float(validity.double().mean())
+    attention_means = torch.full(
+        (accumulator.global_layers, len(_ATTENTION_METRICS)),
+        torch.nan,
+        dtype=torch.float64,
+        device=result.dy_rel.device,
+    )
+    attention_valid = torch.zeros_like(attention_means, dtype=torch.bool)
+    attention_sums = torch.zeros_like(attention_means)
+    attention_counts = torch.zeros_like(attention_means)
+    base = accumulator.global_layers * len(RESPONSE_FAMILIES)
+    for layer in range(accumulator.global_layers):
+        for metric_index in range(len(_ATTENTION_METRICS)):
+            slot = base + layer * len(_ATTENTION_METRICS) + metric_index
+            statistic = accumulator.statistics.mean(slot)
+            packed = accumulator.statistics.slots(slot)
+            valid = statistic.valid & (
+                accumulator.statistics.sum_pack[packed.observation_error] == 0
+            )
+            attention_valid[layer, metric_index] = valid
+            attention_means[layer, metric_index] = torch.where(
+                valid, statistic.value, torch.full_like(statistic.value, torch.nan)
+            )
+            attention_sums[layer, metric_index] = accumulator.statistics.sum_pack[packed.sum]
+            attention_counts[layer, metric_index] = accumulator.statistics.sum_pack[packed.count]
+    for metric_index, names, quantiles_requested in (
+        (0, ("logit_abs_p50", "logit_abs_p90"), (0.5, 0.9)),
+        (1, ("entropy_p10", "entropy_p50"), (0.1, 0.5)),
+    ):
+        values = torch.nanquantile(
+            attention_means[:, metric_index],
+            torch.tensor(quantiles_requested, dtype=torch.float64, device=attention_means.device),
+        )
+        for name, value in zip(names, values, strict=True):
+            values_by_key[f"{TIER1_ATTENTION_PREFIX}{name}"] = value
+    collapse_valid = attention_valid[:, 2]
+    collapse_count = torch.where(
+        collapse_valid, attention_counts[:, 2], torch.zeros_like(attention_counts[:, 2])
+    ).sum()
+    collapse_sum = torch.where(
+        collapse_valid, attention_sums[:, 2], torch.zeros_like(attention_sums[:, 2])
+    ).sum()
+    values_by_key[f"{TIER1_ATTENTION_PREFIX}collapse_fraction"] = torch.where(
+        collapse_count > 0,
+        collapse_sum / collapse_count,
+        torch.full((), torch.nan, dtype=torch.float64, device=result.dy_rel.device),
+    )
     payload = {key: values_by_key[key] for key in TIER1_KEYS}
     if len(set(payload)) != 30:
-        raise RuntimeError(
-            "derived Tier-1 payload does not match the canonical 30-key list"
-        )
+        raise RuntimeError("derived Tier-1 payload does not match the canonical 30-key list")
     return payload
 
 

@@ -15,7 +15,8 @@ import math
 import os
 import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from contextlib import ExitStack
+from dataclasses import dataclass, field, fields, replace
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -31,15 +32,28 @@ SAMPLE_INDEX_FIELD = "__diag_sample_index"
 SAMPLE_EPOCH_FIELD = "__diag_sample_epoch"
 DIAGNOSTIC_MASK_FIELD = "__diag_token_mask"
 _RESERVED_FIELDS = frozenset((SAMPLE_INDEX_FIELD, SAMPLE_EPOCH_FIELD))
+_MODEL_FIELDS: tuple[tuple[str, torch.dtype], ...] = (
+    ("tokens", torch.int64),
+    ("labels", torch.int64),
+    ("loss_mask", torch.float32),
+    ("position_ids", torch.int64),
+)
+_CAPACITY_LIMIT = (1 << 63) - 1
 _PLAN_MAGIC = 0x5449455231504C4E
-_PLAN_VERSION = 1
+_PLAN_VERSION = 2
 
 
 def _hash64(*values: int) -> int:
-    payload = b"".join(
-        int(value).to_bytes(8, "little", signed=True) for value in values
-    )
+    payload = b"".join(int(value).to_bytes(8, "little", signed=True) for value in values)
     return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
+
+
+def _systematic_positions(total: int, selected: int, offset: int) -> frozenset[int]:
+    """Return one cyclic fixed grid; exhaustive offsets give exact inclusion."""
+
+    if total <= 0 or not 0 < selected <= total or not 0 <= offset < total:
+        raise ValueError("systematic selection dimensions are invalid")
+    return frozenset((offset + (index * total) // selected) % total for index in range(selected))
 
 
 @dataclass(frozen=True, order=True)
@@ -81,9 +95,7 @@ class StableSampleDataset:
         if not isinstance(sample, Mapping):
             raise TypeError("Tier-1 stable identity requires mapping samples")
         result = dict(sample)
-        result[SAMPLE_INDEX_FIELD] = torch.tensor(
-            index.sampler_index, dtype=torch.int64
-        )
+        result[SAMPLE_INDEX_FIELD] = torch.tensor(index.sampler_index, dtype=torch.int64)
         result[SAMPLE_EPOCH_FIELD] = torch.tensor(index.epoch, dtype=torch.int64)
         return result
 
@@ -101,11 +113,7 @@ class RecordedSample:
         """Return one sample lane without cloning its storage."""
 
         value = self.batch[key]
-        if (
-            isinstance(value, torch.Tensor)
-            and value.ndim
-            and value.shape[0] == self.batch_size
-        ):
+        if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == self.batch_size:
             return value[self.lane]
         return value
 
@@ -123,7 +131,7 @@ class RecordedSample:
         """Return strictly positive loss-mask columns."""
 
         return tuple(
-            torch.nonzero(self.loss_mask > 0, as_tuple=False).flatten().tolist()
+            int(column) for column in torch.nonzero(self.loss_mask > 0, as_tuple=False).flatten()
         )
 
 
@@ -138,32 +146,46 @@ class RecordedBatch:
     def from_raw(cls, raw: Mapping[str, Any]) -> "RecordedBatch":
         """Validate a raw pre-broadcast batch and retain only references."""
 
-        if SAMPLE_INDEX_FIELD not in raw or SAMPLE_EPOCH_FIELD not in raw:
+        expected_fields = {name for name, _dtype in _MODEL_FIELDS} | _RESERVED_FIELDS
+        if set(raw) != expected_fields:
             raise ValueError(
-                "Tier-1 replay requires stable sample index and epoch fields"
+                "Tier-1 replay requires exactly the fixed tokens, labels, loss_mask, "
+                "position_ids, and identity fields"
             )
-        indices = torch.as_tensor(
-            raw[SAMPLE_INDEX_FIELD], dtype=torch.int64, device="cpu"
-        ).view(-1)
-        epochs = torch.as_tensor(
-            raw[SAMPLE_EPOCH_FIELD], dtype=torch.int64, device="cpu"
-        ).view(-1)
+        for name in _RESERVED_FIELDS:
+            value = raw[name]
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.device.type != "cpu"
+                or value.dtype != torch.int64
+            ):
+                raise ValueError("replay identity fields must be CPU int64 tensors")
+        indices = raw[SAMPLE_INDEX_FIELD].view(-1)
+        epochs = raw[SAMPLE_EPOCH_FIELD].view(-1)
         if indices.numel() == 0 or indices.numel() != epochs.numel():
             raise ValueError("sample identity fields must have equal nonzero length")
-        for value in raw.values():
-            if isinstance(value, torch.Tensor) and value.device.type != "cpu":
-                raise ValueError("raw replay batches must be captured on CPU")
         batch_size = indices.numel()
+        sequence_length: int | None = None
+        for name, dtype in _MODEL_FIELDS:
+            value = raw[name]
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"replay field {name!r} must be a tensor")
+            if value.device.type != "cpu" or value.dtype != dtype or value.ndim != 2:
+                raise ValueError(
+                    f"replay field {name!r} must be a two-dimensional CPU {dtype} tensor"
+                )
+            if value.shape[0] != batch_size:
+                raise ValueError(f"replay field {name!r} has the wrong batch dimension")
+            if sequence_length is None:
+                sequence_length = value.shape[1]
+            elif value.shape[1] != sequence_length:
+                raise ValueError("replay model fields must have one sequence length")
         samples = tuple(
-            RecordedSample(
-                SampleId(int(epochs[lane]), int(indices[lane])), raw, lane, batch_size
-            )
+            RecordedSample(SampleId(int(epochs[lane]), int(indices[lane])), raw, lane, batch_size)
             for lane in range(batch_size)
         )
         if len({sample.sample_id for sample in samples}) != len(samples):
-            raise ValueError(
-                "stable sample identities must be unique within a raw batch"
-            )
+            raise ValueError("stable sample identities must be unique within a raw batch")
         return cls(raw, samples)
 
     @property
@@ -212,17 +234,14 @@ class SamplePopulation:
     valid_count: int
 
 
-def local_sample_populations(
-    recorded: Sequence[RecordedBatch],
-) -> tuple[SamplePopulation, ...]:
+def local_sample_populations(recorded: Sequence[RecordedBatch]) -> tuple[SamplePopulation, ...]:
     """Return validated local sample populations."""
 
     samples = tuple(sample for batch in recorded for sample in batch.samples)
     if len({sample.sample_id for sample in samples}) != len(samples):
         raise ValueError("recorded sample identities must be unique on a data owner")
     return tuple(
-        SamplePopulation(sample.sample_id, len(sample.valid_columns))
-        for sample in samples
+        SamplePopulation(sample.sample_id, len(sample.valid_columns)) for sample in samples
     )
 
 
@@ -235,21 +254,29 @@ class CollectiveBinding:
     size: int
 
     def validate(self) -> None:
-        """Reject a declared topology that disagrees with the real group."""
+        """Reject a topology that is not an existing CPU/Gloo control group."""
 
         if not self.identity or self.size <= 0:
-            raise ValueError(
-                "collective bindings require an identity and positive size"
-            )
+            raise ValueError("collective bindings require an identity and positive size")
         if dist.is_available() and dist.is_initialized():
             if dist.get_world_size(self.group) != self.size:
-                raise ValueError(
-                    f"{self.identity} binding size disagrees with its process group"
+                raise ValueError(f"{self.identity} binding size disagrees with its process group")
+            if str(dist.get_backend(self.group)).lower() != "gloo":
+                raise RuntimeError(
+                    f"{self.identity} control binding must use a pre-existing Gloo group"
                 )
         elif self.size != 1 or self.group is not None:
-            raise RuntimeError(
-                "multi-rank bindings require initialized torch.distributed"
-            )
+            raise RuntimeError("multi-rank bindings require initialized torch.distributed")
+
+    def require_same(self, other: "CollectiveBinding") -> None:
+        """Require control status and payload wires to use one verified group."""
+
+        if (
+            self.identity != other.identity
+            or self.group is not other.group
+            or self.size != other.size
+        ):
+            raise ValueError("control payload and readiness bindings disagree")
 
 
 class ReplayPreflightError(RuntimeError):
@@ -259,10 +286,10 @@ class ReplayPreflightError(RuntimeError):
 class ReadinessConsensus:
     """Own a status scalar allocated before any replay-risky phase."""
 
-    def __init__(
-        self, binding: CollectiveBinding, device: torch.device | str = "cpu"
-    ) -> None:
+    def __init__(self, binding: CollectiveBinding, device: torch.device | str = "cpu") -> None:
         binding.validate()
+        if torch.device(device).type != "cpu":
+            raise RuntimeError("readiness consensus requires a CPU/Gloo control wire")
         self.binding = binding
         self.status = torch.ones(1, dtype=torch.int32, device=device)
 
@@ -272,7 +299,9 @@ class ReadinessConsensus:
         self.status.fill_(0 if error is not None else 1)
         if self.binding.size > 1:
             dist.all_reduce(self.status, op=dist.ReduceOp.MIN, group=self.binding.group)
-        if not bool(self.status.item()):
+        # This is a CPU scalar read.  Control wires never reside on CUDA, so it
+        # cannot introduce event-path device synchronization.
+        if not bool(int(self.status[0])):
             raise ReplayPreflightError(f"Tier-1 {phase} failed collectively") from error
 
 
@@ -287,30 +316,26 @@ class PopulationCollectiveWorkspace:
         device: torch.device | str = "cpu",
     ) -> None:
         binding.validate()
+        if torch.device(device).type != "cpu":
+            raise RuntimeError("population exchange requires CPU/Gloo control wires")
         if maximum_local_samples <= 0:
             raise ValueError("population workspace needs a positive local sample cap")
         self.binding = binding
         self.maximum_local_samples = maximum_local_samples
         self.local_count = torch.zeros(1, dtype=torch.int64, device=device)
         self.counts = torch.zeros(binding.size, dtype=torch.int64, device=device)
-        self.local = torch.full(
-            (maximum_local_samples, 3), -1, dtype=torch.int64, device=device
-        )
+        self.local = torch.full((maximum_local_samples, 3), -1, dtype=torch.int64, device=device)
         self.gathered = torch.full(
-            (binding.size * maximum_local_samples, 3),
-            -1,
-            dtype=torch.int64,
-            device=device,
+            (binding.size * maximum_local_samples, 3), -1, dtype=torch.int64, device=device
         )
         self.schedule_count = torch.zeros(1, dtype=torch.int64, device=device)
 
     def gather(
-        self,
-        local: Sequence[SamplePopulation],
-        readiness: ReadinessConsensus,
+        self, local: Sequence[SamplePopulation], readiness: ReadinessConsensus
     ) -> tuple[SamplePopulation, ...]:
         """Exchange fixed sample metadata and reject duplicate global identities."""
 
+        self.binding.require_same(readiness.binding)
         error: BaseException | None = None
         try:
             if len(local) > self.maximum_local_samples:
@@ -331,28 +356,20 @@ class PopulationCollectiveWorkspace:
             error = caught
         readiness.settle(error, "DP population packing")
         if self.binding.size > 1:
-            dist.all_gather_into_tensor(
-                self.counts, self.local_count, group=self.binding.group
-            )
-            dist.all_gather_into_tensor(
-                self.gathered, self.local, group=self.binding.group
-            )
+            dist.all_gather_into_tensor(self.counts, self.local_count, group=self.binding.group)
+            dist.all_gather_into_tensor(self.gathered, self.local, group=self.binding.group)
         else:
             self.counts.copy_(self.local_count)
             self.gathered.copy_(self.local)
         populations = []
-        for rank, count in enumerate(self.counts.cpu().tolist()):
+        for rank, count_value in enumerate(self.counts):
+            count = int(count_value)
             start = rank * self.maximum_local_samples
-            for epoch, sample, valid in (
-                self.gathered[start : start + count].cpu().tolist()
-            ):
+            for row in self.gathered[start : start + count]:
+                epoch, sample, valid = (int(value) for value in row)
                 populations.append(SamplePopulation(SampleId(epoch, sample), valid))
-        if len({population.sample_id for population in populations}) != len(
-            populations
-        ):
-            raise ValueError(
-                "DP population contains duplicate stable sample identities"
-            )
+        if len({population.sample_id for population in populations}) != len(populations):
+            raise ValueError("DP population contains duplicate stable sample identities")
         return tuple(populations)
 
     def maximum_schedule_count(self, local_count: int) -> int:
@@ -362,10 +379,8 @@ class PopulationCollectiveWorkspace:
             raise ValueError("local replay count cannot be negative")
         self.schedule_count.fill_(local_count)
         if self.binding.size > 1:
-            dist.all_reduce(
-                self.schedule_count, op=dist.ReduceOp.MAX, group=self.binding.group
-            )
-        return int(self.schedule_count.item())
+            dist.all_reduce(self.schedule_count, op=dist.ReduceOp.MAX, group=self.binding.group)
+        return int(self.schedule_count[0])
 
 
 @dataclass
@@ -378,11 +393,7 @@ class ReplayMicrobatch:
     def model_batch(self) -> dict[str, Any]:
         """Return model-path fields, including the diagnostic mask."""
 
-        return {
-            key: value
-            for key, value in self.data.items()
-            if key not in _RESERVED_FIELDS
-        }
+        return {key: value for key, value in self.data.items() if key not in _RESERVED_FIELDS}
 
     @property
     def tensor_bytes(self) -> int:
@@ -402,6 +413,7 @@ class ReplayPlanMetadata:
     micro_batch_size: int
     sequence_length: int
     num_microbatches: int
+    global_selected_tokens: int
     selected_tokens: tuple[TokenId, ...]
     ordered_sample_ids: tuple[SampleId, ...]
     diagnostic_masks: tuple[tuple[bool, ...], ...]
@@ -415,14 +427,11 @@ class ReplayPlanMetadata:
             self.micro_batch_size,
             self.sequence_length,
             self.num_microbatches,
+            self.global_selected_tokens,
         ):
             digest.update(value.to_bytes(8, "little", signed=True))
         for token in self.selected_tokens:
-            for value in (
-                token.sample.epoch,
-                token.sample.sampler_index,
-                token.sequence_column,
-            ):
+            for value in (token.sample.epoch, token.sample.sampler_index, token.sequence_column):
                 digest.update(value.to_bytes(8, "little", signed=True))
         for sample in self.ordered_sample_ids:
             digest.update(sample.epoch.to_bytes(8, "little", signed=True))
@@ -453,9 +462,7 @@ class ReplayPlan:
 
         return sum(batch.tensor_bytes for batch in self.microbatches)
 
-    def diagnostic_mask(
-        self, microbatch: int, device: torch.device | str
-    ) -> torch.Tensor:
+    def diagnostic_mask(self, microbatch: int, device: torch.device | str) -> torch.Tensor:
         """Construct one fixed mask on any TP or PP rank."""
 
         if not 0 <= microbatch < self.num_microbatches:
@@ -471,12 +478,7 @@ class ReplayPlan:
         self.microbatches.clear()
         self._filler = None
         self.metadata = ReplayPlanMetadata(
-            self.metadata.micro_batch_size,
-            self.metadata.sequence_length,
-            0,
-            (),
-            (),
-            (),
+            self.metadata.micro_batch_size, self.metadata.sequence_length, 0, 0, (), (), ()
         )
 
 
@@ -490,10 +492,7 @@ def _assemble_microbatch(
         rows = [sample.row(key) for sample in samples]
         first = rows[0]
         if isinstance(first, torch.Tensor):
-            if not all(
-                isinstance(row, torch.Tensor) and row.shape == first.shape
-                for row in rows
-            ):
+            if not all(isinstance(row, torch.Tensor) and row.shape == first.shape for row in rows):
                 raise ValueError(f"replay tensor field {key!r} has inconsistent shapes")
             data[key] = torch.stack(rows)
         elif all(row is None for row in rows):
@@ -508,9 +507,7 @@ def _assemble_microbatch(
     diagnostic_mask = torch.zeros_like(loss_mask, dtype=torch.bool)
     for lane, sample in enumerate(samples[:real_lanes]):
         for column in range(loss_mask.shape[1]):
-            diagnostic_mask[lane, column] = (
-                TokenId(sample.sample_id, column) in selected
-            )
+            diagnostic_mask[lane, column] = TokenId(sample.sample_id, column) in selected
     if real_lanes < len(samples):
         loss_mask = loss_mask.clone()
         loss_mask[real_lanes:] = 0
@@ -533,31 +530,28 @@ def select_local_token_ids(
     run_seed: int,
     event_id: int,
 ) -> tuple[TokenId, ...]:
-    """Systematically select global positions and return locally owned IDs."""
+    """Select a seed-shifted systematic grid over the full token population.
+
+    A uniform cyclic offset makes every one of the ``total`` logical positions
+    appear in exactly ``selected_count`` of the ``total`` possible grids.  The
+    resulting per-token inclusion probability is therefore exactly ``k / N``;
+    sample block sizes and their order cannot bias selection.
+    """
 
     if probe_tokens < 0:
         raise ValueError("probe token count must be nonnegative")
-    ordered = sorted(
-        global_population,
-        key=lambda item: (
-            _hash64(
-                run_seed, event_id, item.sample_id.epoch, item.sample_id.sampler_index
-            ),
-            item.sample_id,
-        ),
-    )
+    ordered = sorted(global_population, key=lambda item: item.sample_id)
     total = sum(item.valid_count for item in ordered)
     selected_count = min(probe_tokens, total)
     if not selected_count:
         return ()
-    positions = (
-        set(range(total))
-        if selected_count == total
-        else {
-            ((2 * index + 1) * total) // (2 * selected_count)
-            for index in range(selected_count)
-        }
-    )
+    if selected_count == total:
+        positions = set(range(total))
+    else:
+        random_offset = random.Random(_hash64(run_seed, event_id, total, selected_count)).randrange(
+            total
+        )
+        positions = _systematic_positions(total, selected_count, random_offset)
     local = {sample.sample_id: sample for batch in recorded for sample in batch.samples}
     result: list[TokenId] = []
     cursor = 0
@@ -569,24 +563,10 @@ def select_local_token_ids(
         )
         sample = local.get(population.sample_id)
         if sample is not None:
-            columns = sorted(
-                sample.valid_columns,
-                key=lambda column: (
-                    _hash64(
-                        run_seed,
-                        event_id,
-                        sample.sample_id.epoch,
-                        sample.sample_id.sampler_index,
-                        column,
-                    ),
-                    column,
-                ),
-            )
+            columns = sample.valid_columns
             if len(columns) != population.valid_count:
                 raise ValueError("local loss mask disagrees with gathered population")
-            result.extend(
-                TokenId(sample.sample_id, columns[offset]) for offset in offsets
-            )
+            result.extend(TokenId(sample.sample_id, columns[offset]) for offset in offsets)
         cursor += population.valid_count
     return tuple(sorted(result))
 
@@ -597,6 +577,7 @@ def build_local_replay_plan(
     *,
     micro_batch_size: int,
     target_microbatches: int | None = None,
+    global_selected_tokens: int | None = None,
 ) -> ReplayPlan:
     """Reconstruct deterministic fixed batches without advancing a sampler."""
 
@@ -606,9 +587,12 @@ def build_local_replay_plan(
     if len(by_id) != sum(len(batch.samples) for batch in recorded):
         raise ValueError("recorded sample identities must be unique")
     selected_set = set(selected_tokens)
-    selected_samples = [
-        by_id[sample_id] for sample_id in sorted({t.sample for t in selected_set})
-    ]
+    global_selected = (
+        len(selected_set) if global_selected_tokens is None else global_selected_tokens
+    )
+    if global_selected < len(selected_set):
+        raise ValueError("global selected-token count is smaller than local selection")
+    selected_samples = [by_id[sample_id] for sample_id in sorted({t.sample for t in selected_set})]
     filler = min(by_id.values(), key=lambda sample: sample.sample_id) if by_id else None
     batches: list[ReplayMicrobatch] = []
     for start in range(0, len(selected_samples), micro_batch_size):
@@ -627,25 +611,19 @@ def build_local_replay_plan(
     sequence_length = (
         int(batches[0].data["loss_mask"].shape[1])
         if batches
-        else int(next(iter(by_id.values())).loss_mask.numel())
-        if by_id
-        else 0
+        else int(next(iter(by_id.values())).loss_mask.numel()) if by_id else 0
     )
     masks = tuple(
-        tuple(
-            bool(value)
-            for value in batch.data[DIAGNOSTIC_MASK_FIELD].reshape(-1).tolist()
-        )
+        tuple(bool(value) for value in batch.data[DIAGNOSTIC_MASK_FIELD].reshape(-1))
         for batch in batches
     )
     metadata = ReplayPlanMetadata(
         micro_batch_size=micro_batch_size,
         sequence_length=sequence_length,
         num_microbatches=len(batches),
+        global_selected_tokens=global_selected,
         selected_tokens=tuple(selected_tokens),
-        ordered_sample_ids=tuple(
-            sample for batch in batches for sample in batch.sample_ids
-        ),
+        ordered_sample_ids=tuple(sample for batch in batches for sample in batch.sample_ids),
         diagnostic_masks=masks,
     )
     return ReplayPlan(metadata, batches, True, filler)
@@ -672,12 +650,11 @@ def build_distributed_source_plan(
         error = caught
     readiness.settle(error, "local population validation")
     global_population = workspace.gather(local, readiness)
-    if probe_tokens <= 0 or not any(
-        population.valid_count for population in global_population
-    ):
-        readiness.settle(
-            ReplayPreflightError("Tier-1 replay has no valid tokens"), "selection"
-        )
+    global_selected_tokens = min(
+        probe_tokens, sum(population.valid_count for population in global_population)
+    )
+    if probe_tokens <= 0 or not any(population.valid_count for population in global_population):
+        readiness.settle(ReplayPreflightError("Tier-1 replay has no valid tokens"), "selection")
     selected: tuple[TokenId, ...] = ()
     plan: ReplayPlan | None = None
     error = None
@@ -690,7 +667,10 @@ def build_distributed_source_plan(
             event_id=event_id,
         )
         plan = build_local_replay_plan(
-            recorded, selected, micro_batch_size=micro_batch_size
+            recorded,
+            selected,
+            micro_batch_size=micro_batch_size,
+            global_selected_tokens=global_selected_tokens,
         )
     except BaseException as caught:
         error = caught
@@ -711,6 +691,7 @@ def build_distributed_source_plan(
         selected,
         micro_batch_size=micro_batch_size,
         target_microbatches=target,
+        global_selected_tokens=global_selected_tokens,
     )
 
 
@@ -739,11 +720,7 @@ class FixedPlanCodec:
     def integer_count(self) -> int:
         """Return the fixed int64 metadata tensor length."""
 
-        return (
-            7
-            + 3 * self.maximum_tokens
-            + 2 * self.maximum_microbatches * self.micro_batch_size
-        )
+        return 8 + 3 * self.maximum_tokens + 2 * self.maximum_microbatches * self.micro_batch_size
 
     @property
     def mask_count(self) -> int:
@@ -754,42 +731,48 @@ class FixedPlanCodec:
     def allocate(self, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
         """Allocate one reusable fixed wire pair."""
 
+        if torch.device(device).type != "cpu":
+            raise RuntimeError("replay plan control wires require CPU/Gloo")
         return (
             torch.full((self.integer_count,), -1, dtype=torch.int64, device=device),
             torch.zeros((self.mask_count,), dtype=torch.uint8, device=device),
         )
 
-    def encode(
-        self, plan: ReplayPlan, integer: torch.Tensor, mask: torch.Tensor
-    ) -> None:
+    def encode(self, plan: ReplayPlan, integer: torch.Tensor, mask: torch.Tensor) -> None:
         """Encode one source plan into preallocated tensors."""
 
+        if integer.device.type != "cpu" or mask.device.type != "cpu":
+            raise RuntimeError("replay plan control wires must remain CPU-resident")
         metadata = plan.metadata
         if (
             metadata.micro_batch_size != self.micro_batch_size
             or metadata.sequence_length != self.sequence_length
             or metadata.num_microbatches > self.maximum_microbatches
             or len(metadata.selected_tokens) > self.maximum_tokens
+            or not len(metadata.selected_tokens)
+            <= metadata.global_selected_tokens
+            <= self.maximum_tokens
         ):
             raise ValueError("replay plan exceeds its fixed codec")
         if integer.numel() != self.integer_count or mask.numel() != self.mask_count:
             raise ValueError("replay codec received incorrectly sized wire tensors")
         integer.fill_(-1)
         mask.zero_()
-        integer[:7] = torch.tensor(
+        integer[:8] = torch.tensor(
             (
                 _PLAN_MAGIC,
                 _PLAN_VERSION,
                 metadata.num_microbatches,
                 metadata.micro_batch_size,
                 metadata.sequence_length,
+                metadata.global_selected_tokens,
                 len(metadata.selected_tokens),
                 len(metadata.ordered_sample_ids),
             ),
             dtype=torch.int64,
             device=integer.device,
         )
-        offset = 7
+        offset = 8
         for token in metadata.selected_tokens:
             integer[offset : offset + 3] = torch.tensor(
                 (token.sample.epoch, token.sample.sampler_index, token.sequence_column),
@@ -797,12 +780,10 @@ class FixedPlanCodec:
                 device=integer.device,
             )
             offset += 3
-        offset = 7 + 3 * self.maximum_tokens
+        offset = 8 + 3 * self.maximum_tokens
         for sample in metadata.ordered_sample_ids:
             integer[offset : offset + 2] = torch.tensor(
-                (sample.epoch, sample.sampler_index),
-                dtype=torch.int64,
-                device=integer.device,
+                (sample.epoch, sample.sampler_index), dtype=torch.int64, device=integer.device
             )
             offset += 2
         for index, values in enumerate(metadata.diagnostic_masks):
@@ -814,8 +795,12 @@ class FixedPlanCodec:
     def decode(self, integer: torch.Tensor, mask: torch.Tensor) -> ReplayPlanMetadata:
         """Validate and decode one fixed wire pair."""
 
-        header = tuple(int(value) for value in integer[:7].cpu().tolist())
-        magic, version, count, mbs, sequence, selected_count, sample_count = header
+        if integer.device.type != "cpu" or mask.device.type != "cpu":
+            raise RuntimeError("replay plan control wires must remain CPU-resident")
+        header = tuple(int(value) for value in integer[:8])
+        (magic, version, count, mbs, sequence, global_selected, selected_count, sample_count) = (
+            header
+        )
         if magic != _PLAN_MAGIC or version != _PLAN_VERSION:
             raise ValueError("invalid replay plan wire identity")
         if not 0 <= count <= self.maximum_microbatches:
@@ -824,18 +809,18 @@ class FixedPlanCodec:
             raise ValueError("replay plan wire shape disagrees with its codec")
         if not 0 <= selected_count <= self.maximum_tokens:
             raise ValueError("invalid replay selected-token count")
+        if not selected_count <= global_selected <= self.maximum_tokens:
+            raise ValueError("invalid global selected-token count")
         expected_samples = count * mbs
         if sample_count != expected_samples:
             raise ValueError("replay sample metadata cardinality is inconsistent")
-        offset = 7
+        offset = 8
         tokens = []
         for _ in range(selected_count):
-            epoch, sample, column = (
-                int(value) for value in integer[offset : offset + 3]
-            )
+            epoch, sample, column = (int(value) for value in integer[offset : offset + 3])
             tokens.append(TokenId(SampleId(epoch, sample), column))
             offset += 3
-        offset = 7 + 3 * self.maximum_tokens
+        offset = 8 + 3 * self.maximum_tokens
         samples = []
         for _ in range(sample_count):
             epoch, sample = (int(value) for value in integer[offset : offset + 2])
@@ -843,14 +828,11 @@ class FixedPlanCodec:
             offset += 2
         width = mbs * sequence
         masks = tuple(
-            tuple(
-                bool(value)
-                for value in mask[index * width : (index + 1) * width].cpu().tolist()
-            )
+            tuple(bool(value) for value in mask[index * width : (index + 1) * width])
             for index in range(count)
         )
         return ReplayPlanMetadata(
-            mbs, sequence, count, tuple(tokens), tuple(samples), masks
+            mbs, sequence, count, global_selected, tuple(tokens), tuple(samples), masks
         )
 
 
@@ -866,6 +848,11 @@ def broadcast_replay_plan(
     """Broadcast immutable plan data and construct a neutral TP non-source plan."""
 
     binding.validate()
+    binding.require_same(readiness.binding)
+    if torch.device(device).type != "cpu":
+        raise RuntimeError("replay plan broadcast requires a CPU/Gloo control wire")
+    if not 0 <= source_group_rank < binding.size:
+        raise ValueError("TP source group rank is outside the verified binding")
     group_rank = dist.get_rank(binding.group) if binding.size > 1 else 0
     integer: torch.Tensor | None = None
     mask: torch.Tensor | None = None
@@ -889,15 +876,17 @@ def broadcast_replay_plan(
         error = ValueError("a TP non-source rank supplied source replay batches")
     readiness.settle(error, "plan encoding")
     if binding.size > 1:
-        global_source = dist.get_global_rank(binding.group, source_group_rank)
+        global_source = (
+            source_group_rank
+            if binding.group is None
+            else dist.get_global_rank(binding.group, source_group_rank)
+        )
         dist.broadcast(integer, src=global_source, group=binding.group)
         dist.broadcast(mask, src=global_source, group=binding.group)
     metadata = codec.decode(integer, mask)
     if source_plan is not None:
         if metadata.descriptor_hash != source_plan.metadata.descriptor_hash:
-            raise ReplayPreflightError(
-                "source replay plan changed during typed broadcast"
-            )
+            raise ReplayPreflightError("source replay plan changed during typed broadcast")
         return source_plan
     return ReplayPlan(metadata, [], False)
 
@@ -912,6 +901,7 @@ def verify_replay_plan_consensus(
     """Verify fixed plan shape and hash across TP/PP participants before P2P."""
 
     binding.validate()
+    binding.require_same(readiness.binding)
     error: BaseException | None = None
     minimum: torch.Tensor | None = None
     maximum: torch.Tensor | None = None
@@ -940,9 +930,7 @@ def verify_replay_plan_consensus(
             raise ReplayPreflightError("Tier-1 replay plan descriptor mismatch")
 
 
-def cp_sequence_columns(
-    sequence_length: int, cp_size: int, cp_rank: int
-) -> torch.Tensor:
+def cp_sequence_columns(sequence_length: int, cp_size: int, cp_rank: int) -> torch.Tensor:
     """Return Megatron's two-chunk zigzag CP column indices."""
 
     if cp_size <= 0 or not 0 <= cp_rank < cp_size:
@@ -952,11 +940,7 @@ def cp_sequence_columns(
     width = sequence_length // (2 * cp_size)
     chunks = (cp_rank, 2 * cp_size - cp_rank - 1)
     return torch.tensor(
-        [
-            column
-            for chunk in chunks
-            for column in range(chunk * width, (chunk + 1) * width)
-        ],
+        [column for chunk in chunks for column in range(chunk * width, (chunk + 1) * width)],
         dtype=torch.int64,
     )
 
@@ -974,16 +958,11 @@ def slice_replay_mask(
 
     if mask.ndim != 2:
         raise ValueError("replay masks must have [batch, sequence] layout")
-    columns = cp_sequence_columns(
-        mask.shape[1], context_parallel_size, context_parallel_rank
-    )
+    columns = cp_sequence_columns(mask.shape[1], context_parallel_size, context_parallel_rank)
     cp_mask = mask.index_select(1, columns.to(mask.device))
     if not sequence_parallel:
         return cp_mask, None
-    if (
-        tensor_parallel_size <= 0
-        or not 0 <= tensor_parallel_rank < tensor_parallel_size
-    ):
+    if tensor_parallel_size <= 0 or not 0 <= tensor_parallel_rank < tensor_parallel_size:
         raise ValueError("invalid sequence-parallel TP coordinate")
     if cp_mask.shape[1] % tensor_parallel_size:
         raise ValueError("CP-local sequence length is not divisible by TP size")
@@ -1045,9 +1024,7 @@ def _validated_tracker(getter: Callable[[], Any] | None) -> Any | None:
     if not callable(get_states) or not callable(set_states):
         raise TypeError("Megatron RNG tracker lacks get_states/set_states")
     states = get_states()
-    if not isinstance(states, Mapping) or not all(
-        isinstance(name, str) for name in states
-    ):
+    if not isinstance(states, Mapping) or not all(isinstance(name, str) for name in states):
         raise TypeError("Megatron RNG tracker returned an invalid state mapping")
     if not states:
         raise TypeError("Megatron RNG tracker returned no inspected RNG states")
@@ -1069,19 +1046,13 @@ class ReplayRngState:
 
     @classmethod
     def capture(
-        cls,
-        *,
-        tracker_getter: Callable[[], Any] | None,
-        cuda_device: torch.device | int | None,
+        cls, *, tracker_getter: Callable[[], Any] | None, cuda_device: torch.device | int | None
     ) -> "ReplayRngState":
         """Capture Python, NumPy, Torch, CUDA, and validated Megatron tracker state."""
 
         tracker = _validated_tracker(tracker_getter)
         states = (
-            {
-                name: _clone_tracker_value(value)
-                for name, value in tracker.get_states().items()
-            }
+            {name: _clone_tracker_value(value) for name, value in tracker.get_states().items()}
             if tracker is not None
             else {}
         )
@@ -1094,9 +1065,7 @@ class ReplayRngState:
             numpy_state[4],
         )
         cuda_state = (
-            torch.cuda.get_rng_state(cuda_device).clone()
-            if torch.cuda.is_available()
-            else None
+            torch.cuda.get_rng_state(cuda_device).clone() if torch.cuda.is_available() else None
         )
         return cls(
             copy.deepcopy(random.getstate()),
@@ -1113,21 +1082,14 @@ class ReplayRngState:
 
         values = [
             self.torch_state,
-            *(
-                value
-                for value in self.tracker_states.values()
-                if isinstance(value, torch.Tensor)
-            ),
+            *(value for value in self.tracker_states.values() if isinstance(value, torch.Tensor)),
         ]
         if self.cuda_state is not None:
             values.append(self.cuda_state)
         return sum(value.numel() * value.element_size() for value in values)
 
     def restore_stages(
-        self,
-        *,
-        tracker_getter: Callable[[], Any] | None,
-        cuda_device: torch.device | int | None,
+        self, *, tracker_getter: Callable[[], Any] | None, cuda_device: torch.device | int | None
     ) -> tuple[tuple[str, Callable[[], None]], ...]:
         """Return independently invokable restoration stages."""
 
@@ -1154,25 +1116,18 @@ class ReplayRngState:
         def restore_cuda() -> None:
             if self.cuda_state is not None:
                 torch.cuda.set_rng_state(self.cuda_state, cuda_device)
-                if not torch.equal(
-                    torch.cuda.get_rng_state(cuda_device), self.cuda_state
-                ):
+                if not torch.equal(torch.cuda.get_rng_state(cuda_device), self.cuda_state):
                     raise RuntimeError("CUDA RNG restoration verification failed")
 
         def restore_tracker() -> None:
             if tracker_getter is None:
                 if self.tracker_states:
-                    raise RuntimeError(
-                        "captured tracker state has no restoration getter"
-                    )
+                    raise RuntimeError("captured tracker state has no restoration getter")
                 return
             tracker = _validated_tracker(tracker_getter)
             assert tracker is not None
             tracker.set_states(
-                {
-                    name: _clone_tracker_value(value)
-                    for name, value in self.tracker_states.items()
-                }
+                {name: _clone_tracker_value(value) for name, value in self.tracker_states.items()}
             )
             if self.tracker_name is not None:
                 tracker._current_state_name = self.tracker_name
@@ -1183,9 +1138,7 @@ class ReplayRngState:
                 or not torch.equal(restored[name], expected)
                 for name, expected in self.tracker_states.items()
             ):
-                raise RuntimeError(
-                    "Megatron RNG tracker restoration verification failed"
-                )
+                raise RuntimeError("Megatron RNG tracker restoration verification failed")
 
         return (
             ("python_rng", restore_python),
@@ -1207,10 +1160,14 @@ class _ValueSnapshot:
             contents = value.detach().clone()
         elif isinstance(value, list):
             contents = tuple(cls.capture(item) for item in value)
+        elif isinstance(value, tuple):
+            contents = tuple(cls.capture(item) for item in value)
         elif isinstance(value, dict):
             contents = tuple((key, cls.capture(item)) for key, item in value.items())
+        elif isinstance(value, set):
+            contents = frozenset(value)
         else:
-            contents = value
+            contents = copy.deepcopy(value)
         return cls(value, contents)
 
     def restore(self) -> Any:
@@ -1219,9 +1176,14 @@ class _ValueSnapshot:
         elif isinstance(self.original, list):
             self.original.clear()
             self.original.extend(item.restore() for item in self.contents)
+        elif isinstance(self.original, tuple):
+            return tuple(item.restore() for item in self.contents)
         elif isinstance(self.original, dict):
             self.original.clear()
             self.original.update((key, item.restore()) for key, item in self.contents)
+        elif isinstance(self.original, set):
+            self.original.clear()
+            self.original.update(self.contents)
         return self.original
 
     def verify(self, value: Any) -> bool:
@@ -1231,27 +1193,83 @@ class _ValueSnapshot:
             return torch.equal(value, self.contents)
         if isinstance(value, list):
             return len(value) == len(self.contents) and all(
-                snapshot.verify(item)
-                for snapshot, item in zip(self.contents, value, strict=True)
+                snapshot.verify(item) for snapshot, item in zip(self.contents, value, strict=True)
+            )
+        if isinstance(value, tuple):
+            return len(value) == len(self.contents) and all(
+                snapshot.verify(item) for snapshot, item in zip(self.contents, value, strict=True)
             )
         if isinstance(value, dict):
             return tuple(value) == tuple(key for key, _ in self.contents) and all(
                 snapshot.verify(value[key]) for key, snapshot in self.contents
             )
+        if isinstance(value, set):
+            return value == self.contents
         return value is self.original or value == self.contents
+
+    @property
+    def tensor_bytes(self) -> int:
+        """Return tensor storage cloned recursively by this snapshot."""
+
+        if isinstance(self.original, torch.Tensor):
+            return self.contents.numel() * self.contents.element_size()
+        if isinstance(self.original, (list, tuple)):
+            return sum(item.tensor_bytes for item in self.contents)
+        if isinstance(self.original, dict):
+            return sum(item.tensor_bytes for _key, item in self.contents)
+        return 0
+
+
+def _value_tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
+    """Conservatively count recursively reachable tensor storage before cloning."""
+
+    seen = set() if seen is None else seen
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, (list, tuple)):
+        return _checked_sum(*(_value_tensor_bytes(item, seen) for item in value))
+    if isinstance(value, dict):
+        return _checked_sum(*(_value_tensor_bytes(item, seen) for item in value.values()))
+    return 0
 
 
 @dataclass
 class _AttributeSnapshot:
     owner: object
     name: str
+    value: _ValueSnapshot | None
+
+    def restore(self) -> None:
+        if self.value is None:
+            if hasattr(self.owner, self.name):
+                delattr(self.owner, self.name)
+        else:
+            setattr(self.owner, self.name, self.value.restore())
+
+    def verify(self) -> bool:
+        if self.value is None:
+            return not hasattr(self.owner, self.name)
+        return hasattr(self.owner, self.name) and self.value.verify(getattr(self.owner, self.name))
+
+    @property
+    def tensor_bytes(self) -> int:
+        return 0 if self.value is None else self.value.tensor_bytes
+
+
+@dataclass
+class _ExtraStateSnapshot:
+    owner: torch.nn.Module
     value: _ValueSnapshot
 
     def restore(self) -> None:
-        setattr(self.owner, self.name, self.value.restore())
+        self.owner.set_extra_state(self.value.restore())
 
     def verify(self) -> bool:
-        return self.value.verify(getattr(self.owner, self.name))
+        return self.value.verify(self.owner.get_extra_state())
 
 
 class DenseGPTStateSnapshot:
@@ -1264,95 +1282,162 @@ class DenseGPTStateSnapshot:
         "rotary_pos_emb_cache",
         "_decoder_hidden_states_cache",
     )
-    _HOOK_ATTRIBUTES = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks")
+    _MUTABLE_NAME_FRAGMENTS = ("cache", "buffer")
 
     def __init__(
-        self, models: Sequence[torch.nn.Module], mutable_buffers: Sequence[str]
+        self,
+        models: Sequence[torch.nn.Module],
+        mutable_buffers: Sequence[str],
+        maximum_tensor_bytes: int = _CAPACITY_LIMIT,
     ) -> None:
+        if not 0 <= maximum_tensor_bytes <= _CAPACITY_LIMIT:
+            raise ValueError("model state snapshot cap is invalid")
         self.models = tuple(models)
         self.mutable_buffers = frozenset(mutable_buffers)
+        self.maximum_tensor_bytes = maximum_tensor_bytes
         self.modes: list[tuple[torch.nn.Module, bool]] = []
-        self.buffers: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+        self.buffer_maps: list[tuple[torch.nn.Module, tuple[str, ...]]] = []
+        self.buffers: list[tuple[str, torch.nn.Module, str, torch.Tensor, torch.Tensor]] = []
+        self.none_buffers: list[tuple[str, torch.nn.Module, str]] = []
         self.attributes: list[_AttributeSnapshot] = []
+        self.extra_states: list[_ExtraStateSnapshot] = []
+
+    def _admit(self, additional_bytes: int) -> None:
+        if additional_bytes < 0 or self.tensor_bytes + additional_bytes > self.maximum_tensor_bytes:
+            raise ValueError("model state snapshot exceeds its declared byte cap")
 
     def capture(self) -> None:
         """Capture all explicitly admitted mutable model state."""
 
         self.modes = [
-            (module, module.training)
-            for model in self.models
-            for module in model.modules()
+            (module, module.training) for model in self.models for module in model.modules()
         ]
         found: set[str] = set()
+        registered: set[str] = set()
         seen: set[tuple[int, str]] = set()
         for model_index, model in enumerate(self.models):
-            for name, buffer in model.named_buffers():
-                qualified = f"{model_index}:{name}"
-                if name in self.mutable_buffers or qualified in self.mutable_buffers:
-                    found.add(name if name in self.mutable_buffers else qualified)
-                    self.buffers.append((qualified, buffer, buffer.detach().clone()))
-            for module in model.modules():
-                for name in (*self._REFERENCE_ATTRIBUTES, *self._HOOK_ATTRIBUTES):
-                    identity = (id(module), name)
-                    if identity not in seen and hasattr(module, name):
-                        seen.add(identity)
-                        self.attributes.append(
-                            _AttributeSnapshot(
-                                module,
-                                name,
-                                _ValueSnapshot.capture(getattr(module, name)),
+            for module_name, module in model.named_modules():
+                self.buffer_maps.append((module, tuple(module._buffers)))
+                for local_name, buffer in module._buffers.items():
+                    name = f"{module_name}.{local_name}" if module_name else local_name
+                    qualified = f"{model_index}:{name}"
+                    registered.add(qualified)
+                    if name in self.mutable_buffers or qualified in self.mutable_buffers:
+                        found.add(name if name in self.mutable_buffers else qualified)
+                        if buffer is None:
+                            self.none_buffers.append((qualified, module, local_name))
+                        elif isinstance(buffer, torch.Tensor):
+                            size = buffer.numel() * buffer.element_size()
+                            self._admit(size)
+                            self.buffers.append(
+                                (qualified, module, local_name, buffer, buffer.detach().clone())
                             )
-                        )
+                        else:
+                            raise TypeError("registered model buffer is not tensor-or-None")
+                attribute_names = set(self._REFERENCE_ATTRIBUTES)
+                attribute_names.update(
+                    name
+                    for name in vars(module)
+                    if "hook" in name
+                    or any(fragment in name for fragment in self._MUTABLE_NAME_FRAGMENTS)
+                )
+                attribute_names.difference_update({"_buffers", "_parameters", "_modules"})
+                for name in sorted(attribute_names):
+                    identity = (id(module), name)
+                    if identity not in seen:
+                        seen.add(identity)
+                        value: _ValueSnapshot | None = None
+                        if hasattr(module, name):
+                            current = getattr(module, name)
+                            self._admit(_value_tensor_bytes(current))
+                            value = _ValueSnapshot.capture(current)
+                        self.attributes.append(_AttributeSnapshot(module, name, value))
+                if type(module).get_extra_state is not torch.nn.Module.get_extra_state:
+                    if type(module).set_extra_state is torch.nn.Module.set_extra_state:
+                        raise TypeError("model extra state has no verified restoration method")
+                    current = module.get_extra_state()
+                    self._admit(_value_tensor_bytes(current))
+                    value = _ValueSnapshot.capture(current)
+                    self.extra_states.append(_ExtraStateSnapshot(module, value))
         missing = self.mutable_buffers - found
         if missing:
+            raise ValueError(f"declared mutable model buffers were not found: {sorted(missing)}")
+        admitted = {
+            qualified
+            for qualified in registered
+            if qualified.split(":", 1)[1] in self.mutable_buffers
+            or qualified in self.mutable_buffers
+        }
+        undeclared = registered - admitted
+        if undeclared:
             raise ValueError(
-                f"declared mutable model buffers were not found: {sorted(missing)}"
+                f"registered model buffers were not declared mutable: {sorted(undeclared)}"
             )
 
     def restore(self) -> None:
         """Restore model state without performing verification."""
 
-        for _name, buffer, snapshot in self.buffers:
+        for module, names in self.buffer_maps:
+            for local_name in tuple(module._buffers):
+                if local_name not in names:
+                    del module._buffers[local_name]
+        for _name, module, local_name, buffer, snapshot in self.buffers:
+            module._buffers[local_name] = buffer
             buffer.copy_(snapshot)
+        for _name, module, local_name in self.none_buffers:
+            module._buffers[local_name] = None
         for attribute in self.attributes:
             attribute.restore()
+        for extra_state in self.extra_states:
+            extra_state.restore()
         for module, training in self.modes:
             module.training = training
 
     def verify(self) -> None:
         """Verify buffer contents, references, hooks, and module modes."""
 
-        for name, buffer, snapshot in self.buffers:
-            if not torch.equal(buffer, snapshot):
+        if any(tuple(module._buffers) != names for module, names in self.buffer_maps):
+            raise RuntimeError("model buffer registry restoration failed")
+        for name, module, local_name, buffer, snapshot in self.buffers:
+            if module._buffers.get(local_name) is not buffer or not torch.equal(buffer, snapshot):
                 raise RuntimeError(f"model buffer restoration failed: {name}")
+        if any(
+            module._buffers.get(local_name) is not None
+            for _, module, local_name in self.none_buffers
+        ):
+            raise RuntimeError("None model-buffer restoration failed")
         if any(module.training != training for module, training in self.modes):
             raise RuntimeError("model training-mode restoration failed")
         if any(not attribute.verify() for attribute in self.attributes):
             raise RuntimeError("model reference/hook restoration failed")
+        if any(not extra_state.verify() for extra_state in self.extra_states):
+            raise RuntimeError("model extra-state restoration failed")
 
     @property
     def tensor_bytes(self) -> int:
         """Return exact cloned model-buffer storage."""
 
-        return sum(
-            snapshot.numel() * snapshot.element_size()
-            for _, _, snapshot in self.buffers
+        return (
+            sum(snapshot.numel() * snapshot.element_size() for _, _, _, _, snapshot in self.buffers)
+            + sum(attribute.tensor_bytes for attribute in self.attributes)
+            + sum(extra_state.value.tensor_bytes for extra_state in self.extra_states)
         )
 
     def release(self) -> None:
         """Release all captured model references."""
 
         self.modes.clear()
+        self.buffer_maps.clear()
         self.buffers.clear()
+        self.none_buffers.clear()
         self.attributes.clear()
+        self.extra_states.clear()
 
 
 class IdentityStateSnapshot:
     """Snapshot replay iterator positions and sampler identity counters."""
 
-    def __init__(
-        self, iterators: Sequence[ReplayIterator], samplers: Sequence[object]
-    ) -> None:
+    def __init__(self, iterators: Sequence[ReplayIterator], samplers: Sequence[object]) -> None:
         self.iterators = tuple(iterators)
         self.samplers = tuple(samplers)
         self.iterator_positions: tuple[int, ...] = ()
@@ -1366,17 +1451,13 @@ class IdentityStateSnapshot:
         for sampler in self.samplers:
             for name in ("consumed_samples", "epoch"):
                 if hasattr(sampler, name):
-                    values.append(
-                        (sampler, name, copy.deepcopy(getattr(sampler, name)))
-                    )
+                    values.append((sampler, name, copy.deepcopy(getattr(sampler, name))))
         self.sampler_values = tuple(values)
 
     def restore(self) -> None:
         """Restore iterator and sampler counters."""
 
-        for iterator, position in zip(
-            self.iterators, self.iterator_positions, strict=True
-        ):
+        for iterator, position in zip(self.iterators, self.iterator_positions, strict=True):
             iterator.index = position
         for sampler, name, value in self.sampler_values:
             setattr(sampler, name, copy.deepcopy(value))
@@ -1384,14 +1465,9 @@ class IdentityStateSnapshot:
     def verify(self) -> None:
         """Verify every captured identity counter."""
 
-        if (
-            tuple(iterator.index for iterator in self.iterators)
-            != self.iterator_positions
-        ):
+        if tuple(iterator.index for iterator in self.iterators) != self.iterator_positions:
             raise RuntimeError("replay iterator identity restoration failed")
-        if any(
-            getattr(owner, name) != value for owner, name, value in self.sampler_values
-        ):
+        if any(getattr(owner, name) != value for owner, name, value in self.sampler_values):
             raise RuntimeError("training sampler identity restoration failed")
 
 
@@ -1414,15 +1490,13 @@ class OverlapStateSnapshot:
 
         for owner in self.owners:
             for name in self._ATTRIBUTES:
+                snapshot: _ValueSnapshot | None = None
                 if hasattr(owner, name):
                     value = getattr(owner, name)
                     if value is not None:
-                        raise ValueError(
-                            f"Tier-1 replay requires quiescent overlap state: {name}"
-                        )
-                    self.attributes.append(
-                        _AttributeSnapshot(owner, name, _ValueSnapshot.capture(value))
-                    )
+                        raise ValueError(f"Tier-1 replay requires quiescent overlap state: {name}")
+                    snapshot = _ValueSnapshot.capture(value)
+                self.attributes.append(_AttributeSnapshot(owner, name, snapshot))
 
     def restore(self) -> None:
         """Restore overlap references."""
@@ -1460,16 +1534,23 @@ class ReplayStateGuard:
         tracker_getter: Callable[[], Any] | None = None,
         cuda_device: torch.device | int | None = None,
         fault_injections: Mapping[str, Callable[[], None]] | None = None,
+        maximum_model_state_bytes: int = _CAPACITY_LIMIT,
     ) -> None:
-        self.model = DenseGPTStateSnapshot(models, mutable_buffer_names)
+        self.model = DenseGPTStateSnapshot(models, mutable_buffer_names, maximum_model_state_bytes)
         self.identity = IdentityStateSnapshot(replay_iterators, samplers)
         self.overlap = OverlapStateSnapshot(overlap_objects)
         self.tracker_getter = tracker_getter
         self.cuda_device = cuda_device
         self.faults = dict(fault_injections or {})
         self.rng: ReplayRngState | None = None
+        self.prepared = False
+        self.entered = False
 
-    def __enter__(self) -> "ReplayStateGuard":
+    def prepare(self) -> None:
+        """Complete every fallible capture before collective readiness."""
+
+        if self.prepared or self.entered:
+            raise RuntimeError("replay state guard can be prepared exactly once")
         try:
             self.model.capture()
             self.identity.capture()
@@ -1477,17 +1558,23 @@ class ReplayStateGuard:
             self.rng = ReplayRngState.capture(
                 tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
             )
+            self.prepared = True
         except BaseException:
             self.model.release()
             self.overlap.attributes.clear()
+            self.rng = None
             raise
+
+    def __enter__(self) -> "ReplayStateGuard":
+        if not self.prepared:
+            self.prepare()
+        if self.entered:
+            raise RuntimeError("replay state guard cannot be entered twice")
+        self.entered = True
         return self
 
     def _attempt(
-        self,
-        name: str,
-        operation: Callable[[], None],
-        failures: list[tuple[str, BaseException]],
+        self, name: str, operation: Callable[[], None], failures: list[tuple[str, BaseException]]
     ) -> None:
         try:
             fault = self.faults.get(name)
@@ -1498,6 +1585,8 @@ class ReplayStateGuard:
             failures.append((name, error))
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        if not self.entered:
+            raise RuntimeError("unentered replay state guard cannot restore")
         failures: list[tuple[str, BaseException]] = []
         assert self.rng is not None
         restore = (
@@ -1518,6 +1607,7 @@ class ReplayStateGuard:
             self._attempt(name, operation, failures)
         self.model.release()
         self.rng = None
+        self.entered = False
         if failures:
             raise ReplayRestorationError(failures)
         return False
@@ -1538,7 +1628,9 @@ class ReplayMemoryConfig:
     local_layers: int
     hidden_size: int
     ffn_hidden_size: int
+    num_attention_heads: int
     selected_tokens: int
+    replay_microbatches: int
     element_size: int
     rng_snapshot_bytes: int
     model_state_bytes: int
@@ -1547,6 +1639,20 @@ class ReplayMemoryConfig:
     headroom_fraction: float = 0.1
     tp_source: bool = True
     sequence_parallel: bool = False
+
+
+@dataclass(frozen=True)
+class ReplayMemoryPolicy:
+    """Caller-owned cap policy; all allocation dimensions are engine-derived."""
+
+    alignment: int = 256
+    headroom_fraction: float = 0.1
+
+    def validate(self) -> None:
+        if self.alignment <= 0 or self.alignment > _CAPACITY_LIMIT:
+            raise ValueError("replay memory alignment is invalid")
+        if not 0 <= self.headroom_fraction <= 1:
+            raise ValueError("replay memory headroom fraction must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -1579,6 +1685,22 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
+def _checked_sum(*values: int) -> int:
+    if any(value < 0 for value in values):
+        raise ValueError("memory terms cannot be negative")
+    result = sum(values)
+    if result > _CAPACITY_LIMIT:
+        raise OverflowError("replay memory calculation exceeds int64 capacity")
+    return result
+
+
+def _checked_product(*values: int) -> int:
+    result = math.prod(values)
+    if any(value < 0 for value in values) or result > _CAPACITY_LIMIT:
+        raise OverflowError("replay memory calculation exceeds int64 capacity")
+    return result
+
+
 def _packed_storage_bytes(slots: int) -> int:
     sum_fields = len(fields(PackedSlots)) - 2
     return slots * (
@@ -1602,6 +1724,8 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
         config.local_layers,
         config.hidden_size,
         config.ffn_hidden_size,
+        config.num_attention_heads,
+        config.replay_microbatches,
         config.element_size,
         config.alignment,
     )
@@ -1611,8 +1735,10 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
         raise ValueError("replay memory headroom fraction must be in [0, 1]")
     if config.sequence_length % (2 * config.context_parallel_size):
         raise ValueError("sequence length must support zigzag CP")
-    if config.hidden_size % config.tensor_parallel_size or (
-        config.ffn_hidden_size % config.tensor_parallel_size
+    if (
+        config.hidden_size % config.tensor_parallel_size
+        or (config.ffn_hidden_size % config.tensor_parallel_size)
+        or config.num_attention_heads % config.tensor_parallel_size
     ):
         raise ValueError("response widths must be divisible by tensor parallelism")
     if config.global_layers % config.pipeline_parallel_size or (
@@ -1621,31 +1747,30 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
         raise ValueError("standard replay requires uniform physical pipeline layers")
     if (
         config.sequence_parallel
-        and (config.sequence_length // config.context_parallel_size)
-        % config.tensor_parallel_size
+        and (config.sequence_length // config.context_parallel_size) % config.tensor_parallel_size
     ):
         raise ValueError("CP-local sequence length must support sequence parallelism")
-    local_samples = min(
-        _ceil_div(config.global_batch_size, config.data_parallel_size),
-        config.selected_tokens,
-    )
-    microbatches = (
-        _ceil_div(local_samples, config.micro_batch_size) if local_samples else 0
-    )
+    # Every selected row and selected sample may land on one DP/CP rank.  DP
+    # and CP therefore do not divide the maximum-rank bound.
+    local_samples = min(config.global_batch_size, config.selected_tokens)
+    minimum_microbatches = _ceil_div(local_samples, config.micro_batch_size) if local_samples else 0
+    if config.replay_microbatches < minimum_microbatches:
+        raise ValueError("replay microbatch count cannot discard selected samples")
     # tokens, labels, position_ids, loss_mask, diagnostic mask, and two identity vectors.
-    full_batch = config.micro_batch_size * config.sequence_length * (8 + 8 + 8 + 4 + 1)
-    full_batch += config.micro_batch_size * 2 * 8
-    host_inputs = microbatches * full_batch if config.tp_source else 0
-    cp_local = config.micro_batch_size * (
-        config.sequence_length // config.context_parallel_size
+    full_batch = _checked_product(
+        config.micro_batch_size, config.sequence_length, 8 + 8 + 8 + 4 + 1
     )
-    cp_outputs = cp_local * (8 + 8 + 8 + 4 + 1)
-    device_inputs = full_batch + cp_outputs
+    full_batch = _checked_sum(full_batch, _checked_product(config.micro_batch_size, 2, 8))
+    host_inputs = (
+        _checked_product(config.replay_microbatches, full_batch) if config.tp_source else 0
+    )
+    cp_local = _checked_product(
+        config.micro_batch_size, config.sequence_length // config.context_parallel_size
+    )
+    cp_outputs = _checked_product(cp_local, 8 + 8 + 8 + 4 + 1)
+    device_inputs = _checked_sum(full_batch, cp_outputs)
     sp_mask = cp_local // config.tensor_parallel_size if config.sequence_parallel else 0
-    local_rows = _ceil_div(
-        _ceil_div(config.selected_tokens, config.data_parallel_size),
-        config.context_parallel_size,
-    )
+    local_rows = config.selected_tokens
     feature_widths = (
         config.hidden_size,
         3 * config.hidden_size // config.tensor_parallel_size,
@@ -1655,20 +1780,23 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
     )
     response = 0
     max_response = 0
-    for family, width in enumerate(feature_widths):
-        rows = local_rows
-        owner = family in (1, 3) or config.sequence_parallel
-        if config.sequence_parallel and family not in (1, 3):
-            rows = _ceil_div(rows, config.tensor_parallel_size)
-        if owner:
-            allocation = config.local_layers * rows * width * config.element_size
-            response += allocation
-            max_response = max(max_response, rows * width * config.element_size)
-    slots = config.global_layers * 5
+    # TP rank zero owns residual, attention-out, and FC2 in addition to the
+    # feature-sharded QKV/FC1 families, so it is the conservative max rank.
+    for width in feature_widths:
+        allocation = _checked_product(config.local_layers, local_rows, width, config.element_size)
+        response = _checked_sum(response, allocation)
+        max_response = max(max_response, _checked_product(local_rows, width, config.element_size))
+    slots = _checked_product(config.global_layers, 8)
     packed = _packed_storage_bytes(slots)
     reduction_arena = packed
     accumulator_scratch = PackedSufficientStatistics.scratch_bytes_for_capacity()
-    hook_workspace = 2 * max_response
+    attention_elements = _checked_product(
+        config.selected_tokens,
+        config.num_attention_heads // config.tensor_parallel_size,
+        config.sequence_length,
+    )
+    attention_workspace = _checked_product(8, attention_elements, max(config.element_size, 4))
+    hook_workspace = _checked_sum(_checked_product(2, max_response), attention_workspace)
     terms = (
         ("host_replay_inputs", host_inputs),
         ("device_full_and_cp_inputs", device_inputs),
@@ -1682,9 +1810,11 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
         ("hook_workspace", hook_workspace),
         ("fixed_schedule_workspace", config.fixed_workspace_bytes),
     )
-    padding = sum((-value) % config.alignment for _, value in terms if value)
-    allocated = sum(value for _, value in terms) + padding
-    headroom = math.ceil(allocated * config.headroom_fraction)
+    padding = _checked_sum(*((-value) % config.alignment for _, value in terms if value))
+    allocated = _checked_sum(*(value for _, value in terms), padding)
+    headroom_numerator, headroom_denominator = config.headroom_fraction.as_integer_ratio()
+    headroom = (allocated * headroom_numerator + headroom_denominator - 1) // headroom_denominator
+    _checked_sum(allocated, headroom)
     return ReplayMemoryEstimate(terms, padding, headroom)
 
 
@@ -1697,12 +1827,18 @@ def preflight_replay_memory(
 ) -> None:
     """Reject a replay whose reserved bound exceeds either mandatory limit."""
 
-    if min(maximum_extra_bytes, currently_reserved_bytes, total_device_bytes) < 0:
-        raise ValueError("memory preflight values must be nonnegative")
+    values = (
+        maximum_extra_bytes,
+        currently_reserved_bytes,
+        total_device_bytes,
+        estimate.predicted_reserved_bytes,
+    )
+    if min(values) < 0 or max(values) > _CAPACITY_LIMIT:
+        raise ValueError("memory preflight values must be nonnegative int64 values")
     if estimate.predicted_reserved_bytes > maximum_extra_bytes:
         raise ReplayPreflightError("Tier-1 replay exceeds its configured memory cap")
     if (
-        currently_reserved_bytes + estimate.predicted_reserved_bytes
+        _checked_sum(currently_reserved_bytes, estimate.predicted_reserved_bytes)
         > total_device_bytes
     ):
         raise ReplayPreflightError("Tier-1 replay exceeds physical device headroom")
@@ -1715,10 +1851,7 @@ class ResponseProbe(Protocol):
     descriptor_hash: str
 
     def set_masks(
-        self,
-        full_mask: torch.Tensor,
-        *,
-        sequence_parallel_mask: torch.Tensor | None = None,
+        self, full_mask: torch.Tensor, *, sequence_parallel_mask: torch.Tensor | None = None
     ) -> None: ...
 
     def capture_pre(self) -> Any: ...
@@ -1763,9 +1896,7 @@ class NonInterleavedReplaySchedule:
         pg_collection: object | None = None,
     ) -> None:
         if virtual_pipeline_size not in (None, 1) or len(model) != 1:
-            raise ValueError(
-                "Tier-1 replay does not support interleaved/virtual pipeline"
-            )
+            raise ValueError("Tier-1 replay does not support interleaved/virtual pipeline")
         self.forward_backward_func = forward_backward_func
         self.forward_step_func = forward_step_func
         self.model = list(model)
@@ -1793,9 +1924,7 @@ class NonInterleavedReplaySchedule:
         )
         calls = 0
 
-        def replay_forward(
-            data_iterator: Iterator[Any] | None, model: torch.nn.Module, *args: Any
-        ):
+        def replay_forward(data_iterator: Iterator[Any] | None, model: torch.nn.Module, *args: Any):
             nonlocal calls
             mask = plan.diagnostic_mask(calls, self.probe_device)
             cp_mask, sp_mask = slice_replay_mask(
@@ -1810,12 +1939,8 @@ class NonInterleavedReplaySchedule:
             calls += 1
             output, _reducer = self.forward_step_func(data_iterator, model, *args)
 
-            def zero_reducer(
-                output_tensor: torch.Tensor,
-            ) -> tuple[torch.Tensor, dict[str, Any]]:
-                return torch.zeros(
-                    (), dtype=torch.float32, device=output_tensor.device
-                ), {}
+            def zero_reducer(output_tensor: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
+                return torch.zeros((), dtype=torch.float32, device=output_tensor.device), {}
 
             return output, zero_reducer
 
@@ -1836,9 +1961,7 @@ class NonInterleavedReplaySchedule:
             pg_collection=self.pg_collection,
         )
         if calls != plan.num_microbatches:
-            raise RuntimeError(
-                "replay schedule executed an unexpected microbatch count"
-            )
+            raise RuntimeError("replay schedule executed an unexpected microbatch count")
         self.completed = True
 
 
@@ -1871,6 +1994,41 @@ class TransactionState(StrEnum):
     CLOSED = "closed"
 
 
+def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
+    """Admit only the explicitly inspected dense local-MCore GPT surface."""
+
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.transformer.enums import ModelType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    if len(models) != 1:
+        raise TypeError("Tier-1 replay requires one noninterleaved dense GPTModel chunk")
+    for model in models:
+        if type(model) is not GPTModel:
+            raise TypeError("Tier-1 replay supports exact MCore GPTModel instances only")
+        config = getattr(model, "config", None)
+        if type(config) is not TransformerConfig:
+            raise TypeError("Tier-1 replay requires an exact TransformerConfig")
+        unsupported = {
+            "transformer_engine": config.transformer_impl != "local",
+            "mixture_of_experts": config.num_moe_experts is not None,
+            "expert_parallel": config.expert_model_parallel_size != 1,
+            "fp8": config.fp8 is not None or config.fp8_param,
+            "recompute": config.recompute_granularity is not None,
+            "deferred_embedding_wgrad": config.defer_embedding_wgrad_compute,
+            "cpu_offloading": config.cpu_offloading,
+            "cuda_graph": config.cuda_graph_impl != "none",
+            "virtual_pipeline": config.virtual_pipeline_model_parallel_size not in (None, 1),
+            "multi_token_prediction": bool(getattr(model, "mtp_process", False)),
+            "multi_latent_attention": config.multi_latent_attention,
+        }
+        enabled = sorted(name for name, value in unsupported.items() if value)
+        if enabled:
+            raise ValueError(f"Tier-1 replay does not support GPT capabilities: {enabled}")
+        if getattr(model, "model_type", None) != ModelType.encoder_or_decoder:
+            raise ValueError("Tier-1 replay requires the dense GPT model type")
+
+
 class Tier1ReplayTransaction:
     """Split pre/post replay around an externally owned optimizer update."""
 
@@ -1888,6 +2046,8 @@ class Tier1ReplayTransaction:
         samplers: Sequence[object],
         overlap_objects: Sequence[object],
         fatal_abort: FatalAbort,
+        maximum_model_state_bytes: int = _CAPACITY_LIMIT,
+        memory_estimate: ReplayMemoryEstimate | None = None,
     ) -> None:
         self.models = tuple(models)
         self.plan = plan
@@ -1900,6 +2060,8 @@ class Tier1ReplayTransaction:
         self.samplers = tuple(samplers)
         self.overlap_objects = tuple(overlap_objects)
         self.fatal_abort = fatal_abort
+        self.maximum_model_state_bytes = maximum_model_state_bytes
+        self.memory_estimate = memory_estimate
         self.rng_a: ReplayRngState | None = None
         self.state = TransactionState.READY
 
@@ -1911,12 +2073,77 @@ class Tier1ReplayTransaction:
             overlap_objects=self.overlap_objects,
             tracker_getter=self.tracker_getter,
             cuda_device=self.cuda_device,
+            maximum_model_state_bytes=self.maximum_model_state_bytes,
         )
 
     def _fatal(self, error: BaseException) -> None:
-        self.release()
-        self.fatal_abort(error)
+        fatal_error = error
+        try:
+            self.release()
+        except BaseException as cleanup_error:
+            fatal_error = BaseExceptionGroup(
+                "Tier-1 post-commit failure and cleanup failure", (error, cleanup_error)
+            )
+        finally:
+            self.fatal_abort(fatal_error)
         raise RuntimeError("Tier-1 fatal-abort protocol returned") from error
+
+    def _prepare_phase(self, phase: str) -> ExitStack:
+        """Prepare guard, hooks, modes, and RNG before the last readiness gate."""
+
+        stack = ExitStack()
+        error: BaseException | None = None
+        try:
+            guard = self._guard()
+            guard.prepare()
+            stack.enter_context(guard)
+            stack.enter_context(torch.no_grad())
+            stack.enter_context(
+                self.probe.capture_pre() if phase == "pre" else self.probe.capture_post()
+            )
+            assert self.rng_a is not None
+            for _name, operation in self.rng_a.restore_stages(
+                tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
+            ):
+                operation()
+        except BaseException as caught:
+            error = caught
+        try:
+            self.readiness.settle(error, f"{phase}-schedule state preparation")
+        except BaseException as readiness_error:
+            cleanup_error: BaseException | None = None
+            try:
+                stack.close()
+            except BaseException as caught:
+                cleanup_error = caught
+            self.readiness.settle(cleanup_error, f"{phase}-schedule preparation cleanup")
+            raise readiness_error
+        return stack
+
+    def _run_schedule_phase(self, phase: str) -> None:
+        stack = self._prepare_phase(phase)
+        error: BaseException | None = None
+        try:
+            self.schedule.p2p_started = True
+            self.schedule.completed = False
+            self.schedule(self.plan, self.probe, phase)
+            self.schedule.completed = True
+        except BaseException as caught:
+            error = caught
+        try:
+            stack.close()
+        except BaseException as caught:
+            error = (
+                caught
+                if error is None
+                else BaseExceptionGroup(
+                    f"Tier-1 {phase} schedule and restoration failed", (error, caught)
+                )
+            )
+        try:
+            self.readiness.settle(error, f"{phase}-schedule committed outcome")
+        except BaseException as caught:
+            self._fatal(caught)
 
     def run_pre(self) -> None:
         """Run pre-update replay from RNG state A and restore ambient state."""
@@ -1932,26 +2159,7 @@ class Tier1ReplayTransaction:
             error = caught
         self.readiness.settle(error, "pre-schedule RNG capture")
         assert self.rng_a is not None
-        schedule_error: BaseException | None = None
-        try:
-            with self._guard(), torch.no_grad(), self.probe.capture_pre():
-                for _name, operation in self.rng_a.restore_stages(
-                    tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
-                ):
-                    operation()
-                self.schedule(self.plan, self.probe, "pre")
-        except BaseException as caught:
-            schedule_error = caught
-        if self.schedule.p2p_started:
-            if self.schedule.completed:
-                try:
-                    self.readiness.settle(schedule_error, "pre-schedule restoration")
-                except BaseException as caught:
-                    self._fatal(caught)
-            if schedule_error is not None:
-                self._fatal(schedule_error)
-        elif schedule_error is not None:
-            raise schedule_error
+        self._run_schedule_phase("pre")
         self.state = TransactionState.PRE_COMPLETE
 
     def finish(self, *, update_succeeded: bool) -> Any | None:
@@ -1963,33 +2171,17 @@ class Tier1ReplayTransaction:
             self.release()
             return None
         try:
-            self.schedule.p2p_started = False
-            self.schedule.completed = False
-            self.readiness.settle(None, "post-schedule readiness")
+            self._run_schedule_phase("post")
             result: Any | None = None
-            schedule_error: BaseException | None = None
+            finalize_error: BaseException | None = None
             try:
-                with self._guard(), torch.no_grad(), self.probe.capture_post():
-                    for _name, operation in self.rng_a.restore_stages(
-                        tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
-                    ):
-                        operation()
-                    self.schedule(self.plan, self.probe, "post")
                 result = self.probe.finalize()
             except BaseException as caught:
-                schedule_error = caught
-            if self.schedule.p2p_started:
-                if self.schedule.completed:
-                    try:
-                        self.readiness.settle(
-                            schedule_error, "post-schedule restoration"
-                        )
-                    except BaseException as caught:
-                        self._fatal(caught)
-                if schedule_error is not None:
-                    self._fatal(schedule_error)
-            elif schedule_error is not None:
-                raise schedule_error
+                finalize_error = caught
+            try:
+                self.readiness.settle(finalize_error, "post-schedule finalization")
+            except BaseException as caught:
+                self._fatal(caught)
             return result
         finally:
             self.release()
@@ -1999,10 +2191,19 @@ class Tier1ReplayTransaction:
 
         if self.state == TransactionState.CLOSED:
             return
-        self.probe.release()
-        self.plan.release()
-        self.rng_a = None
+        failures: list[tuple[str, BaseException]] = []
+        for name, operation in (
+            ("probe_release", self.probe.release),
+            ("plan_release", self.plan.release),
+            ("rng_release", lambda: setattr(self, "rng_a", None)),
+        ):
+            try:
+                operation()
+            except BaseException as error:
+                failures.append((name, error))
         self.state = TransactionState.CLOSED
+        if failures:
+            raise ReplayRestorationError(failures)
 
 
 class Tier1ReplayEngine:
@@ -2035,7 +2236,7 @@ class Tier1ReplayEngine:
         plan: ReplayPlan,
         probe: ResponseProbe,
         schedule: ReplaySchedule,
-        memory_estimate: ReplayMemoryEstimate,
+        memory_policy: ReplayMemoryPolicy,
         maximum_extra_bytes: int,
         currently_reserved_bytes: int,
         total_device_bytes: int,
@@ -2065,14 +2266,10 @@ class Tier1ReplayEngine:
         assert response_minimum is not None and response_maximum is not None
         if self.readiness.binding.size > 1:
             dist.all_reduce(
-                response_minimum,
-                op=dist.ReduceOp.MIN,
-                group=self.readiness.binding.group,
+                response_minimum, op=dist.ReduceOp.MIN, group=self.readiness.binding.group
             )
             dist.all_reduce(
-                response_maximum,
-                op=dist.ReduceOp.MAX,
-                group=self.readiness.binding.group,
+                response_maximum, op=dist.ReduceOp.MAX, group=self.readiness.binding.group
             )
             error = (
                 ValueError("Tier-1 response descriptor hash differs across ranks")
@@ -2081,18 +2278,99 @@ class Tier1ReplayEngine:
             )
             self.readiness.settle(error, "response descriptor identity")
         error = None
+        memory_estimate: ReplayMemoryEstimate | None = None
         try:
             if probe.expected_hook_calls != plan.num_microbatches:
                 raise ValueError("response hook cardinality disagrees with replay plan")
             if not plan.metadata.descriptor_hash:
                 raise ValueError("replay plan has no canonical descriptor hash")
             if self.tracker_getter is None:
-                raise TypeError(
-                    "Tier-1 replay requires an inspected Megatron RNG tracker"
-                )
+                raise TypeError("Tier-1 replay requires an inspected Megatron RNG tracker")
             tracker = _validated_tracker(self.tracker_getter)
             if self.tracker_getter() is not tracker:
                 raise TypeError("Megatron RNG tracker getter is not identity-stable")
+            _validate_dense_gpt_models(self.models)
+            if type(schedule) is not NonInterleavedReplaySchedule:
+                raise TypeError("Tier-1 replay requires the verified noninterleaved schedule")
+            memory_policy.validate()
+            state_guard = ReplayStateGuard(
+                self.models,
+                mutable_buffer_names=self.mutable_buffer_names,
+                samplers=self.samplers,
+                overlap_objects=self.overlap_objects,
+                tracker_getter=self.tracker_getter,
+                cuda_device=self.cuda_device,
+                maximum_model_state_bytes=maximum_extra_bytes,
+            )
+            state_guard.prepare()
+            assert state_guard.rng is not None
+            rng_snapshot_bytes = state_guard.rng.tensor_bytes
+            model_state_bytes = state_guard.model.tensor_bytes
+            with state_guard:
+                pass
+            model_config = self.models[0].config
+            if any(model.config is not model_config for model in self.models):
+                raise ValueError("pipeline model chunks have inconsistent GPT configs")
+            global_layers = getattr(probe, "global_layers", None)
+            descriptors = getattr(probe, "descriptors", None)
+            if not isinstance(global_layers, int) or not isinstance(descriptors, tuple):
+                raise TypeError("response probe lacks verified layer descriptors")
+            local_layers = len({descriptor.global_layer for descriptor in descriptors})
+            if local_layers <= 0:
+                raise ValueError("response probe has no local dense GPT layers")
+            params_dtype = model_config.params_dtype
+            if not isinstance(params_dtype, torch.dtype):
+                raise TypeError("GPT parameter dtype is not a torch dtype")
+            cp_local = plan.metadata.sequence_length // schedule.cp_size
+            if (
+                model_config.tensor_model_parallel_size != schedule.tp_size
+                or model_config.context_parallel_size != schedule.cp_size
+            ):
+                raise ValueError("schedule topology disagrees with the GPT config")
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            model_parallel_size = _checked_product(
+                schedule.tp_size, schedule.cp_size, model_config.pipeline_model_parallel_size
+            )
+            if world_size % model_parallel_size:
+                raise ValueError("world size is not divisible by model parallel topology")
+            data_parallel_size = world_size // model_parallel_size
+            fixed_workspace_bytes = _checked_sum(
+                _checked_product(plan.metadata.micro_batch_size, plan.metadata.sequence_length),
+                _checked_product(plan.metadata.micro_batch_size, cp_local),
+                _checked_product(
+                    plan.metadata.micro_batch_size,
+                    cp_local // schedule.tp_size if schedule.sequence_parallel else 0,
+                ),
+            )
+            actual_config = ReplayMemoryConfig(
+                sequence_length=plan.metadata.sequence_length,
+                micro_batch_size=plan.metadata.micro_batch_size,
+                global_batch_size=plan.metadata.global_selected_tokens,
+                data_parallel_size=data_parallel_size,
+                tensor_parallel_size=schedule.tp_size,
+                pipeline_parallel_size=model_config.pipeline_model_parallel_size,
+                context_parallel_size=schedule.cp_size,
+                global_layers=global_layers,
+                local_layers=local_layers,
+                hidden_size=model_config.hidden_size,
+                ffn_hidden_size=model_config.ffn_hidden_size,
+                num_attention_heads=model_config.num_attention_heads,
+                selected_tokens=plan.metadata.global_selected_tokens,
+                replay_microbatches=plan.num_microbatches,
+                element_size=torch.empty((), dtype=params_dtype).element_size(),
+                rng_snapshot_bytes=rng_snapshot_bytes,
+                model_state_bytes=model_state_bytes,
+                fixed_workspace_bytes=fixed_workspace_bytes,
+                alignment=memory_policy.alignment,
+                headroom_fraction=memory_policy.headroom_fraction,
+                tp_source=True,
+                sequence_parallel=schedule.sequence_parallel,
+            )
+            memory_estimate = estimate_replay_memory(actual_config)
+            if plan.num_microbatches and memory_estimate.predicted_reserved_bytes <= 0:
+                raise ReplayPreflightError(
+                    "nonempty replay plans require a nonzero memory preflight"
+                )
             preflight_replay_memory(
                 memory_estimate,
                 maximum_extra_bytes=maximum_extra_bytes,
@@ -2102,6 +2380,7 @@ class Tier1ReplayEngine:
         except BaseException as caught:
             error = caught
         self.readiness.settle(error, "transaction preflight")
+        assert memory_estimate is not None
         return Tier1ReplayTransaction(
             models=self.models,
             plan=plan,
@@ -2114,4 +2393,6 @@ class Tier1ReplayEngine:
             samplers=self.samplers,
             overlap_objects=self.overlap_objects,
             fatal_abort=self.fatal_abort,
+            maximum_model_state_bytes=maximum_extra_bytes,
+            memory_estimate=memory_estimate,
         )

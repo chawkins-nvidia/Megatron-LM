@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import json
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -52,28 +54,26 @@ def _probe(layers: int, *, owner: bool = True, expected_hook_calls: int = 0):
     return probe, modules
 
 
-def _add_relative_response(
-    probe: FunctionResponseProbe, slot: int, response: float
-) -> None:
+def _add_relative_response(probe: FunctionResponseProbe, slot: int, response: float) -> None:
     before = torch.tensor([3.0, 4.0], dtype=torch.bfloat16)
     after = before.float() * (1 + response)
     probe.registry.add_update(
-        probe.accumulator.statistics,
-        probe.registry.slot_names[slot],
-        before,
-        after,
+        probe.accumulator.statistics, probe.registry.slot_names[slot], before, after
     )
 
 
 def test_tier1_schema_is_exactly_30_unique_canonical_keys() -> None:
+    fixture_path = Path(
+        "/home/chawkins/src/scaling-worktrees/issue-209-launch-review/"
+        "tests/fixtures/diag_v2_canonical_keys.json"
+    )
+    fixture = json.loads(fixture_path.read_bytes())
+    approved = tuple(fixture["tier1_core"] + fixture["tier1_attention"])
+
     assert len(TIER1_KEYS) == 30
     assert len(set(TIER1_KEYS)) == 30
-    assert TIER1_KEYS[:5] == (
-        "diag/v2/tier1/residual/dy_rel/first",
-        "diag/v2/tier1/residual/dy_rel/q25",
-        "diag/v2/tier1/residual/dy_rel/mid",
-        "diag/v2/tier1/residual/dy_rel/q75",
-        "diag/v2/tier1/residual/dy_rel/last",
+    assert b"\0".join(key.encode() for key in TIER1_KEYS) == b"\0".join(
+        key.encode() for key in approved
     )
 
 
@@ -83,9 +83,7 @@ def test_exact_pooled_formulas_produce_all_30_outputs() -> None:
     for layer in range(layers):
         for family in range(len(RESPONSE_FAMILIES)):
             _add_relative_response(
-                probe,
-                layer * len(RESPONSE_FAMILIES) + family,
-                response=(layer + 1) / 16,
+                probe, layer * len(RESPONSE_FAMILIES) + family, response=(layer + 1) / 16
             )
     probe.accumulator.finalize_local_()
 
@@ -97,11 +95,10 @@ def test_exact_pooled_formulas_produce_all_30_outputs() -> None:
     torch.testing.assert_close(
         result.dy_rel[:, 0], torch.arange(1, layers + 1, dtype=torch.float64) / 16
     )
-    assert payload["diag/v2/tier1/residual/dy_rel/first"] == pytest.approx(1 / 16)
-    assert payload["diag/v2/tier1/residual/dy_rel/last"] == pytest.approx(5 / 16)
+    assert payload["diag/v2/t1/response/residual/dy_rel/first"] == pytest.approx(1 / 16)
+    assert payload["diag/v2/t1/response/residual/dy_rel/last"] == pytest.approx(5 / 16)
     assert all(
-        payload[f"diag/v2/tier1/{family.value}/valid_fraction"] == 1
-        for family in RESPONSE_FAMILIES
+        math.isnan(payload[key]) for key in TIER1_KEYS if key.startswith("diag/v2/t1/attention/")
     )
 
 
@@ -109,16 +106,10 @@ def test_pooled_sums_are_not_an_average_of_rank_or_microbatch_ratios() -> None:
     probe, _modules = _probe(1)
     slot = probe.registry.slot_names[0]
     probe.registry.add_update(
-        probe.accumulator.statistics,
-        slot,
-        torch.tensor([1.0]),
-        torch.tensor([2.0]),
+        probe.accumulator.statistics, slot, torch.tensor([1.0]), torch.tensor([2.0])
     )
     probe.registry.add_update(
-        probe.accumulator.statistics,
-        slot,
-        torch.tensor([100.0]),
-        torch.tensor([110.0]),
+        probe.accumulator.statistics, slot, torch.tensor([100.0]), torch.tensor([110.0])
     )
     probe.accumulator.finalize_local_()
 
@@ -140,13 +131,30 @@ def test_no_population_and_observation_errors_are_invalid_nan() -> None:
     assert not result.valid.any()
     assert torch.isnan(result.dy_rel).all()
     assert all(
-        payload[f"diag/v2/tier1/{family.value}/valid_fraction"] == 0
+        math.isnan(payload[f"diag/v2/t1/response/{family.value}/starved_fraction"])
         for family in RESPONSE_FAMILIES
     )
-    assert all(
-        math.isnan(payload[f"diag/v2/tier1/{family.value}/starved_fraction"])
-        for family in RESPONSE_FAMILIES
-    )
+
+
+def test_attention_keys_derive_from_attention_logits_and_probabilities() -> None:
+    probe, _modules = _probe(3, expected_hook_calls=1)
+    probe._phase = "post"
+    probe.set_masks(torch.tensor([[True, False]]))
+    probabilities = torch.tensor([[[[0.5, 0.5], [0.5, 0.5]]]])
+    for layer in range(3):
+        logits = torch.full_like(probabilities, float(layer + 1))
+        probe.observe_attention(layer, logits, probabilities)
+    probe._phase = None
+    accumulator = probe.finalize()
+    accumulator.finalize_local_()
+
+    payload = derive_tier1_summaries(accumulator)
+
+    assert payload["diag/v2/t1/attention/logit_abs_p50"] == pytest.approx(2)
+    assert payload["diag/v2/t1/attention/logit_abs_p90"] == pytest.approx(2.8)
+    assert payload["diag/v2/t1/attention/entropy_p10"] == pytest.approx(math.log(2))
+    assert payload["diag/v2/t1/attention/entropy_p50"] == pytest.approx(math.log(2))
+    assert payload["diag/v2/t1/attention/collapse_fraction"] == 0
 
 
 def test_nonowner_slots_remain_exactly_neutral() -> None:
@@ -158,16 +166,9 @@ def test_nonowner_slots_remain_exactly_neutral() -> None:
     assert torch.isposinf(probe.accumulator.statistics.min_pack).all()
 
 
-def test_rows_are_selected_before_bias_and_unselected_nonfinite_values_are_ignored() -> (
-    None
-):
+def test_rows_are_selected_before_bias_and_unselected_nonfinite_values_are_ignored() -> None:
     activation = torch.tensor(
-        [
-            [[1.0, 2.0]],
-            [[torch.inf, torch.inf]],
-            [[5.0, 6.0]],
-            [[torch.nan, torch.nan]],
-        ]
+        [[[1.0, 2.0]], [[torch.inf, torch.inf]], [[5.0, 6.0]], [[torch.nan, torch.nan]]]
     )
     mask = torch.tensor([[True], [False], [True], [False]])
     bias = torch.tensor([0.25, 0.5])
@@ -214,7 +215,7 @@ def test_descriptor_hash_is_global_and_independent_of_local_ownership() -> None:
 
     assert owner.descriptor_hash == nonowner.descriptor_hash
     assert owner.registry.slot_names == nonowner.registry.slot_names
-    assert len(owner.registry.slot_names) == 3 * len(RESPONSE_FAMILIES)
+    assert len(owner.registry.slot_names) == 3 * (len(RESPONSE_FAMILIES) + 3)
 
 
 def test_canonical_accumulator_scratch_bound_is_used() -> None:
