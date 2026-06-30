@@ -888,14 +888,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 raise ValueError(
                     f"distributed-optimizer diagnostic group {group_index} is not aligned"
                 )
-            for group_parameter_index, (
-                model_param,
-                aligned_model_shard,
-                main_shard,
-            ) in enumerate(zip(model_group, model_shard_group, main_group)):
+            for group_parameter_index, (model_param, aligned_model_shard, main_shard) in enumerate(
+                zip(model_group, model_shard_group, main_group)
+            ):
                 if aligned_model_shard is None or main_shard is None:
                     raise RuntimeError("quantized or missing owner shards are not supported")
-                if model_param.dtype != torch.bfloat16 or aligned_model_shard.dtype != torch.bfloat16:
+                if (
+                    model_param.dtype != torch.bfloat16
+                    or aligned_model_shard.dtype != torch.bfloat16
+                ):
                     raise RuntimeError("diagnostic forward owner shards must be BF16")
                 if main_shard.dtype != torch.float32:
                     raise RuntimeError("diagnostic authoritative owner shards must be FP32")
@@ -915,9 +916,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if model_shard.dtype != torch.bfloat16:
                     raise RuntimeError("diagnostic applied owner bucket slices must be BF16")
 
-                tensor_parallel_sharded = bool(
-                    getattr(model_param, "tensor_model_parallel", False)
-                )
+                tensor_parallel_sharded = bool(getattr(model_param, "tensor_model_parallel", False))
                 tensor_parallel_owner = tensor_parallel.param_is_not_tensor_parallel_duplicate(
                     model_param, tp_group=getattr(self, "tp_group", None)
                 )

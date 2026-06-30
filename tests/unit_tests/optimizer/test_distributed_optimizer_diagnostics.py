@@ -31,6 +31,7 @@ from megatron.training.diagnostics.distributed_optimizer import (
     DistributedOptimizerEventStatus,
     SnapshotMemoryReason,
 )
+from megatron.training.diagnostics.normalization import CanonicalDgradNormalizer
 from megatron.training.diagnostics.registry import (
     DenominatorKind,
     MaskKind,
@@ -302,6 +303,225 @@ def _adapter(
         ),
         registry,
     )
+
+
+def _cross_lane_registry(
+    parameters: tuple[torch.nn.Parameter, ...],
+    *,
+    local_owners: tuple[bool, ...] | None = None,
+    reducer=None,
+) -> tuple[MetricRegistry, dict[torch.nn.Parameter, str]]:
+    descriptors = [
+        MetricDescriptor(
+            logical_name="event/runtime_status",
+            family=MetricFamily.EVENT,
+            global_layer=None,
+            partition_axes=(),
+            replication_axes=(),
+            replication_multiplicity=1,
+            ownership=Ownership.EVERY_RANK,
+            mask_kind=MaskKind.NONE,
+            statistic_kind=StatisticKind.TENSOR_MOMENTS,
+            denominator_kind=DenominatorKind.SELECTED_ELEMENTS,
+            normalization_kind=NormalizationKind.NONE,
+            process_group_identity=ProcessGroupIdentity.WORLD,
+            reduction_kind=ReductionKind.PACKED_SUM_MAX_MIN,
+            tied_owner_identity=None,
+            packed_slots=PackedSlots.for_index(0),
+        ),
+        MetricDescriptor(
+            logical_name="dgrad/residual/layer_0",
+            family=MetricFamily.RESIDUAL,
+            global_layer=0,
+            partition_axes=(PartitionAxis.DATA_SAMPLE, PartitionAxis.PIPELINE_LAYER),
+            replication_axes=(),
+            replication_multiplicity=1,
+            ownership=Ownership.PIPELINE_STAGE,
+            mask_kind=MaskKind.TOKEN,
+            statistic_kind=StatisticKind.TENSOR_MOMENTS,
+            denominator_kind=DenominatorKind.SELECTED_ELEMENTS,
+            normalization_kind=NormalizationKind.LOSS_SCALE_AND_GLOBAL_VALID_TOKENS,
+            process_group_identity=ProcessGroupIdentity.WORLD,
+            reduction_kind=ReductionKind.PACKED_SUM_MAX_MIN,
+            tied_owner_identity=None,
+            packed_slots=PackedSlots.for_index(1),
+        ),
+    ]
+    names = {}
+    for parameter_index, parameter in enumerate(parameters):
+        descriptor_index = len(descriptors)
+        logical_name = f"update/fc1/{parameter_index}"
+        names[parameter] = logical_name
+        descriptors.append(
+            MetricDescriptor(
+                logical_name=logical_name,
+                family=MetricFamily.FC1,
+                global_layer=parameter_index,
+                partition_axes=(
+                    PartitionAxis.OPTIMIZER_SHARD,
+                    PartitionAxis.TENSOR_FEATURE,
+                    PartitionAxis.PIPELINE_LAYER,
+                ),
+                replication_axes=(),
+                replication_multiplicity=1,
+                ownership=Ownership.AUTHORITATIVE_SHARD,
+                mask_kind=MaskKind.NONE,
+                statistic_kind=StatisticKind.UPDATE,
+                denominator_kind=DenominatorKind.PRE_UPDATE_SUMSQ,
+                normalization_kind=NormalizationKind.NONE,
+                process_group_identity=ProcessGroupIdentity.WORLD,
+                reduction_kind=ReductionKind.PACKED_SUM_MAX_MIN,
+                tied_owner_identity=None,
+                packed_slots=PackedSlots.for_index(descriptor_index),
+            )
+        )
+    return (
+        MetricRegistry(
+            descriptors,
+            reduction_binding=ReductionBinding.flat_world(None, reducer=reducer),
+            local_owners=local_owners,
+            normalization_adapters=(CanonicalDgradNormalizer(loss_scale=2.0),),
+        ),
+        names,
+    )
+
+
+def _applied_update_moments() -> dict[str, torch.Tensor]:
+    return {
+        "count": torch.tensor(2.0, dtype=torch.float64),
+        "master_sumsq": torch.tensor(4.0, dtype=torch.float64),
+        "applied_sumsq": torch.tensor(1.0, dtype=torch.float64),
+        "applied_pre_sumsq": torch.tensor(16.0, dtype=torch.float64),
+        "master_nonzero": torch.tensor(2.0, dtype=torch.float64),
+        "applied_nonzero": torch.tensor(1.0, dtype=torch.float64),
+        "cast_zero": torch.tensor(1.0, dtype=torch.float64),
+        "nonfinite": torch.tensor(0.0, dtype=torch.float64),
+        "maximum": torch.tensor(0.5, dtype=torch.float32),
+        "minimum": torch.tensor(0.0, dtype=torch.float32),
+        "arithmetic_error": torch.tensor(0.0, dtype=torch.float64),
+        "materialization_error": torch.tensor(0.0, dtype=torch.float64),
+        "materialization_valid": torch.tensor(True),
+    }
+
+
+def test_cross_lane_normalization_changes_only_the_capture_slot() -> None:
+    _, parameters = _fake_optimizer()
+    registry, _ = _cross_lane_registry(parameters)
+    accumulator = registry.new_accumulator("cpu")
+    registry.add_masked_tensor(
+        accumulator, "dgrad/residual/layer_0", torch.tensor([4.0, 8.0]), mask=torch.ones(2)
+    )
+    registry.add_applied_update_moments(accumulator, "update/fc1/0", **_applied_update_moments())
+    accumulator.finalize_local_()
+
+    update_slots = accumulator.slots("update/fc1/0")
+    update_sum_before = accumulator.sum_pack[
+        update_slots.sum : update_slots.observation_error + 1
+    ].clone()
+    update_max_before = accumulator.max_pack[update_slots.maximum].clone()
+    update_min_before = accumulator.min_pack[update_slots.minimum].clone()
+    registry.apply_normalizations_(accumulator, global_valid_tokens=torch.tensor(2.0))
+
+    torch.testing.assert_close(
+        accumulator.rms("dgrad/residual/layer_0").value,
+        torch.sqrt(torch.tensor(40.0, dtype=torch.float64)) / 4.0,
+    )
+    torch.testing.assert_close(
+        accumulator.norm_retention("update/fc1/0").value, torch.tensor(0.5, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        accumulator.sum_pack[update_slots.sum : update_slots.observation_error + 1],
+        update_sum_before,
+    )
+    torch.testing.assert_close(accumulator.max_pack[update_slots.maximum], update_max_before)
+    torch.testing.assert_close(accumulator.min_pack[update_slots.minimum], update_min_before)
+
+
+def test_cross_lane_capture_missing_and_optimizer_invalid_status_share_one_reduction() -> None:
+    collective_calls = []
+
+    def identity_reducer(tensor, *, op, group):
+        collective_calls.append((tensor, op, group))
+
+    optimizer, parameters = _fake_optimizer()
+    registry, names = _cross_lane_registry(parameters, reducer=identity_reducer)
+    adapter = Bf16DistributedOptimizerDiagnosticAdapter(
+        optimizer, registry, names, diagnostic_max_extra_bytes=1_000_000, finish_chunk_elements=2
+    )
+    accumulator = registry.new_accumulator("cpu")
+    registry.mark_observation_error(accumulator, "dgrad/residual/layer_0")
+    assert adapter.begin_event() is not None
+    with torch.no_grad():
+        for shard in adapter.iter_owner_shards():
+            shard.main_shard.add_(0.25)
+    assert adapter.finish_event(accumulator, update_successful=True) is not None
+    registry.add_masked_tensor(
+        accumulator, "event/runtime_status", adapter.status_for_event_consensus()
+    )
+    accumulator.reduce_()
+
+    capture_slots = accumulator.slots("dgrad/residual/layer_0")
+    event_slots = accumulator.slots("event/runtime_status")
+    assert len(collective_calls) == 3
+    assert accumulator.sum_pack[capture_slots.observation_error] == 1
+    assert accumulator.max_pack[event_slots.maximum] == int(
+        DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH
+    )
+    assert adapter.local_status.item() == DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH
+    for parameter in parameters:
+        update_slots = accumulator.slots(names[parameter])
+        assert accumulator.sum_pack[update_slots.mask_error] > 0
+        assert accumulator.sum_pack[update_slots.observation_error] == 0
+
+
+def test_cross_lane_nonowners_keep_every_slot_neutral_and_the_same_layout() -> None:
+    _, parameters = _fake_optimizer()
+    owner_registry, _ = _cross_lane_registry(parameters)
+    nonowner_registry, _ = _cross_lane_registry(
+        parameters, local_owners=tuple(False for _ in owner_registry.descriptors)
+    )
+    accumulator = nonowner_registry.new_accumulator("cpu")
+    nonowner_registry.add_masked_tensor(
+        accumulator, "dgrad/residual/layer_0", torch.tensor([4.0]), mask=torch.ones(1)
+    )
+    nonowner_registry.add_applied_update_moments(
+        accumulator, "update/fc1/0", **_applied_update_moments()
+    )
+    nonowner_registry.add_masked_tensor(
+        accumulator,
+        "event/runtime_status",
+        torch.tensor([DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH]),
+    )
+    accumulator.finalize_local_()
+    nonowner_registry.apply_normalizations_(accumulator, global_valid_tokens=torch.tensor(2.0))
+
+    assert nonowner_registry.slot_names == owner_registry.slot_names
+    assert nonowner_registry.descriptor_hash == owner_registry.descriptor_hash
+    assert torch.count_nonzero(accumulator.sum_pack) == 0
+    assert torch.all(accumulator.max_pack == -torch.inf)
+    assert torch.all(accumulator.min_pack == torch.inf)
+
+
+def test_cross_lane_exact_hbm_adds_capture_scratch_and_optimizer_event_only() -> None:
+    optimizer, parameters = _fake_optimizer()
+    registry, names = _cross_lane_registry(parameters)
+    adapter = Bf16DistributedOptimizerDiagnosticAdapter(
+        optimizer, registry, names, diagnostic_max_extra_bytes=2_000_000
+    )
+    accumulator = registry.new_accumulator("cpu")
+    estimate = adapter.estimate_snapshot_memory()
+    persistent_pack_baseline = (
+        accumulator.sum_pack.nbytes + accumulator.max_pack.nbytes + accumulator.min_pack.nbytes
+    )
+    combined_incremental_hbm = accumulator.maximum_scratch_bytes + estimate.total_bytes
+
+    assert accumulator.maximum_scratch_bytes == 1_572_864
+    assert estimate.snapshot_bytes == 42
+    assert estimate.finish_scratch_bytes == 304
+    assert estimate.total_bytes == estimate.snapshot_bytes + estimate.finish_scratch_bytes == 346
+    assert combined_incremental_hbm == 1_573_210
+    assert persistent_pack_baseline == 384
+    assert combined_incremental_hbm + persistent_pack_baseline == 1_573_594
 
 
 def test_iterator_exposes_existing_cross_parameter_and_padding_ranges() -> None:

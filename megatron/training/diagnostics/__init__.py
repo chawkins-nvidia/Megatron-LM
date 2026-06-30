@@ -23,7 +23,6 @@ from .capture import (
     stage_valid_token_mask,
     unpack_valid_token_mask_sideband,
 )
-from .normalization import CanonicalDgradNormalizer
 from .distributed_optimizer import (
     Bf16DistributedOptimizerDiagnosticAdapter,
     DeviceMemoryState,
@@ -37,6 +36,7 @@ from .distributed_optimizer import (
     SnapshotMemoryPreflight,
     SnapshotMemoryReason,
 )
+from .normalization import CanonicalDgradNormalizer
 from .registry import (
     DenominatorKind,
     MaskKind,
