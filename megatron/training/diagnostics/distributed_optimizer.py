@@ -66,6 +66,14 @@ class DistributedOptimizerEventStatus(IntEnum):
     ALLOCATOR_QUERY_FAILED = 21
     BEGIN_UNEXPECTED_FAILED = 22
     FINISH_UNEXPECTED_FAILED = 23
+    SECANT_DELTA_NOT_ARMED = 24
+    SECANT_DELTA_IDENTITY_CHANGED = 25
+    SECANT_DELTA_NONFINITE = 26
+    SECANT_DELTA_FAILED = 27
+    SECANT_MIDPOINT_UNAVAILABLE = 28
+    SECANT_MIDPOINT_INSTALL_FAILED = 29
+    SECANT_RESTORE_COPY_FAILED = 30
+    SECANT_RESTORE_VERIFY_FAILED = 31
 
 
 class SnapshotMemoryReason(IntEnum):
@@ -206,6 +214,10 @@ class _SnapshotState:
     applied_before: torch.Tensor
     measurement: SnapshotMemoryMeasurement
     allocator_before: int | None
+    unique_capture_indices: tuple[int, ...]
+    delta_ready: bool = False
+    midpoint_installed: bool = False
+    post_fingerprints: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -482,6 +494,8 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         )
         self._construction_status = DistributedOptimizerEventStatus.OK
         self._bound_shards: tuple[ModelMainParamShard, ...] = ()
+        self._bound_offsets: tuple[tuple[int, int], ...] = ()
+        self._unique_capture_indices: tuple[int, ...] = ()
 
         try:
             shards = tuple(self.optimizer.iter_model_main_param_shards())
@@ -514,12 +528,15 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             return
         try:
             self._validate_unique_local_ownership(shards)
+            offsets, unique_capture_indices = self._capture_layout(shards)
         except Exception:
             self._record_construction_failure(
                 DistributedOptimizerEventStatus.CONSTRUCTOR_OWNERSHIP_FAILED
             )
             return
         self._bound_shards = shards
+        self._bound_offsets = offsets
+        self._unique_capture_indices = unique_capture_indices
 
     @staticmethod
     def negotiate_capabilities(
@@ -603,10 +620,33 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
 
         return self._bound_shards
 
+    @property
+    def secant_delta_ready(self) -> bool:
+        """Return whether the shared FP32 pre buffer now stores authoritative deltas."""
+
+        return self._snapshot is not None and self._snapshot.delta_ready
+
+    @property
+    def secant_delta_buffer(self) -> torch.Tensor | None:
+        """Return the shared FP32 pre buffer after its in-place delta transformation."""
+
+        if self._snapshot is None or not self._snapshot.delta_ready:
+            return None
+        return self._snapshot.master_before
+
+    @property
+    def secant_applied_pre_buffer(self) -> torch.Tensor | None:
+        """Return the immutable BF16 pre-materialization snapshot for the active event."""
+
+        return None if self._snapshot is None else self._snapshot.applied_before
+
     def estimate_snapshot_memory(self) -> SnapshotMemoryEstimate:
         """Return exact retained and bounded peak bytes through accumulation."""
 
-        owner_elements = sum(shard.main_shard.numel() for shard in self._bound_shards)
+        owner_elements = sum(
+            self._bound_shards[index].main_shard.numel()
+            for index in self._unique_capture_indices
+        )
         return snapshot_memory_estimate(
             owner_elements, finish_chunk_elements=self.finish_chunk_elements
         )
@@ -688,9 +728,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             reason=reason,
         )
 
-    def begin_event(
-        self, *, additional_bytes: int = 0
-    ) -> SnapshotMemoryMeasurement | None:
+    def begin_event(self, *, additional_bytes: int = 0) -> SnapshotMemoryMeasurement | None:
         """Capture pre-state or expose a typed local status with no retained partial state."""
 
         try:
@@ -700,9 +738,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             self._set_status(DistributedOptimizerEventStatus.BEGIN_UNEXPECTED_FAILED)
             return None
 
-    def _begin_event(
-        self, *, additional_bytes: int = 0
-    ) -> SnapshotMemoryMeasurement | None:
+    def _begin_event(self, *, additional_bytes: int = 0) -> SnapshotMemoryMeasurement | None:
         """Implement begin under the nonthrowing public lifecycle boundary."""
 
         if self._snapshot is not None:
@@ -725,13 +761,10 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         ):
             self._set_status(DistributedOptimizerEventStatus.BEGIN_IDENTITY_CHANGED)
             return None
-        if not shards:
-            self._set_status(DistributedOptimizerEventStatus.BEGIN_NO_SHARDS)
-            return None
         devices = {shard.main_shard.device for shard in shards} | {
             shard.model_shard.device for shard in shards
         }
-        if len(devices) != 1:
+        if len(devices) > 1:
             self._set_status(DistributedOptimizerEventStatus.BEGIN_DEVICE_MISMATCH)
             return None
         estimate = self.estimate_snapshot_memory()
@@ -743,7 +776,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
                 return None
             estimate = preflight.estimate
 
-        device = next(iter(devices))
+        device = next(iter(devices), self._status.device)
         allocator_ok, allocator_before = self._sample_allocator_bytes(device)
         if not allocator_ok:
             return None
@@ -769,19 +802,21 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
                 self._set_status(DistributedOptimizerEventStatus.BEGIN_SECOND_ALLOCATION_FAILED)
                 return None
 
-        offsets: list[tuple[int, int]] = []
         try:
-            offset = 0
-            for shard in shards:
-                end = offset + shard.main_shard.numel()
-                master_before[offset:end].copy_(shard.main_shard.view(-1))
-                applied_before[offset:end].copy_(shard.model_shard.view(-1))
-                offsets.append((offset, end))
-                offset = end
+            offsets, unique_capture_indices = self._capture_layout(shards)
+            if (
+                offsets != self._bound_offsets
+                or unique_capture_indices != self._unique_capture_indices
+            ):
+                raise ValueError("distributed-optimizer capture alias layout changed")
+            for index in unique_capture_indices:
+                start, end = offsets[index]
+                shard = shards[index]
+                master_before[start:end].copy_(shard.main_shard.view(-1))
+                applied_before[start:end].copy_(shard.model_shard.view(-1))
         except Exception:
             master_before = None
             applied_before = None
-            offsets.clear()
             self._set_status(DistributedOptimizerEventStatus.BEGIN_COPY_FAILED)
             return None
 
@@ -789,7 +824,6 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         if not allocator_ok:
             master_before = None
             applied_before = None
-            offsets.clear()
             return None
         allocator_delta = self._allocator_delta(allocator_before, allocator_after)
         measurement = SnapshotMemoryMeasurement(
@@ -806,6 +840,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             applied_before=applied_before,
             measurement=measurement,
             allocator_before=allocator_before,
+            unique_capture_indices=unique_capture_indices,
         )
         return measurement
 
@@ -813,6 +848,174 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         """Return retained payload and peak measurements for the active event."""
 
         return None if self._snapshot is None else self._snapshot.measurement
+
+    @torch.no_grad()
+    def commit_secant_delta(
+        self, accumulator: PackedSufficientStatistics | None = None, *, update_successful: bool
+    ) -> SnapshotMemoryMeasurement | None:
+        """Turn the shared FP32 pre snapshot into delta without changing live masters.
+
+        The optional accumulator receives the ordinary Tier-0 applied-update moments
+        before the pre snapshot is overwritten. Runtime failures remain encoded in
+        :attr:`local_status`; this local half never launches a collective.
+
+        Args:
+            accumulator: Canonical registry accumulator shared with Tier 0, if due.
+            update_successful: Globally agreed optimizer-step result supplied by integration.
+
+        Returns:
+            Updated memory measurement, or ``None`` when local preparation failed.
+        """
+
+        snapshot = self._snapshot
+        if snapshot is None or snapshot.delta_ready:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_DELTA_NOT_ARMED)
+            return None
+        if not update_successful:
+            self._set_status(DistributedOptimizerEventStatus.UPDATE_SKIPPED)
+            self.abort_event()
+            return None
+
+        try:
+            current_shards = tuple(self.optimizer.iter_model_main_param_shards())
+            if len(current_shards) != len(snapshot.shards) or any(
+                self._shard_identity(original) != self._shard_identity(current)
+                for original, current in zip(snapshot.shards, current_shards)
+            ):
+                self._set_status(DistributedOptimizerEventStatus.SECANT_DELTA_IDENTITY_CHANGED)
+                return None
+
+            scratch = self._allocate_finish_scratch(snapshot.master_before.device)
+            try:
+                self._verify_materialization(current_shards, scratch)
+                torch.eq(
+                    self._status,
+                    int(DistributedOptimizerEventStatus.OK),
+                    out=scratch.materialization_valid,
+                )
+                if accumulator is not None:
+                    self._accumulate_update_moments(
+                        accumulator,
+                        snapshot,
+                        current_shards,
+                        scratch,
+                        scratch.materialization_valid.squeeze(0),
+                    )
+
+                snapshot.post_fingerprints = torch.empty(
+                    4, dtype=torch.float64, device=snapshot.master_before.device
+                )
+                self._fingerprint_shards(
+                    current_shards,
+                    snapshot.unique_capture_indices,
+                    scratch,
+                    use_main=True,
+                    out=snapshot.post_fingerprints[:2],
+                )
+                self._fingerprint_shards(
+                    current_shards,
+                    snapshot.unique_capture_indices,
+                    scratch,
+                    use_main=False,
+                    out=snapshot.post_fingerprints[2:],
+                )
+                self._transform_pre_to_delta(snapshot, current_shards, scratch)
+                snapshot.delta_ready = True
+                measurement = self._measurement_with_peak(snapshot, snapshot.master_before.device)
+                if measurement is not None:
+                    snapshot.measurement = measurement
+                return measurement
+            finally:
+                self._clear_finish_scratch(scratch)
+        except Exception:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_DELTA_FAILED)
+            return None
+
+    @torch.no_grad()
+    def install_secant_midpoint(self) -> torch.Tensor:
+        """Install BF16 owner midpoints through one bounded FP32 cast workspace.
+
+        Returns:
+            Device-resident local status for a later fixed readiness agreement.
+        """
+
+        snapshot = self._snapshot
+        if snapshot is None or not snapshot.delta_ready:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_MIDPOINT_UNAVAILABLE)
+            return self._status
+
+        snapshot.midpoint_installed = True
+        try:
+            scratch = self._allocate_finish_scratch(snapshot.master_before.device)
+            try:
+                for index in snapshot.unique_capture_indices:
+                    shard = snapshot.shards[index]
+                    offset, _ = snapshot.offsets[index]
+                    main = shard.main_shard.detach().view(-1)
+                    applied = shard.model_shard.detach().view(-1)
+                    for start in range(0, main.numel(), self.finish_chunk_elements):
+                        end = min(start + self.finish_chunk_elements, main.numel())
+                        size = end - start
+                        midpoint = scratch.master_delta_fp32[:size]
+                        midpoint.copy_(main[start:end])
+                        midpoint.add_(
+                            snapshot.master_before[offset + start : offset + end], alpha=-0.5
+                        )
+                        self._copy_secant_chunk(applied[start:end], midpoint, "midpoint")
+            finally:
+                self._clear_finish_scratch(scratch)
+        except Exception:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_MIDPOINT_INSTALL_FAILED)
+        return self._status
+
+    @torch.no_grad()
+    def restore_secant_post(self) -> torch.Tensor:
+        """Best-effort restore every owner view and verify post state independently.
+
+        A failure for one physical owner does not skip later owners. FP32 masters
+        are never written; their bounded fingerprints are verified alongside the
+        bitwise BF16 cast expected in each optimizer parameter-buffer view.
+
+        Returns:
+            Device-resident local status for the integration layer's fatal agreement.
+        """
+
+        snapshot = self._snapshot
+        if snapshot is None or not snapshot.delta_ready:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_MIDPOINT_UNAVAILABLE)
+            return self._status
+
+        scratch: _FinishScratch | None = None
+        copy_failed = False
+        try:
+            scratch = self._allocate_finish_scratch(snapshot.master_before.device)
+            for index in snapshot.unique_capture_indices:
+                shard = snapshot.shards[index]
+                main = shard.main_shard.detach().view(-1)
+                applied = shard.model_shard.detach().view(-1)
+                try:
+                    for start in range(0, main.numel(), self.finish_chunk_elements):
+                        end = min(start + self.finish_chunk_elements, main.numel())
+                        self._copy_secant_chunk(applied[start:end], main[start:end], "restore")
+                except Exception:
+                    copy_failed = True
+                    continue
+
+            if copy_failed:
+                self._set_status(DistributedOptimizerEventStatus.SECANT_RESTORE_COPY_FAILED)
+            self._verify_secant_post(snapshot, scratch)
+        except Exception:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_RESTORE_VERIFY_FAILED)
+        finally:
+            if scratch is not None:
+                self._clear_finish_scratch(scratch)
+            snapshot.midpoint_installed = False
+        return self._status
+
+    def release_secant_event(self) -> None:
+        """Release retained secant buffers after global completion or central fatal handling."""
+
+        self.abort_event()
 
     @torch.no_grad()
     def finish_event(
@@ -851,6 +1054,9 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
 
         snapshot = self._snapshot
         assert snapshot is not None
+        if snapshot.delta_ready:
+            self._set_status(DistributedOptimizerEventStatus.FINISH_UNEXPECTED_FAILED)
+            return None
         if not update_successful:
             self._set_status(DistributedOptimizerEventStatus.UPDATE_SKIPPED)
             return None
@@ -948,6 +1154,110 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             scalar_bool=_typed_view(storage, layout.scalar_bool, torch.bool),
             status_int64=_typed_view(storage, layout.status_int64, torch.int64),
         )
+
+    @staticmethod
+    def _copy_secant_chunk(destination: torch.Tensor, source: torch.Tensor, phase: str) -> None:
+        """Copy one bounded owner chunk; ``phase`` is an injection seam for tests."""
+
+        del phase
+        destination.copy_(source)
+
+    def _transform_pre_to_delta(
+        self,
+        snapshot: _SnapshotState,
+        shards: tuple[ModelMainParamShard, ...],
+        scratch: _FinishScratch,
+    ) -> None:
+        for index in snapshot.unique_capture_indices:
+            shard = shards[index]
+            offset, _ = snapshot.offsets[index]
+            main = shard.main_shard.detach().view(-1)
+            for start in range(0, main.numel(), self.finish_chunk_elements):
+                end = min(start + self.finish_chunk_elements, main.numel())
+                delta = snapshot.master_before[offset + start : offset + end]
+                torch.sub(main[start:end], delta, out=delta)
+                finite = scratch.finite[: end - start]
+                auxiliary = scratch.auxiliary[: end - start]
+                self._initialize_finite_mask(delta, finite, auxiliary)
+                torch.all(finite, dim=(0,), out=scratch.scalar_bool.squeeze(0))
+                torch.logical_not(scratch.scalar_bool, out=scratch.scalar_bool)
+                scratch.status_int64.copy_(scratch.scalar_bool)
+                scratch.status_int64.mul_(
+                    int(DistributedOptimizerEventStatus.SECANT_DELTA_NONFINITE)
+                )
+                torch.maximum(self._status, scratch.status_int64, out=self._status)
+
+    def _fingerprint_shards(
+        self,
+        shards: tuple[ModelMainParamShard, ...],
+        indices: tuple[int, ...],
+        scratch: _FinishScratch,
+        *,
+        use_main: bool,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        fingerprint = out
+        fingerprint.zero_()
+        for index in indices:
+            shard = shards[index]
+            values = (shard.main_shard if use_main else shard.model_shard).detach().view(-1)
+            for start in range(0, values.numel(), self.finish_chunk_elements):
+                end = min(start + self.finish_chunk_elements, values.numel())
+                work = scratch.work_fp64[: end - start]
+                work.copy_(values[start:end])
+                fingerprint[0].add_(work.sum())
+                work.square_()
+                fingerprint[1].add_(work.sum())
+        return fingerprint
+
+    def _verify_secant_post(self, snapshot: _SnapshotState, scratch: _FinishScratch) -> None:
+        mismatch = scratch.scalar_bool.squeeze(0)
+        for index in snapshot.unique_capture_indices:
+            shard = snapshot.shards[index]
+            main = shard.main_shard.detach().view(-1)
+            applied = shard.model_shard.detach().view(-1)
+            for start in range(0, main.numel(), self.finish_chunk_elements):
+                end = min(start + self.finish_chunk_elements, main.numel())
+                size = end - start
+                expected = scratch.expected_bf16[:size]
+                expected.copy_(main[start:end])
+                torch.ne(expected, applied[start:end], out=scratch.auxiliary[:size])
+                torch.any(scratch.auxiliary[:size], dim=(0,), out=mismatch)
+                scratch.status_int64.copy_(mismatch)
+                scratch.status_int64.mul_(
+                    int(DistributedOptimizerEventStatus.SECANT_RESTORE_VERIFY_FAILED)
+                )
+                torch.maximum(self._status, scratch.status_int64, out=self._status)
+
+        current_master = self._fingerprint_shards(
+            snapshot.shards,
+            snapshot.unique_capture_indices,
+            scratch,
+            use_main=True,
+            out=scratch.moment_fp64[:2],
+        )
+        current_applied = self._fingerprint_shards(
+            snapshot.shards,
+            snapshot.unique_capture_indices,
+            scratch,
+            use_main=False,
+            out=scratch.moment_fp64[2:4],
+        )
+        post_fingerprints = snapshot.post_fingerprints
+        if post_fingerprints is None:
+            self._set_status(DistributedOptimizerEventStatus.SECANT_RESTORE_VERIFY_FAILED)
+            return
+        for current, expected in (
+            (current_master, post_fingerprints[:2]),
+            (current_applied, post_fingerprints[2:]),
+        ):
+            torch.ne(current, expected, out=scratch.auxiliary[:2])
+            torch.any(scratch.auxiliary[:2], dim=(0,), out=mismatch)
+            scratch.status_int64.copy_(mismatch)
+            scratch.status_int64.mul_(
+                int(DistributedOptimizerEventStatus.SECANT_RESTORE_VERIFY_FAILED)
+            )
+            torch.maximum(self._status, scratch.status_int64, out=self._status)
 
     @staticmethod
     def _clear_finish_scratch(scratch: _FinishScratch) -> None:
@@ -1230,6 +1540,41 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             shard.main_shard.dtype,
             shard.model_shard.dtype,
         )
+
+    @staticmethod
+    def _capture_layout(
+        shards: tuple[ModelMainParamShard, ...]
+    ) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
+        """Assign one shared snapshot range to each exact physical owner alias."""
+
+        offsets: list[tuple[int, int]] = []
+        unique_indices: list[int] = []
+        ranges: dict[tuple[object, ...], tuple[int, int]] = {}
+        offset = 0
+        for index, shard in enumerate(shards):
+            key = (
+                shard.main_shard.device,
+                shard.main_shard.untyped_storage().data_ptr(),
+                shard.main_shard.storage_offset(),
+                shard.main_shard.numel(),
+                shard.main_shard.dtype,
+                shard.model_shard.device,
+                shard.model_shard.untyped_storage().data_ptr(),
+                shard.model_shard.storage_offset(),
+                shard.model_shard.numel(),
+                shard.model_shard.dtype,
+            )
+            existing = ranges.get(key)
+            if existing is not None:
+                offsets.append(existing)
+                continue
+            end = offset + shard.main_shard.numel()
+            current = (offset, end)
+            ranges[key] = current
+            offsets.append(current)
+            unique_indices.append(index)
+            offset = end
+        return tuple(offsets), tuple(unique_indices)
 
     @staticmethod
     def _validate_unique_local_ownership(shards: tuple[ModelMainParamShard, ...]) -> None:
