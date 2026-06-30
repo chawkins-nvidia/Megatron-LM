@@ -88,9 +88,7 @@ def _registry(
 ) -> MetricRegistry:
     return MetricRegistry(
         _descriptors() if descriptors is None else descriptors,
-        reduction_binding=_binding()
-        if reduction_binding is None
-        else reduction_binding,
+        reduction_binding=_binding() if reduction_binding is None else reduction_binding,
         local_owners=local_owners,
     )
 
@@ -118,32 +116,23 @@ def test_registry_enforces_registered_multiplicity_and_operation_kind() -> None:
     registry = _registry()
     accumulator = registry.new_accumulator("cpu")
     registry.add_masked_tensor(
-        accumulator,
-        "activation/residual/layer_0",
-        torch.tensor([2.0, 4.0]),
-        mask=torch.ones(2),
+        accumulator, "activation/residual/layer_0", torch.tensor([2.0, 4.0]), mask=torch.ones(2)
     )
     slots = accumulator.slots("activation/residual/layer_0")
 
     assert (
-        "replication_multiplicity"
-        not in inspect.signature(registry.add_masked_tensor).parameters
+        "replication_multiplicity" not in inspect.signature(registry.add_masked_tensor).parameters
     )
     torch.testing.assert_close(
         accumulator.sum_pack[slots.count], torch.tensor(1.0, dtype=torch.float64)
     )
     with pytest.raises(ValueError, match="requires tensor_moments"):
         registry.add_update(
-            accumulator,
-            "activation/residual/layer_0",
-            torch.ones(1),
-            torch.ones(1),
+            accumulator, "activation/residual/layer_0", torch.ones(1), torch.ones(1)
         )
 
 
-@pytest.mark.parametrize(
-    "mask_kind", (MaskKind.TOKEN, MaskKind.SEQUENCE_PARALLEL_TOKEN)
-)
+@pytest.mark.parametrize("mask_kind", (MaskKind.TOKEN, MaskKind.SEQUENCE_PARALLEL_TOKEN))
 def test_required_token_mask_missing_is_a_packed_collective_safe_mismatch(
     mask_kind: MaskKind,
 ) -> None:
@@ -151,9 +140,7 @@ def test_required_token_mask_missing_is_a_packed_collective_safe_mismatch(
     registry = _registry((replace(residual, mask_kind=mask_kind), update))
     accumulator = registry.new_accumulator("cpu")
 
-    registry.add_masked_tensor(
-        accumulator, "activation/residual/layer_0", torch.tensor([2.0, 4.0])
-    )
+    registry.add_masked_tensor(accumulator, "activation/residual/layer_0", torch.tensor([2.0, 4.0]))
     slots = accumulator.slots("activation/residual/layer_0")
 
     assert accumulator.sum_pack[slots.mask_error] == 1
@@ -173,27 +160,20 @@ def test_unmasked_metrics_require_explicit_none_and_reject_masks() -> None:
     accumulator = registry.new_accumulator("cpu")
     with pytest.raises(ValueError, match="does not accept a mask"):
         registry.add_update(
-            accumulator,
-            "update/fc1/layer_7",
-            torch.ones(1),
-            torch.ones(1),
-            mask=torch.ones(1),
+            accumulator, "update/fc1/layer_7", torch.ones(1), torch.ones(1), mask=torch.ones(1)
         )
 
 
 @pytest.mark.parametrize(
     "normalization_kind",
-    (
-        NormalizationKind.GLOBAL_VALID_TOKENS,
-        NormalizationKind.LOSS_SCALE_AND_GLOBAL_VALID_TOKENS,
-    ),
+    (NormalizationKind.GLOBAL_VALID_TOKENS, NormalizationKind.LOSS_SCALE_AND_GLOBAL_VALID_TOKENS),
 )
 def test_non_none_normalization_is_rejected_until_an_adapter_exists(
     normalization_kind: NormalizationKind,
 ) -> None:
-    residual, _ = _descriptors()
+    residual, update = _descriptors()
     with pytest.raises(ValueError, match="typed normalization adapter"):
-        replace(residual, normalization_kind=normalization_kind)
+        _registry((replace(residual, normalization_kind=normalization_kind), update))
 
 
 def test_owner_aware_add_update_accumulates_only_authoritative_shards() -> None:
@@ -202,9 +182,7 @@ def test_owner_aware_add_update_accumulates_only_authoritative_shards() -> None:
 
     authoritative = _registry(local_owners=(False, True))
     authoritative_accumulator = authoritative.new_accumulator("cpu")
-    authoritative.add_update(
-        authoritative_accumulator, "update/fc1/layer_7", before, after
-    )
+    authoritative.add_update(authoritative_accumulator, "update/fc1/layer_7", before, after)
     authoritative_accumulator.finalize_local_()
     torch.testing.assert_close(
         authoritative_accumulator.relative_rms("update/fc1/layer_7").value,
@@ -223,31 +201,20 @@ def test_owner_aware_add_update_accumulates_only_authoritative_shards() -> None:
 def test_nonowning_rank_retains_neutral_fixed_slots() -> None:
     registry = _registry(local_owners=(False, True))
     accumulator = registry.new_accumulator("cpu")
-    registry.add_masked_tensor(
-        accumulator, "activation/residual/layer_0", torch.tensor([9.0])
-    )
+    registry.add_masked_tensor(accumulator, "activation/residual/layer_0", torch.tensor([9.0]))
     registry.add_update(
-        accumulator,
-        "update/fc1/layer_7",
-        torch.tensor([1.0, 2.0]),
-        torch.tensor([2.0, 4.0]),
+        accumulator, "update/fc1/layer_7", torch.tensor([1.0, 2.0]), torch.tensor([2.0, 4.0])
     )
     accumulator.finalize_local_()
 
-    assert accumulator.slot_names == (
-        "activation/residual/layer_0",
-        "update/fc1/layer_7",
-    )
+    assert accumulator.slot_names == ("activation/residual/layer_0", "update/fc1/layer_7")
     assert not accumulator.rms("activation/residual/layer_0").valid
     torch.testing.assert_close(
-        accumulator.relative_rms("update/fc1/layer_7").value,
-        torch.tensor(1.0, dtype=torch.float64),
+        accumulator.relative_rms("update/fc1/layer_7").value, torch.tensor(1.0, dtype=torch.float64)
     )
 
 
-def test_descriptor_hash_is_deterministic_rank_independent_and_semantically_complete() -> (
-    None
-):
+def test_descriptor_hash_is_deterministic_rank_independent_and_semantically_complete() -> None:
     first = _registry(local_owners=(True, False))
     second = _registry(local_owners=(False, True))
     assert first.descriptor_hash == second.descriptor_hash
@@ -288,10 +255,7 @@ def test_descriptor_serialization_occurs_once_not_per_observation(
 
     for _ in range(10):
         registry.add_masked_tensor(
-            accumulator,
-            "activation/residual/layer_0",
-            torch.ones(1),
-            mask=torch.ones(1),
+            accumulator, "activation/residual/layer_0", torch.ones(1), mask=torch.ones(1)
         )
 
     assert calls == 1
@@ -301,9 +265,7 @@ def test_descriptor_serialization_occurs_once_not_per_observation(
 def test_wrong_missing_and_unimplemented_reduction_bindings_fail_closed() -> None:
     collective_calls: list[object] = []
 
-    def counting_reducer(
-        tensor: torch.Tensor, *, op: object, group: object | None
-    ) -> None:
+    def counting_reducer(tensor: torch.Tensor, *, op: object, group: object | None) -> None:
         collective_calls.append((tensor, op, group))
 
     with pytest.raises(ValueError, match="typed process-group identity"):
@@ -331,30 +293,19 @@ def test_wrong_missing_and_unimplemented_reduction_bindings_fail_closed() -> Non
         )
     with pytest.raises(ValueError, match="flat packed world"):
         PackedSufficientStatistics(
-            ("metric",),
-            "cpu",
-            descriptor_hash="wrong-binding",
-            reduction_binding=wrong_binding,
+            ("metric",), "cpu", descriptor_hash="wrong-binding", reduction_binding=wrong_binding
         )
 
     residual, _ = _descriptors()
     with pytest.raises(ValueError, match="typed process-group identity"):
         replace(residual, process_group_identity="world")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="world diagnostic reduction"):
-        replace(
-            residual,
-            process_group_identity=ProcessGroupIdentity.DATA_PARALLEL,
-        )
+        replace(residual, process_group_identity=ProcessGroupIdentity.DATA_PARALLEL)
     with pytest.raises(ValueError, match="hierarchical diagnostic reduction"):
-        replace(
-            residual,
-            reduction_kind=ReductionKind.HIERARCHICAL_PACKED_SUM_MAX_MIN,
-        )
+        replace(residual, reduction_kind=ReductionKind.HIERARCHICAL_PACKED_SUM_MAX_MIN)
 
     assert collective_calls == []
-    assert tuple(inspect.signature(PackedSufficientStatistics.reduce_).parameters) == (
-        "self",
-    )
+    assert tuple(inspect.signature(PackedSufficientStatistics.reduce_).parameters) == ("self",)
 
 
 def test_registry_rejects_same_names_with_different_descriptor_identity() -> None:
@@ -372,10 +323,7 @@ def test_registry_rejects_same_names_with_different_descriptor_identity() -> Non
     assert first.slot_names == second.slot_names
     with pytest.raises(ValueError, match="descriptor/schema identity"):
         second.add_masked_tensor(
-            accumulator,
-            "activation/residual/layer_0",
-            torch.ones(1),
-            mask=torch.ones(1),
+            accumulator, "activation/residual/layer_0", torch.ones(1), mask=torch.ones(1)
         )
 
 
@@ -394,10 +342,7 @@ def test_registry_binds_and_enforces_schema_identity() -> None:
     )
     with pytest.raises(ValueError, match="descriptor/schema identity"):
         registry.add_masked_tensor(
-            foreign_schema,
-            "activation/residual/layer_0",
-            torch.ones(1),
-            mask=torch.ones(1),
+            foreign_schema, "activation/residual/layer_0", torch.ones(1), mask=torch.ones(1)
         )
 
 

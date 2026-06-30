@@ -29,9 +29,7 @@ _SUM_FIELD_COUNT = len(_SUM_FIELDS)
 class PackedReducer(Protocol):
     """Define an injectable packed-collective callable."""
 
-    def __call__(
-        self, tensor: torch.Tensor, *, op: object, group: object | None
-    ) -> object:
+    def __call__(self, tensor: torch.Tensor, *, op: object, group: object | None) -> object:
         """Reduce one packed tensor.
 
         Args:
@@ -84,9 +82,7 @@ class ReductionBinding:
         """
 
         if not isinstance(self.process_group_identity, ProcessGroupIdentity):
-            raise ValueError(
-                "reduction bindings require a typed process-group identity"
-            )
+            raise ValueError("reduction bindings require a typed process-group identity")
         if not isinstance(self.reduction_kind, ReductionKind):
             raise ValueError("reduction bindings require a typed reduction kind")
 
@@ -192,13 +188,9 @@ class DerivedStatistic:
     reason: torch.Tensor
 
 
-def _torch_all_reduce(
-    tensor: torch.Tensor, *, op: object, group: object | None
-) -> object:
+def _torch_all_reduce(tensor: torch.Tensor, *, op: object, group: object | None) -> object:
     if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError(
-            "torch.distributed must be initialized, or a reducer must be injected"
-        )
+        raise RuntimeError("torch.distributed must be initialized, or a reducer must be injected")
     return dist.all_reduce(tensor, op=op, group=group)
 
 
@@ -244,9 +236,7 @@ class PackedSufficientStatistics:
             reduction_binding.process_group_identity != ProcessGroupIdentity.WORLD
             or reduction_binding.reduction_kind != ReductionKind.PACKED_SUM_MAX_MIN
         ):
-            raise ValueError(
-                "only the flat packed world SUM/MAX/MIN reduction is implemented"
-            )
+            raise ValueError("only the flat packed world SUM/MAX/MIN reduction is implemented")
         self.slot_names = slot_names
         self.descriptor_hash = descriptor_hash
         self.schema_identity = schema_identity
@@ -331,9 +321,7 @@ class PackedSufficientStatistics:
         self._validate_multiplicity(replication_multiplicity)
         slots = self.slots(slot)
         values_fp32 = values.detach().to(dtype=torch.float32)
-        weights = self._weights_like(
-            values_fp32, mask, slots, require_mask=require_mask
-        )
+        weights = self._weights_like(values_fp32, mask, slots, require_mask=require_mask)
         if values_fp32.numel() == 0:
             return
 
@@ -361,10 +349,8 @@ class PackedSufficientStatistics:
             )
             / scale
         )
-        weighted_sum, count, weighted_sumsq, zero, nonfinite = (
-            self._finite_contributions(
-                slots, weighted_sum, count, weighted_sumsq, zero, nonfinite
-            )
+        weighted_sum, count, weighted_sumsq, zero, nonfinite = self._finite_contributions(
+            slots, weighted_sum, count, weighted_sumsq, zero, nonfinite
         )
 
         self.sum_pack[slots.sum].add_(weighted_sum)
@@ -380,12 +366,8 @@ class PackedSufficientStatistics:
         candidate_min = torch.where(
             finite_selected, values_fp32, torch.full_like(values_fp32, torch.inf)
         ).amin()
-        self.max_pack[slots.maximum] = torch.maximum(
-            self.max_pack[slots.maximum], candidate_max
-        )
-        self.min_pack[slots.minimum] = torch.minimum(
-            self.min_pack[slots.minimum], candidate_min
-        )
+        self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
+        self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
 
     def add_masked_pair(
         self,
@@ -441,9 +423,9 @@ class PackedSufficientStatistics:
         rhs_sumsq = (clean_rhs.square() * finite_weights).sum() / scale
         dot = (clean_lhs * clean_rhs * finite_weights).sum() / scale
         zero = (
-            torch.where(
-                finite_selected & (lhs_fp32 == 0), weights, torch.zeros_like(weights)
-            ).sum(dtype=torch.float64)
+            torch.where(finite_selected & (lhs_fp32 == 0), weights, torch.zeros_like(weights)).sum(
+                dtype=torch.float64
+            )
             / scale
         )
         nonfinite = (
@@ -452,23 +434,10 @@ class PackedSufficientStatistics:
             )
             / scale
         )
-        (
-            weighted_sum,
-            count,
-            lhs_sumsq,
-            rhs_sumsq,
-            dot,
-            zero,
-            nonfinite,
-        ) = self._finite_contributions(
-            slots,
-            weighted_sum,
-            count,
-            lhs_sumsq,
-            rhs_sumsq,
-            dot,
-            zero,
-            nonfinite,
+        (weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite) = (
+            self._finite_contributions(
+                slots, weighted_sum, count, lhs_sumsq, rhs_sumsq, dot, zero, nonfinite
+            )
         )
 
         self.sum_pack[slots.sum].add_(weighted_sum)
@@ -486,12 +455,8 @@ class PackedSufficientStatistics:
         candidate_min = torch.where(
             finite_selected, lhs_fp32, torch.full_like(lhs_fp32, torch.inf)
         ).amin()
-        self.max_pack[slots.maximum] = torch.maximum(
-            self.max_pack[slots.maximum], candidate_max
-        )
-        self.min_pack[slots.minimum] = torch.minimum(
-            self.min_pack[slots.minimum], candidate_min
-        )
+        self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
+        self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
 
     def add_update(
         self,
@@ -527,6 +492,48 @@ class PackedSufficientStatistics:
             mask=mask,
             replication_multiplicity=replication_multiplicity,
             require_mask=require_mask,
+        )
+
+    def mark_mask_error(self, slot: str | int, error: torch.Tensor | None = None) -> None:
+        """Record a device-resident mask contract failure for one slot.
+
+        Args:
+            slot: Registered logical name or zero-based slot index.
+            error: Optional boolean or numeric scalar. A missing, malformed, or
+                wrong-device scalar records an error without moving data.
+
+        Raises:
+            RuntimeError: If accumulation already completed.
+        """
+
+        self._ensure_accumulating()
+        slots = self.slots(slot)
+        if error is None or error.numel() != 1 or error.device != self.sum_pack.device:
+            self.sum_pack[slots.mask_error].add_(1)
+            return
+        self.sum_pack[slots.mask_error].add_(
+            error.detach().reshape(()).to(dtype=self.sum_pack.dtype)
+        )
+
+    def mark_arithmetic_error(self, slot: str | int, error: torch.Tensor | None = None) -> None:
+        """Record a device-resident arithmetic contract failure for one slot.
+
+        Args:
+            slot: Registered logical name or zero-based slot index.
+            error: Optional boolean or numeric scalar. A missing, malformed, or
+                wrong-device scalar records an error without moving data.
+
+        Raises:
+            RuntimeError: If accumulation already completed.
+        """
+
+        self._ensure_accumulating()
+        slots = self.slots(slot)
+        if error is None or error.numel() != 1 or error.device != self.sum_pack.device:
+            self.sum_pack[slots.nonfinite_arithmetic].add_(1)
+            return
+        self.sum_pack[slots.nonfinite_arithmetic].add_(
+            error.detach().reshape(()).to(dtype=self.sum_pack.dtype)
         )
 
     def reduce_(self) -> "PackedSufficientStatistics":
@@ -586,9 +593,7 @@ class PackedSufficientStatistics:
         """
 
         slots = self._derived_slots(slot)
-        ratio = self._ratio(
-            self.sum_pack[slots.sumsq], self.sum_pack[slots.count], slots
-        )
+        ratio = self._ratio(self.sum_pack[slots.sumsq], self.sum_pack[slots.count], slots)
         return self._safe_sqrt(ratio)
 
     def cosine(self, slot: str | int) -> DerivedStatistic:
@@ -617,9 +622,7 @@ class PackedSufficientStatistics:
         """
 
         slots = self._derived_slots(slot)
-        ratio = self._ratio(
-            self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.rhs_sumsq], slots
-        )
+        ratio = self._ratio(self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.rhs_sumsq], slots)
         return self._safe_sqrt(ratio)
 
     def zero_fraction(self, slot: str | int) -> DerivedStatistic:
@@ -708,11 +711,7 @@ class PackedSufficientStatistics:
             & (~positive_denominator | torch.isfinite(quotient))
         )
         valid = (
-            has_contributors
-            & finite_input
-            & positive_denominator
-            & mask_valid
-            & arithmetic_finite
+            has_contributors & finite_input & positive_denominator & mask_valid & arithmetic_finite
         )
         value = torch.where(valid, quotient, torch.full_like(numerator, torch.nan))
         reason = self._reason(
@@ -768,30 +767,18 @@ class PackedSufficientStatistics:
     ) -> torch.Tensor:
         reason = torch.full_like(reference, Tier0Reason.NONE, dtype=torch.int64)
         reason = torch.where(
-            ~positive_denominator,
-            torch.full_like(reason, Tier0Reason.ZERO_DENOMINATOR),
-            reason,
+            ~positive_denominator, torch.full_like(reason, Tier0Reason.ZERO_DENOMINATOR), reason
         )
         reason = torch.where(
-            ~has_contributors,
-            torch.full_like(reason, Tier0Reason.NO_CONTRIBUTORS),
-            reason,
+            ~has_contributors, torch.full_like(reason, Tier0Reason.NO_CONTRIBUTORS), reason
         )
         reason = torch.where(
-            ~finite_input,
-            torch.full_like(reason, Tier0Reason.NONFINITE_INPUT),
-            reason,
+            ~finite_input, torch.full_like(reason, Tier0Reason.NONFINITE_INPUT), reason
         )
         reason = torch.where(
-            ~arithmetic_finite,
-            torch.full_like(reason, Tier0Reason.NONFINITE_ARITHMETIC),
-            reason,
+            ~arithmetic_finite, torch.full_like(reason, Tier0Reason.NONFINITE_ARITHMETIC), reason
         )
-        return torch.where(
-            ~mask_valid,
-            torch.full_like(reason, Tier0Reason.MASK_MISMATCH),
-            reason,
-        )
+        return torch.where(~mask_valid, torch.full_like(reason, Tier0Reason.MASK_MISMATCH), reason)
 
     def _derived_slots(self, slot: str | int) -> PackedSlots:
         if not self._reduced:
@@ -825,18 +812,14 @@ class PackedSufficientStatistics:
             self.sum_pack[slots.mask_error].add_(1)
             return torch.zeros_like(values, dtype=torch.float32)
         try:
-            weights = torch.broadcast_to(
-                mask.detach().to(dtype=torch.float32), values.shape
-            )
+            weights = torch.broadcast_to(mask.detach().to(dtype=torch.float32), values.shape)
         except RuntimeError:
             self.sum_pack[slots.mask_error].add_(1)
             return torch.zeros_like(values, dtype=torch.float32)
 
         valid_elements = torch.isfinite(weights) & (weights >= 0)
         mask_valid = valid_elements.all()
-        self.sum_pack[slots.mask_error].add_(
-            (~mask_valid).to(dtype=self.sum_pack.dtype)
-        )
+        self.sum_pack[slots.mask_error].add_((~mask_valid).to(dtype=self.sum_pack.dtype))
         return torch.where(mask_valid, weights, torch.zeros_like(weights))
 
     def _finite_contributions(
