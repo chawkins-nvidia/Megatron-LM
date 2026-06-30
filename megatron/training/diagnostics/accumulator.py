@@ -338,6 +338,21 @@ class PackedSufficientStatistics:
         index = self._resolve_index(slot)
         return PackedSlots.for_index(index)
 
+    def invalidate(self, slot: str | int) -> None:
+        """Mark one statistic invalid while preserving fixed reduction participation.
+
+        Args:
+            slot: Registered logical name or zero-based slot index.
+
+        Raises:
+            RuntimeError: If accumulation already completed.
+            KeyError: If a logical name is unknown.
+            IndexError: If an integer slot is out of range.
+        """
+
+        self._ensure_accumulating()
+        self.sum_pack[self.slots(slot).mask_error].add_(1)
+
     def add_masked_tensor(
         self,
         slot: str | int,
@@ -725,16 +740,13 @@ class PackedSufficientStatistics:
         self._ensure_accumulating()
         self._validate_multiplicity(replication_multiplicity)
         slots = self.slots(slot)
-        (
-            master_before_fp32,
-            master_after_fp32,
-            applied_before_fp32,
-            applied_after_fp32,
-        ) = torch.broadcast_tensors(
-            master_before.detach().to(dtype=torch.float32),
-            master_after.detach().to(dtype=torch.float32),
-            applied_before.detach().to(dtype=torch.float32),
-            applied_after.detach().to(dtype=torch.float32),
+        (master_before_fp32, master_after_fp32, applied_before_fp32, applied_after_fp32) = (
+            torch.broadcast_tensors(
+                master_before.detach().to(dtype=torch.float32),
+                master_after.detach().to(dtype=torch.float32),
+                applied_before.detach().to(dtype=torch.float32),
+                applied_after.detach().to(dtype=torch.float32),
+            )
         )
         if master_before_fp32.numel() == 0:
             return
@@ -762,12 +774,10 @@ class PackedSufficientStatistics:
         master_sumsq = clean_master_delta.square().sum() / scale
         applied_sumsq = clean_applied_delta.square().sum() / scale
         applied_pre_sumsq = clean_applied_before.square().sum() / scale
-        master_nonzero = (finite & (master_delta_fp32 != 0)).sum(
+        master_nonzero = (finite & (master_delta_fp32 != 0)).sum(dtype=torch.float64) / scale
+        applied_nonzero = (finite & (master_delta_fp32 != 0) & (applied_delta_fp32 != 0)).sum(
             dtype=torch.float64
         ) / scale
-        applied_nonzero = (
-            finite & (master_delta_fp32 != 0) & (applied_delta_fp32 != 0)
-        ).sum(dtype=torch.float64) / scale
         cast_zero = (finite & (master_delta_fp32 != 0) & (applied_delta_fp32 == 0)).sum(
             dtype=torch.float64
         ) / scale
@@ -803,21 +813,122 @@ class PackedSufficientStatistics:
         self.sum_pack[slots.nonfinite].add_(nonfinite)
 
         candidate_max = torch.where(
-            finite,
-            applied_delta_fp32,
-            torch.full_like(applied_delta_fp32, -torch.inf),
+            finite, applied_delta_fp32, torch.full_like(applied_delta_fp32, -torch.inf)
         ).amax()
         candidate_min = torch.where(
-            finite,
-            applied_delta_fp32,
-            torch.full_like(applied_delta_fp32, torch.inf),
+            finite, applied_delta_fp32, torch.full_like(applied_delta_fp32, torch.inf)
         ).amin()
-        self.max_pack[slots.maximum] = torch.maximum(
-            self.max_pack[slots.maximum], candidate_max
+        self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
+        self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
+
+    def add_applied_update_moments(
+        self,
+        slot: str | int,
+        *,
+        count: torch.Tensor,
+        master_sumsq: torch.Tensor,
+        applied_sumsq: torch.Tensor,
+        applied_pre_sumsq: torch.Tensor,
+        master_nonzero: torch.Tensor,
+        applied_nonzero: torch.Tensor,
+        cast_zero: torch.Tensor,
+        nonfinite: torch.Tensor,
+        maximum: torch.Tensor,
+        minimum: torch.Tensor,
+        materialization_valid: torch.Tensor,
+        replication_multiplicity: int = 1,
+    ) -> None:
+        """Add bounded-chunk update moments without allocating elementwise temporaries.
+
+        The distributed-optimizer adapter uses preallocated device scratch to
+        calculate these scalar sufficient statistics. ``materialization_valid``
+        is a device scalar covering the complete local owner-shard sequence. A
+        failed post-step materialization therefore contributes no numeric
+        moments and marks the slot invalid before the later fixed event
+        consensus.
+
+        Args:
+            slot: Registered update slot.
+            count: Finite element count in this chunk.
+            master_sumsq: FP32-master delta square sum.
+            applied_sumsq: Applied BF16 delta square sum.
+            applied_pre_sumsq: Pre-update applied BF16 square sum.
+            master_nonzero: Nonzero FP32-master delta count.
+            applied_nonzero: Surviving applied-delta count.
+            cast_zero: Nonzero master deltas lost by BF16 materialization.
+            nonfinite: Nonfinite input count.
+            maximum: Maximum finite applied delta.
+            minimum: Minimum finite applied delta.
+            materialization_valid: Device boolean for exact post-step materialization.
+            replication_multiplicity: Number of identical logical replicas.
+
+        Raises:
+            RuntimeError: If accumulation already completed.
+            ValueError: If replication multiplicity is not positive or inputs are not scalars.
+        """
+
+        self._ensure_accumulating()
+        self._validate_multiplicity(replication_multiplicity)
+        slots = self.slots(slot)
+        contributions = (
+            count,
+            master_sumsq,
+            applied_sumsq,
+            applied_pre_sumsq,
+            master_nonzero,
+            applied_nonzero,
+            cast_zero,
+            nonfinite,
+            maximum,
+            minimum,
+            materialization_valid,
         )
-        self.min_pack[slots.minimum] = torch.minimum(
-            self.min_pack[slots.minimum], candidate_min
+        if any(contribution.numel() != 1 for contribution in contributions):
+            raise ValueError("precomputed applied-update moments must be scalars")
+        valid = materialization_valid.to(dtype=torch.bool)
+        scale = replication_multiplicity
+        numeric = tuple(
+            contribution.to(dtype=torch.float64) / scale for contribution in contributions[:8]
         )
+        numeric = tuple(
+            torch.where(valid, contribution, torch.zeros_like(contribution))
+            for contribution in numeric
+        )
+        numeric = self._finite_contributions(slots, *numeric)
+        (
+            count,
+            master_sumsq,
+            applied_sumsq,
+            applied_pre_sumsq,
+            master_nonzero,
+            applied_nonzero,
+            cast_zero,
+            nonfinite,
+        ) = numeric
+
+        self.sum_pack[slots.count].add_(count)
+        self.sum_pack[slots.sumsq].add_(master_sumsq)
+        self.sum_pack[slots.lhs_sumsq].add_(applied_sumsq)
+        self.sum_pack[slots.rhs_sumsq].add_(applied_pre_sumsq)
+        self.sum_pack[slots.sum].add_(master_nonzero)
+        self.sum_pack[slots.dot].add_(applied_nonzero)
+        self.sum_pack[slots.zero].add_(cast_zero)
+        self.sum_pack[slots.nonfinite].add_(nonfinite)
+        self.sum_pack[slots.mask_error].add_((~valid).to(dtype=self.sum_pack.dtype))
+
+        valid_extremum = valid & (count > 0)
+        candidate_max = torch.where(
+            valid_extremum,
+            maximum.to(dtype=self.max_pack.dtype),
+            torch.full_like(self.max_pack[slots.maximum], -torch.inf),
+        )
+        candidate_min = torch.where(
+            valid_extremum,
+            minimum.to(dtype=self.min_pack.dtype),
+            torch.full_like(self.min_pack[slots.minimum], torch.inf),
+        )
+        self.max_pack[slots.maximum] = torch.maximum(self.max_pack[slots.maximum], candidate_max)
+        self.min_pack[slots.minimum] = torch.minimum(self.min_pack[slots.minimum], candidate_min)
 
     def reduce_(self) -> "PackedSufficientStatistics":
         """Reduce the three fixed packs with SUM, MAX, and MIN.
@@ -921,9 +1032,7 @@ class PackedSufficientStatistics:
 
         slots = self._derived_slots(slot)
         return self._safe_sqrt(
-            self._ratio(
-                self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.count], slots
-            )
+            self._ratio(self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.count], slots)
         )
 
     def norm_retention(self, slot: str | int) -> DerivedStatistic:
@@ -931,11 +1040,7 @@ class PackedSufficientStatistics:
 
         slots = self._derived_slots(slot)
         return self._safe_sqrt(
-            self._ratio(
-                self.sum_pack[slots.lhs_sumsq],
-                self.sum_pack[slots.sumsq],
-                slots,
-            )
+            self._ratio(self.sum_pack[slots.lhs_sumsq], self.sum_pack[slots.sumsq], slots)
         )
 
     def master_nonzero_fraction(self, slot: str | int) -> DerivedStatistic:

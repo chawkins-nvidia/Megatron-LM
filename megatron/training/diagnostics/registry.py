@@ -491,9 +491,7 @@ class MetricRegistry:
             ValueError: If the accumulator or operation conflicts with the descriptor.
         """
 
-        index, descriptor = self._operation(
-            accumulator, logical_name, StatisticKind.UPDATE, None
-        )
+        index, descriptor = self._operation(accumulator, logical_name, StatisticKind.UPDATE, None)
         if self.local_owners[index]:
             accumulator.add_applied_update(
                 index,
@@ -502,6 +500,27 @@ class MetricRegistry:
                 applied_before,
                 applied_after,
                 replication_multiplicity=descriptor.replication_multiplicity,
+            )
+
+    def add_applied_update_moments(
+        self, accumulator: PackedSufficientStatistics, logical_name: str, **moments: torch.Tensor
+    ) -> None:
+        """Accumulate precomputed bounded-chunk applied-update moments.
+
+        Args:
+            accumulator: Registry-bound packed accumulator.
+            logical_name: Registered update descriptor name.
+            **moments: Scalar arguments accepted by
+                :meth:`PackedSufficientStatistics.add_applied_update_moments`.
+
+        Raises:
+            ValueError: If the accumulator or operation conflicts with the descriptor.
+        """
+
+        index, descriptor = self._operation(accumulator, logical_name, StatisticKind.UPDATE, None)
+        if self.local_owners[index]:
+            accumulator.add_applied_update_moments(
+                index, **moments, replication_multiplicity=descriptor.replication_multiplicity
             )
 
     def mark_mask_error(
