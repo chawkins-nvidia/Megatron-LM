@@ -1,0 +1,94 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Versioned scalar schema for the Tier-0 diagnostic heartbeat."""
+
+from enum import IntEnum
+from typing import Mapping
+
+SCHEMA_VERSION = 2
+TIER0_PREFIX = f"diag/v{SCHEMA_VERSION}/t0/"
+
+
+class Tier0Status(IntEnum):
+    """Stable event-level Tier-0 status codes."""
+
+    OK = 0
+    INVALID_STATISTICS = 1
+    UNSUPPORTED = 2
+    RUNTIME_ERROR = 3
+
+
+class Tier0Reason(IntEnum):
+    """Stable reason codes used when a Tier-0 statistic or event is invalid."""
+
+    NONE = 0
+    NO_CONTRIBUTORS = 1
+    ZERO_DENOMINATOR = 2
+    NONFINITE_INPUT = 3
+    MASK_MISMATCH = 4
+    DESCRIPTOR_MISMATCH = 5
+    UNSUPPORTED_LAYOUT = 6
+
+
+_DEPTH_SUMMARIES = ("first", "q1", "middle", "q3", "last", "p10", "p50", "p90")
+_MODULE_FAMILIES = ("qkv", "attn_out", "fc1", "fc2")
+_LAYERED_UPDATE_FAMILIES = (*_MODULE_FAMILIES, "norm")
+_MATRIX_FAMILIES = ("embedding", *_MODULE_FAMILIES, "output")
+
+TIER0_KEYS: tuple[str, ...] = (
+    *(
+        f"{TIER0_PREFIX}activation/residual/rms/{summary}"
+        for summary in _DEPTH_SUMMARIES
+    ),
+    *(f"{TIER0_PREFIX}dgrad/residual/rms/{summary}" for summary in _DEPTH_SUMMARIES),
+    *(
+        f"{TIER0_PREFIX}dgrad/{family}/{summary}"
+        for family in _MODULE_FAMILIES
+        for summary in ("p10", "p50", "zero_fraction")
+    ),
+    *(
+        f"{TIER0_PREFIX}update/{family}/{summary}"
+        for family in _LAYERED_UPDATE_FAMILIES
+        for summary in ("p10", "p50", "p90", "starved_fraction")
+    ),
+    f"{TIER0_PREFIX}update/embedding/relative_rms",
+    f"{TIER0_PREFIX}update/output/relative_rms",
+    *(
+        f"{TIER0_PREFIX}retention/{family}/{summary}"
+        for family in _MATRIX_FAMILIES
+        for summary in ("median", "zero_fraction")
+    ),
+    *(
+        f"{TIER0_PREFIX}activation/{family}/max_abs"
+        for family in (*_MODULE_FAMILIES, "residual")
+    ),
+    f"{TIER0_PREFIX}event/successful_update",
+    f"{TIER0_PREFIX}event/valid_positions",
+    f"{TIER0_PREFIX}health/nonfinite_fraction",
+    f"{TIER0_PREFIX}health/underflow_fraction",
+    f"{TIER0_PREFIX}status/valid",
+    f"{TIER0_PREFIX}perf/peak_hbm_bytes_max_rank",
+    f"{TIER0_PREFIX}perf/latency_ms_median_rank",
+    f"{TIER0_PREFIX}perf/latency_ms_max_rank",
+)
+
+
+def assert_payload_schema(payload: Mapping[str, object]) -> None:
+    """Require a payload to contain exactly the 75 canonical Tier-0 keys.
+
+    Args:
+        payload: Mapping that is about to be emitted to a scalar sink.
+
+    Raises:
+        ValueError: If any canonical key is missing or any extra key is present.
+    """
+
+    expected = set(TIER0_KEYS)
+    actual = set(payload)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise ValueError(
+            "Tier-0 payload does not match the canonical schema: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
