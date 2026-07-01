@@ -58,7 +58,6 @@ def _observation(name: str, pre, post, repeat, midpoint) -> SecantObservation:
         torch.as_tensor(post, dtype=torch.float32),
         torch.as_tensor(repeat, dtype=torch.float32),
         torch.as_tensor(midpoint, dtype=torch.float32),
-        torch.ones_like(pre_tensor),
     )
 
 
@@ -182,7 +181,6 @@ def test_nonowner_contributions_leave_all_canonical_packs_neutral() -> None:
             torch.ones(1, 2),
             torch.ones(2, 1),
             torch.ones(2, 1),
-            torch.ones(2, 1),
         ),
         SecantObservation(
             "layer_0/residual",
@@ -190,7 +188,6 @@ def test_nonowner_contributions_leave_all_canonical_packs_neutral() -> None:
             torch.ones(2, 2).t(),
             torch.ones(2, 2).t(),
             torch.ones(2, 2).t(),
-            torch.ones(2, 2),
         ),
         SecantObservation(
             "layer_0/residual",
@@ -198,7 +195,6 @@ def test_nonowner_contributions_leave_all_canonical_packs_neutral() -> None:
             torch.ones(1).expand(4),
             torch.ones(1).expand(4),
             torch.ones(1).expand(4),
-            torch.ones(4),
         ),
     ),
 )
@@ -214,20 +210,48 @@ def test_misaligned_noncontiguous_and_stride_zero_observations_fail_before_accum
     assert torch.count_nonzero(statistics.accumulator.sum_pack) == 0
 
 
-def test_validated_mask_broadcast_is_chunked_without_broadcasting_observations() -> None:
+def test_preselected_owner_rows_need_no_second_mask_and_contribute() -> None:
     cell = SecantCellDescriptor("layer_0/residual", MetricFamily.RESIDUAL, 0)
     binding = build_secant_registry((cell,), reduction_binding=ReductionBinding.flat_world(None))
     statistics = SecantStatistics(binding, "cpu", chunk_elements=2)
-    pre = torch.ones(2, 3)
+    pre = torch.tensor([[1.0, 2.0, 3.0]])
     observation = SecantObservation(
-        cell.logical_name, pre, pre + 1, pre + 1, pre + 0.5, torch.tensor([[1.0], [0.0]])
+        cell.logical_name, pre, pre + 1, pre + 1, pre + 0.5
     )
 
     statistics.add_observations((observation,))
     statistics.accumulator.finalize_local_()
     view = SecantSufficientStatisticsView.from_accumulator(binding, statistics.accumulator, cell)
+    metrics = derive_secant_cell(
+        view,
+        midpoint_displacement_sq=1.0,
+        full_displacement_sq=4.0,
+        restore_verified=True,
+    )
 
     assert view.count == 3
+    assert view.contract_error == 0
+    assert metrics.status == SecantMathStatus.OK
+    assert metrics.valid
+
+
+def test_preselected_secant_rows_reject_a_second_mask() -> None:
+    cell = SecantCellDescriptor("layer_0/residual", MetricFamily.RESIDUAL, 0)
+    binding = build_secant_registry((cell,), reduction_binding=ReductionBinding.flat_world(None))
+    statistics = SecantStatistics(binding, "cpu", chunk_elements=2)
+    pre = torch.tensor([[1.0, 2.0, 3.0]])
+    observation = SecantObservation(
+        cell.logical_name,
+        pre,
+        pre + 1,
+        pre + 1,
+        pre + 0.5,
+        torch.tensor([[1.0]]),
+    )
+
+    with pytest.raises(ValueError, match="does not accept a mask"):
+        statistics.add_observations((observation,))
+    assert torch.count_nonzero(statistics.accumulator.sum_pack) == 0
 
 
 def test_affine_and_quadratic_formula_references() -> None:

@@ -149,7 +149,10 @@ def build_secant_registry(
                     replication_axes=(ReplicationAxis.TENSOR,),
                     replication_multiplicity=1,
                     ownership=Ownership.PIPELINE_STAGE,
-                    mask_kind=MaskKind.TOKEN,
+                    # Replay hooks have already compacted every endpoint to the
+                    # selected token rows.  Requiring a second token mask here
+                    # would invalidate those nonempty observations.
+                    mask_kind=MaskKind.NONE,
                     statistic_kind=statistic_kind,
                     denominator_kind=(
                         DenominatorKind.SELECTED_ELEMENTS
