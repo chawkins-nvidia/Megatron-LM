@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention
@@ -857,6 +858,13 @@ def test_dense_gpt_spec_accepts_canonical_enum_values() -> None:
     )
     with pytest.raises(TypeError, match="unsupported value set"):
         _validate_dense_gpt_models((model,))
+
+
+def test_dense_gpt_spec_accepts_complete_local_rmsnorm_spec() -> None:
+    model = _dense_gpt_stub()
+    model.transformer_layer_spec = get_gpt_layer_local_spec(normalization="RMSNorm")
+
+    _validate_dense_gpt_models((model,))
 
 
 def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):

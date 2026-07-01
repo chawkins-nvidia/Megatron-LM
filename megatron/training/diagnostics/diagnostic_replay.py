@@ -3028,10 +3028,18 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
             validate_spec_value(value.submodules)
             validate_spec_value(value.metainfo)
             return
+        if type(value) is functools.partial:
+            validate_spec_value(value.func)
+            validate_spec_value(value.args)
+            validate_spec_value(value.keywords or {})
+            return
         if isinstance(value, type) or callable(value):
             module_name = getattr(value, "__module__", "")
             if not module_name.startswith(allowed_prefixes):
-                raise TypeError("dense GPT spec contains an unsupported builder")
+                builder_name = getattr(value, "__qualname__", type(value).__qualname__)
+                raise TypeError(
+                    f"dense GPT spec contains unsupported builder {module_name}.{builder_name}"
+                )
             return
         if is_dataclass(value) and type(value).__module__.startswith("megatron.core."):
             for spec_field in fields(value):
