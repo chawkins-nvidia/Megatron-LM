@@ -1736,12 +1736,47 @@ class _ExtraStateSnapshot:
     path: str
     owner: torch.nn.Module
     value: _ValueSnapshot
+    te_empty_uint8: bool = False
 
     def restore(self) -> None:
         self.owner.set_extra_state(self.value.restore())
 
     def verify(self) -> bool:
+        if self.te_empty_uint8:
+            return _is_exact_empty_uint8_extra_state(self.owner.get_extra_state())
         return self.value.verify(self.owner.get_extra_state())
+
+
+def _is_exact_empty_uint8_extra_state(value: Any) -> bool:
+    """Recognize TE's no-FP8 serialization sentinel without widening tensor identity."""
+
+    return (
+        type(value) is torch.Tensor
+        and value.dtype is torch.uint8
+        and value.device == torch.device("cpu")
+        and value.layout is torch.strided
+        and tuple(value.shape) == (0,)
+        and tuple(value.stride()) == (1,)
+        and value.storage_offset() == 0
+        and not value.requires_grad
+        and value.untyped_storage().nbytes() == 0
+    )
+
+
+def _uses_te_empty_uint8_extra_state(module: torch.nn.Module, value: Any) -> bool:
+    """Admit only the inspected exact TE RMSNorm no-state serialization contract."""
+
+    try:
+        from transformer_engine.pytorch import RMSNorm as TransformerEngineRMSNorm
+    except (AttributeError, ImportError):
+        return False
+    if type(module) is not TransformerEngineRMSNorm:
+        return False
+    if not _is_exact_empty_uint8_extra_state(value):
+        raise TypeError(
+            "exact Transformer Engine RMSNorm extra state must be the empty CPU uint8 sentinel"
+        )
+    return True
 
 
 class DenseGPTStateSnapshot:
@@ -1791,7 +1826,7 @@ class DenseGPTStateSnapshot:
         seen: set[tuple[int, str]] = set()
         pending_buffers: list[tuple[str, torch.nn.Module, str, torch.Tensor]] = []
         pending_attributes: list[tuple[str, torch.nn.Module, str, Any]] = []
-        pending_extra_states: list[tuple[str, torch.nn.Module, Any]] = []
+        pending_extra_states: list[tuple[str, torch.nn.Module, Any, bool]] = []
         missing_attribute = object()
         for model_index, model in enumerate(self.models):
             for module_name, module in model.named_modules():
@@ -1839,8 +1874,14 @@ class DenseGPTStateSnapshot:
                 if type(module).get_extra_state is not torch.nn.Module.get_extra_state:
                     if type(module).set_extra_state is torch.nn.Module.set_extra_state:
                         raise TypeError("model extra state has no verified restoration method")
+                    extra_state = module.get_extra_state()
                     pending_extra_states.append(
-                        (module_path, module, module.get_extra_state())
+                        (
+                            module_path,
+                            module,
+                            extra_state,
+                            _uses_te_empty_uint8_extra_state(module, extra_state),
+                        )
                     )
         missing = self.mutable_buffers - found
         if missing:
@@ -1882,14 +1923,16 @@ class DenseGPTStateSnapshot:
             self.attributes.append(
                 _AttributeSnapshot(f"{module_path}.{name}", module, name, value)
             )
-        for module_path, module, current in pending_extra_states:
+        for module_path, module, current, te_empty_uint8 in pending_extra_states:
             try:
                 value = plan.walk(current, f"{module_path}.extra_state")
             except TypeError as error:
                 unsupported.append(str(error))
                 continue
             self.extra_states.append(
-                _ExtraStateSnapshot(f"{module_path}.extra_state", module, value)
+                _ExtraStateSnapshot(
+                    f"{module_path}.extra_state", module, value, te_empty_uint8
+                )
             )
         if unsupported:
             details = "\n".join(f"- {message}" for message in unsupported)

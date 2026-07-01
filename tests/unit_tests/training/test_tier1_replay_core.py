@@ -985,6 +985,14 @@ def test_dense_gpt_children_accept_transformer_engine_final_rmsnorm() -> None:
     model.final_layernorm = TENorm(config=model.config, hidden_size=model.config.hidden_size)
 
     _validate_dense_gpt_models((model,))
+    guard = ReplayStateGuard(
+        (model,),
+        tracker_getter=lambda: _Tracker(),
+        cuda_device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+    )
+    guard.prepare()
+    with guard:
+        pass
 
 
 def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):
