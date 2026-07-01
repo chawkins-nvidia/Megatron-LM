@@ -2245,6 +2245,8 @@ class ReplayMemoryConfig:
     hidden_size: int
     ffn_hidden_size: int
     num_attention_heads: int
+    num_query_groups: int
+    kv_channels: int
     selected_tokens: int
     replay_microbatches: int
     element_size: int
@@ -2256,6 +2258,7 @@ class ReplayMemoryConfig:
     tp_source: bool = True
     sequence_parallel: bool = False
     gated_linear_unit: bool = False
+    attention_output_gate: bool = False
     observed_host_replay_bytes: int | None = None
     observed_packed_statistics_bytes: int | None = None
     observed_reduction_arena_bytes: int | None = None
@@ -2331,6 +2334,37 @@ def _packed_storage_bytes(slots: int) -> int:
     )
 
 
+def _local_qkv_response_width(
+    *,
+    num_attention_heads: int,
+    num_query_groups: int,
+    kv_channels: int,
+    tensor_parallel_size: int,
+    attention_output_gate: bool,
+) -> int:
+    """Return the exact local SelfAttention ``linear_qkv`` output width."""
+
+    dimensions = (
+        num_attention_heads,
+        num_query_groups,
+        kv_channels,
+        tensor_parallel_size,
+    )
+    if any(type(value) is not int or value <= 0 for value in dimensions):
+        raise ValueError("QKV response dimensions must be positive integers")
+    if num_query_groups > num_attention_heads or num_attention_heads % num_query_groups:
+        raise ValueError("query groups must evenly divide attention heads")
+    full_width = _checked_product(
+        kv_channels,
+        num_attention_heads
+        + 2 * num_query_groups
+        + int(attention_output_gate) * num_attention_heads,
+    )
+    if full_width % tensor_parallel_size:
+        raise ValueError("QKV response width must be divisible by tensor parallelism")
+    return full_width // tensor_parallel_size
+
+
 def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
     """Purely estimate all core replay allocations without DP/CP duplication."""
 
@@ -2347,6 +2381,8 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
         config.hidden_size,
         config.ffn_hidden_size,
         config.num_attention_heads,
+        config.num_query_groups,
+        config.kv_channels,
         config.replay_microbatches,
         config.element_size,
         config.alignment,
@@ -2409,9 +2445,16 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
     device_inputs = _checked_sum(full_batch, cp_outputs)
     sp_mask = cp_local // config.tensor_parallel_size if config.sequence_parallel else 0
     local_rows = config.selected_tokens
+    qkv_width = _local_qkv_response_width(
+        num_attention_heads=config.num_attention_heads,
+        num_query_groups=config.num_query_groups,
+        kv_channels=config.kv_channels,
+        tensor_parallel_size=config.tensor_parallel_size,
+        attention_output_gate=config.attention_output_gate,
+    )
     feature_widths = (
         config.hidden_size,
-        3 * config.hidden_size // config.tensor_parallel_size,
+        qkv_width,
         config.hidden_size,
         (1 + int(config.gated_linear_unit)) * config.ffn_hidden_size // config.tensor_parallel_size,
         config.hidden_size,
@@ -3409,12 +3452,14 @@ class Tier1ReplayTransaction:
     def _fatal(self, error: BaseException) -> None:
         fatal_error = error
         cleanup_error = self._release_local()
-        try:
-            self.readiness.settle(cleanup_error, "fatal transaction cleanup")
-        except BaseException as collective_cleanup_error:
+        if cleanup_error is not None:
             fatal_error = BaseExceptionGroup(
-                "Tier-1 post-commit failure and cleanup failure", (error, collective_cleanup_error)
+                "Tier-1 post-commit failure and cleanup failure", (error, cleanup_error)
             )
+        # Never enter another collective after a committed schedule error. A
+        # peer may still be blocked in P2P and cannot join a cleanup consensus;
+        # the production abort tears down the process group so every worker is
+        # bounded to this single failed attempt.
         self.fatal_abort(fatal_error)
         raise RuntimeError("Tier-1 fatal-abort protocol returned") from error
 
@@ -3502,8 +3547,10 @@ class Tier1ReplayTransaction:
                     f"Tier-1 {phase} schedule and restoration failed", (error, caught)
                 )
             )
+        if error is not None:
+            self._fatal(error)
         try:
-            self.readiness.settle(error, f"{phase}-schedule committed outcome")
+            self.readiness.settle(None, f"{phase}-schedule committed outcome")
         except BaseException as caught:
             self._fatal(caught)
 
@@ -3764,15 +3811,46 @@ class Tier1ReplayEngine:
                 raise ValueError("world size is not divisible by model parallel topology")
             data_parallel_size = world_size // model_parallel_size
             gated_linear_unit = bool(model_config.gated_linear_unit)
+            if not isinstance(model_config.num_query_groups, int) or not isinstance(
+                model_config.kv_channels, int
+            ):
+                raise TypeError("GPT attention projection dimensions are not concrete integers")
+            qkv_width = _local_qkv_response_width(
+                num_attention_heads=model_config.num_attention_heads,
+                num_query_groups=model_config.num_query_groups,
+                kv_channels=model_config.kv_channels,
+                tensor_parallel_size=schedule.tp_size,
+                attention_output_gate=bool(model_config.attention_output_gate),
+            )
             response_widths = {
                 ResponseFamily.RESIDUAL: model_config.hidden_size,
-                ResponseFamily.QKV: 3 * model_config.hidden_size // schedule.tp_size,
+                ResponseFamily.QKV: qkv_width,
                 ResponseFamily.ATTN_OUT: model_config.hidden_size,
                 ResponseFamily.FC1: (
                     (1 + int(gated_linear_unit)) * model_config.ffn_hidden_size // schedule.tp_size
                 ),
                 ResponseFamily.FC2: model_config.hidden_size,
             }
+            module_width_attributes = {
+                ResponseFamily.QKV: "output_size_per_partition",
+                ResponseFamily.ATTN_OUT: "output_size",
+                ResponseFamily.FC1: "output_size_per_partition",
+                ResponseFamily.FC2: "output_size",
+            }
+            for family, attribute in module_width_attributes.items():
+                live_widths = tuple(
+                    getattr(expected_modules[layer][family], attribute, None)
+                    for layer in sorted(expected_modules)
+                )
+                if any(type(width) is not int or width <= 0 for width in live_widths):
+                    raise TypeError(
+                        f"dense GPT {family.value} modules lack a concrete local output width"
+                    )
+                if any(width != response_widths[family] for width in live_widths):
+                    raise ValueError(
+                        f"dense GPT {family.value} module width disagrees with response preflight: "
+                        f"expected {response_widths[family]}, observed {live_widths}"
+                    )
             local_attention_heads = model_config.num_attention_heads // schedule.tp_size
             probe.bind_preflight(
                 selected_row_capacity=plan_facts.local_selected_tokens,
@@ -3824,6 +3902,8 @@ class Tier1ReplayEngine:
                 hidden_size=model_config.hidden_size,
                 ffn_hidden_size=model_config.ffn_hidden_size,
                 num_attention_heads=model_config.num_attention_heads,
+                num_query_groups=model_config.num_query_groups,
+                kv_channels=model_config.kv_channels,
                 selected_tokens=plan.metadata.global_selected_tokens,
                 replay_microbatches=plan.num_microbatches,
                 element_size=torch.empty((), dtype=params_dtype).element_size(),
@@ -3835,6 +3915,7 @@ class Tier1ReplayEngine:
                 tp_source=True,
                 sequence_parallel=schedule.sequence_parallel,
                 gated_linear_unit=gated_linear_unit,
+                attention_output_gate=bool(model_config.attention_output_gate),
                 observed_host_replay_bytes=expected_host_bytes,
                 observed_packed_statistics_bytes=probe.packed_statistics_bytes,
                 observed_reduction_arena_bytes=probe.reduction_arena_bytes,

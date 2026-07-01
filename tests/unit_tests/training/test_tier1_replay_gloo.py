@@ -207,6 +207,8 @@ class _FaultSchedule:
     def __call__(self, plan, probe, phase):
         self.calls += 1
         self.p2p_started = True
+        if self.fault == "asymmetric" and self.rank == 0:
+            raise RuntimeError("injected asymmetric schedule fault")
         dist.barrier()
         if self.fault in ("schedule", "cleanup_schedule") and self.rank == 0:
             raise RuntimeError("injected schedule fault")
@@ -236,8 +238,10 @@ class _FatalRaised(RuntimeError):
 def _transaction_worker(rank: int, init_method: str, directory: str, fault: str) -> None:
     _init(rank, init_method)
     tracker = _FailOnSecondSetTracker(fail=fault == "restore" and rank == 0)
+    fatal_errors = []
 
     def fatal_abort(error: BaseException) -> None:
+        fatal_errors.append(error)
         if dist.is_initialized():
             try:
                 dist.destroy_process_group()
@@ -261,7 +265,11 @@ def _transaction_worker(rank: int, init_method: str, directory: str, fault: str)
     try:
         transaction.run_pre()
     except _FatalRaised:
-        _write_result(directory, rank, "fatal")
+        _write_result(
+            directory,
+            rank,
+            "fatal" if transaction.schedule.calls == len(fatal_errors) == 1 else "unbounded",
+        )
     else:
         _write_result(directory, rank, "unexpected-return")
         if dist.is_initialized():
@@ -436,7 +444,9 @@ def test_two_rank_one_rank_post_graph_drift_settles_before_second_schedule(tmp_p
     ]
 
 
-@pytest.mark.parametrize("fault", ("schedule", "restore", "cleanup_schedule"))
+@pytest.mark.parametrize(
+    "fault", ("schedule", "restore", "cleanup_schedule", "asymmetric")
+)
 def test_two_rank_post_p2p_fault_is_fatal_on_every_rank(tmp_path: Path, fault: str) -> None:
     assert _run_two_rank(tmp_path, _transaction_worker, fault) == ["fatal", "fatal"]
 

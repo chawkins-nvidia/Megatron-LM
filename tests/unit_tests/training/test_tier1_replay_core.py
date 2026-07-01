@@ -61,6 +61,7 @@ from megatron.training.diagnostics.diagnostic_replay import (
     TokenId,
     _ModelGraphFacts,
     _ReplayPlanFacts,
+    _local_qkv_response_width,
     _validate_dense_gpt_models,
     _systematic_positions,
     broadcast_replay_plan,
@@ -1058,16 +1059,20 @@ def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):
     core_attention = DotProductAttention.__new__(DotProductAttention)
     torch.nn.Module.__init__(core_attention)
     qkv.gather_output = False
+    qkv.output_size_per_partition = 3 * model.config.hidden_size
     qkv.skip_bias_add = False
     qkv.sequence_parallel = False
     qkv.allreduce_dgrad = False
     projection.skip_bias_add = False
+    projection.output_size = model.config.hidden_size
     projection.sequence_parallel = False
     fc1.gather_output = False
+    fc1.output_size_per_partition = (1 + int(gated)) * model.config.ffn_hidden_size
     fc1.skip_bias_add = True
     fc1.sequence_parallel = False
     fc1.allreduce_dgrad = False
     fc2.skip_bias_add = True
+    fc2.output_size = model.config.hidden_size
     fc2.sequence_parallel = False
     attention.linear_qkv = qkv
     attention.linear_proj = projection
@@ -1394,6 +1399,87 @@ def test_engine_binds_gated_fc1_width_and_actual_probe_scratch() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("heads", "groups", "kv_channels", "tp", "output_gate", "expected"),
+    (
+        (8, 2, 128, 1, False, 1536),
+        (8, 2, 128, 4, False, 384),
+        (8, 1, 128, 8, False, 160),
+        (8, 2, 128, 2, True, 1280),
+    ),
+)
+def test_qkv_response_width_covers_gqa_tp_and_output_gate(
+    heads: int,
+    groups: int,
+    kv_channels: int,
+    tp: int,
+    output_gate: bool,
+    expected: int,
+) -> None:
+    assert (
+        _local_qkv_response_width(
+            num_attention_heads=heads,
+            num_query_groups=groups,
+            kv_channels=kv_channels,
+            tensor_parallel_size=tp,
+            attention_output_gate=output_gate,
+        )
+        == expected
+    )
+
+
+def test_engine_binds_and_observes_real_r4_gqa_qkv_layout() -> None:
+    engine, model, _plan, probe, schedule = _dense_engine_fixture()
+    model.config.hidden_size = 1024
+    model.config.ffn_hidden_size = 4096
+    model.config.num_attention_heads = 8
+    model.config.num_query_groups = 2
+    model.config.kv_channels = 128
+    model.config.params_dtype = torch.bfloat16
+    model.config.attention_output_gate = False
+    model.decoder_layer.self_attention.linear_qkv.output_size_per_partition = 1536
+    model.decoder_layer.self_attention.linear_proj.output_size = 1024
+    model.decoder_layer.mlp.linear_fc1.output_size_per_partition = 4096
+    model.decoder_layer.mlp.linear_fc2.output_size = 1024
+    plan = _plan(sequence_length=2048)
+    schedule.sequence_length = 2048
+
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+
+    assert dict(probe._response_widths) == {
+        ResponseFamily.RESIDUAL: 1024,
+        ResponseFamily.QKV: 1536,
+        ResponseFamily.ATTN_OUT: 1024,
+        ResponseFamily.FC1: 4096,
+        ResponseFamily.FC2: 1024,
+    }
+    assert transaction.memory_estimate is not None
+    assert transaction.memory_estimate.term("retained_response_rows") == 34_816
+    qkv_descriptor = next(
+        descriptor
+        for descriptor in probe.descriptors
+        if descriptor.family == ResponseFamily.QKV
+    )
+    mask = torch.zeros(2, 2048, dtype=torch.bool)
+    mask[0, 7] = True
+    activation = torch.ones(2048, 2, 1536, dtype=torch.bfloat16)
+    with probe.capture_pre():
+        probe.set_masks(mask)
+        probe._observe(qkv_descriptor, (activation, None))
+    assert probe._pre_rows[qkv_descriptor.key][0].shape == (1, 1536)
+    transaction.release()
+
+
+def test_engine_rejects_module_projection_width_drift_before_schedule() -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    model.decoder_layer.self_attention.linear_qkv.output_size_per_partition -= 1
+
+    with pytest.raises(ReplayPreflightError, match="qkv module width disagrees"):
+        _prepare_fixture(engine, plan, probe, schedule)
+
+    assert not schedule.p2p_started
+
+
 def test_engine_revalidates_bound_plan_and_topology_before_schedule() -> None:
     engine, _model, plan, probe, schedule = _dense_engine_fixture()
     transaction = _prepare_fixture(engine, plan, probe, schedule)
@@ -1683,6 +1769,8 @@ def _memory_config(**overrides) -> ReplayMemoryConfig:
         hidden_size=4096,
         ffn_hidden_size=16384,
         num_attention_heads=32,
+        num_query_groups=32,
+        kv_channels=128,
         selected_tokens=256,
         replay_microbatches=64,
         element_size=2,
@@ -1693,6 +1781,10 @@ def _memory_config(**overrides) -> ReplayMemoryConfig:
         headroom_fraction=0.1,
     )
     values.update(overrides)
+    if "num_query_groups" not in overrides:
+        values["num_query_groups"] = values["num_attention_heads"]
+    if "kv_channels" not in overrides:
+        values["kv_channels"] = values["hidden_size"] // values["num_attention_heads"]
     if "replay_microbatches" not in overrides:
         values["replay_microbatches"] = math.ceil(
             min(values["global_batch_size"], values["selected_tokens"]) / values["micro_batch_size"]

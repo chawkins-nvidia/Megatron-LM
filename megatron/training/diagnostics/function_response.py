@@ -672,7 +672,13 @@ class FunctionResponseProbe:
             or activation.dtype != self._response_dtype
             or activation.shape[-1] != widths[descriptor.family]
         ):
-            raise ValueError("response activation disagrees with memory preflight")
+            raise ValueError(
+                "response activation disagrees with memory preflight: "
+                f"family={descriptor.family.value}, shape={tuple(activation.shape)}, "
+                f"dtype={activation.dtype}, device={activation.device}, "
+                f"expected_width={widths[descriptor.family]}, "
+                f"expected_dtype={self._response_dtype}, expected_device={self.device}"
+            )
         if bias is not None and (
             bias.device != self.device
             or bias.dtype != self._response_dtype
