@@ -66,6 +66,7 @@ from .schema import (  # isort: skip
     TIER0_METADATA_KEYS,
     TIER0_METRIC_KEYS,
     assert_payload_schema,
+    assert_tiered_payload_schema,
 )
 
 _UPDATE_FAMILIES = (
@@ -643,6 +644,7 @@ class Tier0Heartbeat:
         model: Sequence[nn.Module],
         optimizer: object,
         forward_step_func: Callable[..., Any] | None = None,
+        forward_backward_func: Callable[..., Any] | None = None,
         *,
         wandb_log: Callable[..., None] | None = None,
         wandb_writer: object | None = None,
@@ -676,6 +678,7 @@ class Tier0Heartbeat:
             num_microbatches=num_microbatches,
         )
         self.forward_step_func = forward_step_func
+        self.forward_backward_func = forward_backward_func
         if not self.capability.supported and self.unsupported_policy == "error":
             raise RuntimeError(
                 "Tier-0 heartbeat unsupported on every rank: "
@@ -716,6 +719,8 @@ class Tier0Heartbeat:
         self._rank_evidence: torch.Tensor | None = None
         self._local_rank_evidence: torch.Tensor | None = None
         self._sink_staging: torch.Tensor | None = None
+        self._tier_output: torch.Tensor | None = None
+        self._runtime_payload: dict[str, torch.Tensor] = {}
         self._control_value: torch.Tensor | None = None
         self._mask_compare: torch.Tensor | None = None
         self._mask_compare_valid: torch.Tensor | None = None
@@ -735,6 +740,24 @@ class Tier0Heartbeat:
         self._startup_num_microbatches = min(
             _MAX_MICROBATCHES, max(1, startup_microbatches)
         )
+
+        self.tiered_runtime = None
+        if bool(getattr(args, "diag_enabled", False)) and int(
+            getattr(args, "diag_max_tier", 0)
+        ) >= 1:
+            if forward_step_func is None or forward_backward_func is None:
+                raise RuntimeError("Tier-1/2 diagnostics require the canonical training schedule")
+            from .runtime import TieredDiagnosticRuntime
+
+            self.tiered_runtime = TieredDiagnosticRuntime(
+                args,
+                self.model,
+                optimizer,
+                forward_step_func,
+                forward_backward_func,
+                reduction_binding=self.reduction_binding,
+                num_microbatches=num_microbatches,
+            )
 
         self.reservation = self._startup_reservation()
         self._collect_process_group_memberships()
@@ -949,15 +972,7 @@ class Tier0Heartbeat:
                 self.capture_accumulator = self.capture.registry.new_accumulator(
                     self.device
                 )
-            accumulators = tuple(
-                accumulator
-                for accumulator in (
-                    self.capture_accumulator,
-                    self.update_accumulator,
-                    self.control_accumulator,
-                )
-                if accumulator is not None
-            )
+            accumulators = self._event_accumulators()
             self._reduction_arenas = (
                 PackedSufficientStatistics.allocate_reduction_arenas(accumulators)
             )
@@ -1021,17 +1036,22 @@ class Tier0Heartbeat:
                 accumulator.sum_pack.numel()
                 + accumulator.max_pack.numel()
                 + accumulator.min_pack.numel()
-                for accumulator in (
-                    self.capture_accumulator,
-                    self.update_accumulator,
-                    self.control_accumulator,
-                )
-                if accumulator is not None
+                for accumulator in accumulators
+            )
+            runtime_output_elements = (
+                len(self.tiered_runtime.output_keys)
+                if self.tiered_runtime is not None
+                else 0
             )
             self._sink_staging = torch.empty(
-                world_size * _RANK_EVIDENCE_FIELDS + sink_pack_elements,
+                world_size * _RANK_EVIDENCE_FIELDS
+                + sink_pack_elements
+                + runtime_output_elements,
                 dtype=torch.float64,
                 device=self.device,
+            )
+            self._tier_output = torch.empty(
+                runtime_output_elements, dtype=torch.float64, device=self.device
             )
         except Exception:
             allocation_failed = True
@@ -1116,6 +1136,22 @@ class Tier0Heartbeat:
 
         return self.successful_updates + 1
 
+    def _event_accumulators(self) -> tuple[PackedSufficientStatistics, ...]:
+        """Return the exact startup-bound accumulator order for every event."""
+
+        accumulators = [
+            accumulator
+            for accumulator in (
+                self.capture_accumulator,
+                self.update_accumulator,
+                self.control_accumulator,
+            )
+            if accumulator is not None
+        ]
+        if self.tiered_runtime is not None:
+            accumulators.extend(self.tiered_runtime.accumulators)
+        return tuple(accumulators)
+
     def _model_device(self) -> torch.device:
         for chunk in self.model:
             parameter = next(chunk.parameters(), None)
@@ -1175,6 +1211,10 @@ class Tier0Heartbeat:
         set_diagnostic_global_valid_tokens(None)
         self._step_started = time.perf_counter()
         self._attempt_due = self.cadence.is_due(self.next_successful_update)
+        if self.tiered_runtime is not None:
+            self.tiered_runtime.prepare_attempt(
+                due=self._attempt_due, num_microbatches=num_microbatches
+            )
         if not self._attempt_due:
             return False
         self._attempt_started = time.perf_counter()
@@ -1213,6 +1253,13 @@ class Tier0Heartbeat:
         assert self.update_accumulator is not None
         self.update_accumulator.reset_()
         return True
+
+    def wrap_data_iterator(self, data_iterator: Any) -> Any:
+        """Attach the due Tier-1/2 raw-batch recorder without advancing early."""
+
+        if self.tiered_runtime is None:
+            return data_iterator
+        return self.tiered_runtime.wrap_data_iterator(data_iterator)
 
     def install_capture(self) -> None:
         """Install capture hooks immediately before the forward/backward schedule."""
@@ -1377,6 +1424,8 @@ class Tier0Heartbeat:
             raise RuntimeError(
                 "diagnostic capture must be sealed before the optimizer snapshot"
             )
+        if self.tiered_runtime is not None and self.tiered_runtime.active:
+            self.tiered_runtime.run_pre(event_id=self.event_id + 1)
         self.adapter.begin_event()
         return None
 
@@ -1394,7 +1443,13 @@ class Tier0Heartbeat:
             return update_successful
         assert self.control_accumulator is not None
         if self.adapter is not None and self.update_accumulator is not None:
-            if update_successful and self.adapter.armed:
+            if self.tiered_runtime is not None and self.tiered_runtime.active:
+                self.tiered_runtime.complete_optimizer_event(
+                    self.adapter,
+                    self.update_accumulator,
+                    update_successful=update_successful,
+                )
+            elif update_successful and self.adapter.armed:
                 self.adapter.finish_event(
                     self.update_accumulator, update_successful=True
                 )
@@ -1417,16 +1472,15 @@ class Tier0Heartbeat:
             )
         self._add_control("control/all_rank_post_gather_peak_unavailable", True)
 
-        accumulators = tuple(
-            accumulator
-            for accumulator in (
-                self.capture_accumulator,
-                self.update_accumulator,
-                self.control_accumulator,
-            )
-            if accumulator is not None
-        )
+        accumulators = self._event_accumulators()
         PackedSufficientStatistics.reduce_many_(accumulators, self._reduction_arenas)
+        self._runtime_payload = (
+            self.tiered_runtime.derive_outputs()
+            if update_successful
+            and self.tiered_runtime is not None
+            and self.tiered_runtime.active
+            else {}
+        )
         self._gather_pre_gather_rank_evidence()
         if not update_successful:
             self.abort_attempt()
@@ -1780,13 +1834,7 @@ class Tier0Heartbeat:
         )
         offset += rank_elements
         pack_ranges: list[tuple[PackedSufficientStatistics, int, int]] = []
-        for accumulator in (
-            self.capture_accumulator,
-            self.update_accumulator,
-            self.control_accumulator,
-        ):
-            if accumulator is None:
-                continue
+        for accumulator in self._event_accumulators():
             start = offset
             for tensor in (
                 accumulator.sum_pack,
@@ -1797,6 +1845,17 @@ class Tier0Heartbeat:
                 self._sink_staging[offset:end].copy_(tensor)
                 offset = end
             pack_ranges.append((accumulator, start, offset))
+        runtime_start = offset
+        if self._runtime_payload:
+            assert self.tiered_runtime is not None
+            assert self._tier_output is not None
+            if tuple(self._runtime_payload) != self.tiered_runtime.output_keys:
+                raise RuntimeError("runtime diagnostic output order changed before sink transfer")
+            for index, key in enumerate(self.tiered_runtime.output_keys):
+                self._tier_output[index].copy_(self._runtime_payload[key])
+            runtime_end = runtime_start + self._tier_output.numel()
+            self._sink_staging[runtime_start:runtime_end].copy_(self._tier_output)
+            offset = runtime_end
         host_combined = self._sink_host_transfer()
         memory_evidence = self._sample_sink_interval_memory()
         rank_values = host_combined[:rank_elements]
@@ -1819,6 +1878,23 @@ class Tier0Heartbeat:
             host_payload = self._derive_host_payload(host_packs, rank_evidence)
             host_payload["diag/v2/status/valid"] = 0
             assert_payload_schema(host_payload)
+            if self._runtime_payload:
+                assert self.tiered_runtime is not None
+                runtime_values = host_combined[
+                    runtime_start : runtime_start + len(self.tiered_runtime.output_keys)
+                ]
+                host_payload.update(
+                    zip(self.tiered_runtime.output_keys, runtime_values, strict=True)
+                )
+            assert_tiered_payload_schema(
+                host_payload,
+                effective_tier=(
+                    self.tiered_runtime.tier
+                    if self.tiered_runtime is not None
+                    and self.tiered_runtime.active
+                    else 0
+                ),
+            )
             artifact_written = False
             if self.artifact_writer is not None:
                 artifact_written = self._write_artifact(
@@ -1829,7 +1905,7 @@ class Tier0Heartbeat:
             if self.wandb_log is not None:
                 self.wandb_log(host_payload, step=iteration + 1)
             if self.tensorboard_writer is not None:
-                for key in (*TIER0_METRIC_KEYS, *TIER0_METADATA_KEYS):
+                for key in host_payload:
                     self.tensorboard_writer.add_scalar(
                         key, host_payload[key], iteration + 1
                     )
@@ -2332,10 +2408,13 @@ class Tier0Heartbeat:
 
         if self.adapter is not None:
             self.adapter.abort_event()
+        if self.tiered_runtime is not None:
+            self.tiered_runtime.abort_attempt()
         if self.capture is not None:
             self.capture.abort()
         self.capture_result = None
         self.preflight = None
         self._received_sidebands.clear()
         self._attempt_due = False
+        self._runtime_payload.clear()
         self._expected_num_microbatches = 0

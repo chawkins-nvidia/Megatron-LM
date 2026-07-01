@@ -60,6 +60,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.diagnostics.runtime import wrap_stable_training_dataset
 from megatron.training.diagnostics.tier0 import _register_canonical_gpt_mask_producer
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -437,6 +438,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
+    train_ds = wrap_stable_training_dataset(train_ds, args)
 
     print_rank_0("> finished creating GPT datasets ...")
 

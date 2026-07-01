@@ -99,3 +99,30 @@ def assert_payload_schema(payload: Mapping[str, object]) -> None:
             "Tier-0 payload does not match the canonical schema: "
             f"missing={missing}, unexpected={unexpected}"
         )
+
+
+def assert_tiered_payload_schema(
+    payload: Mapping[str, object], *, effective_tier: int
+) -> None:
+    """Require the exact cumulative 75/105/122-key dense payload surface."""
+
+    if effective_tier not in (0, 1, 2):
+        raise ValueError("effective diagnostic tier must be 0, 1, or 2")
+    expected = list(TIER0_KEYS)
+    if effective_tier >= 1:
+        from .function_response import TIER1_KEYS
+
+        expected.extend(TIER1_KEYS)
+    if effective_tier >= 2:
+        from .secant import TIER2_OUTPUT_KEYS
+
+        expected.extend(TIER2_OUTPUT_KEYS)
+    if tuple(payload) != tuple(expected):
+        expected_set = set(expected)
+        actual_set = set(payload)
+        raise ValueError(
+            "tiered diagnostic payload does not match the canonical schema: "
+            f"missing={sorted(expected_set - actual_set)}, "
+            f"unexpected={sorted(actual_set - expected_set)}, "
+            f"order_matches={tuple(payload) == tuple(expected)}"
+        )

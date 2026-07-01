@@ -2060,6 +2060,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         if diagnostic_heartbeat is not None:
             diagnostic_heartbeat.prepare_attempt(num_microbatches=get_num_microbatches())
+            step_data_iterator = diagnostic_heartbeat.wrap_data_iterator(data_iterator)
+        else:
+            step_data_iterator = data_iterator
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2114,7 +2117,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         try:
             losses_reduced = forward_backward_func(
                 forward_step_func=heartbeat_forward_step,
-                data_iterator=data_iterator,
+                data_iterator=step_data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
                 seq_length=args.seq_length,
@@ -2183,7 +2186,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # CompleteP coordinate diagnostics: run frozen-batch probes after grads are
     # settled and before optimizer.step(), then compare against post-step params.
-    if save_probe_in_this_iteration or save_linearization_in_this_iteration:
+    if (
+        save_probe_in_this_iteration or save_linearization_in_this_iteration
+    ) and not bool(getattr(args, "diag_enabled", False)):
         probe_batch = get_last_training_batch()
         if probe_batch is not None:
             capture_probe_batch(model, probe_batch)
@@ -2219,9 +2224,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer').stop()
 
-    if save_probe_in_this_iteration and get_last_training_batch() is not None:
+    if (
+        save_probe_in_this_iteration
+        and not bool(getattr(args, "diag_enabled", False))
+        and get_last_training_batch() is not None
+    ):
         probe_post(model, args.save, iteration + 1)
-    if save_linearization_in_this_iteration and get_last_training_batch() is not None:
+    if (
+        save_linearization_in_this_iteration
+        and not bool(getattr(args, "diag_enabled", False))
+        and get_last_training_batch() is not None
+    ):
         linearization_post(model, args.save, iteration + 1)
 
     # Checkpoint params with parameter names.
@@ -3171,6 +3184,7 @@ def train(
             model,
             optimizer,
             forward_step_func,
+            forward_backward_func,
             wandb_log=getattr(diagnostic_wandb_writer, "log", None),
             wandb_writer=diagnostic_wandb_writer,
             tensorboard_writer=get_tensorboard_writer(),

@@ -85,6 +85,13 @@ class StableSampleDataset:
     def __len__(self) -> int:
         return len(self.dataset)
 
+    def __getattr__(self, name: str) -> Any:
+        """Delegate dataset metadata such as ``split`` without hiding it."""
+
+        if name == "dataset":
+            raise AttributeError(name)
+        return getattr(self.dataset, name)
+
     def __getitem__(self, index: SamplerIssuedIndex | int) -> dict[str, Any]:
         if not isinstance(index, SamplerIssuedIndex):
             raise TypeError("StableSampleDataset requires a sampler-issued identity")
@@ -271,16 +278,16 @@ class CollectiveBinding:
     size: int
 
     def validate(self) -> None:
-        """Reject a topology that is not an existing CPU/Gloo control group."""
+        """Reject a topology that is not an existing fixed control group."""
 
         if not self.identity or self.size <= 0:
             raise ValueError("collective bindings require an identity and positive size")
         if dist.is_available() and dist.is_initialized():
             if dist.get_world_size(self.group) != self.size:
                 raise ValueError(f"{self.identity} binding size disagrees with its process group")
-            if str(dist.get_backend(self.group)).lower() != "gloo":
+            if str(dist.get_backend(self.group)).lower() not in ("gloo", "nccl"):
                 raise RuntimeError(
-                    f"{self.identity} control binding must use a pre-existing Gloo group"
+                    f"{self.identity} control binding must use a pre-existing Gloo or NCCL group"
                 )
         elif self.size != 1 or self.group is not None:
             raise RuntimeError("multi-rank bindings require initialized torch.distributed")
@@ -309,10 +316,18 @@ class ReadinessConsensus:
 
     def __init__(self, binding: CollectiveBinding, device: torch.device | str = "cpu") -> None:
         binding.validate()
-        if torch.device(device).type != "cpu":
-            raise RuntimeError("readiness consensus requires a CPU/Gloo control wire")
+        control_device = torch.device(device)
+        backend = (
+            str(dist.get_backend(binding.group)).lower()
+            if dist.is_available() and dist.is_initialized()
+            else "gloo"
+        )
+        if (backend == "gloo" and control_device.type != "cpu") or (
+            backend == "nccl" and control_device.type != "cuda"
+        ):
+            raise RuntimeError("readiness wire device disagrees with its fixed process group")
         self.binding = binding
-        self.status = torch.ones(1, dtype=torch.int32, device=device)
+        self.status = torch.ones(1, dtype=torch.int32, device=control_device)
 
     def settle(self, error: BaseException | None, phase: str) -> None:
         """Make one local preflight result identical across the bound group."""
@@ -339,6 +354,10 @@ class PopulationCollectiveWorkspace:
         binding.validate()
         if torch.device(device).type != "cpu":
             raise RuntimeError("population exchange requires CPU/Gloo control wires")
+        if dist.is_available() and dist.is_initialized() and str(
+            dist.get_backend(binding.group)
+        ).lower() != "gloo":
+            raise RuntimeError("population exchange requires a pre-existing Gloo group")
         if maximum_local_samples <= 0:
             raise ValueError("population workspace needs a positive local sample cap")
         self.binding = binding
@@ -925,9 +944,6 @@ class FixedPlanCodec:
 
     def allocate(self, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
         """Allocate one reusable fixed wire pair."""
-
-        if torch.device(device).type != "cpu":
-            raise RuntimeError("replay plan control wires require CPU/Gloo")
         return (
             torch.full((self.integer_count,), -1, dtype=torch.int64, device=device),
             torch.zeros((self.mask_count,), dtype=torch.uint8, device=device),
@@ -935,9 +951,8 @@ class FixedPlanCodec:
 
     def encode(self, plan: ReplayPlan, integer: torch.Tensor, mask: torch.Tensor) -> None:
         """Encode one source plan into preallocated tensors."""
-
-        if integer.device.type != "cpu" or mask.device.type != "cpu":
-            raise RuntimeError("replay plan control wires must remain CPU-resident")
+        if integer.device != mask.device:
+            raise RuntimeError("replay plan control wires must share one device")
         metadata = plan.metadata
         if (
             metadata.micro_batch_size != self.micro_batch_size
@@ -989,9 +1004,8 @@ class FixedPlanCodec:
 
     def decode(self, integer: torch.Tensor, mask: torch.Tensor) -> ReplayPlanMetadata:
         """Validate and decode one fixed wire pair."""
-
-        if integer.device.type != "cpu" or mask.device.type != "cpu":
-            raise RuntimeError("replay plan control wires must remain CPU-resident")
+        if integer.device != mask.device:
+            raise RuntimeError("replay plan control wires must share one device")
         header = tuple(int(value) for value in integer[:8])
         (magic, version, count, mbs, sequence, global_selected, selected_count, sample_count) = (
             header
@@ -1044,8 +1058,13 @@ def broadcast_replay_plan(
 
     binding.validate()
     binding.require_same(readiness.binding)
-    if torch.device(device).type != "cpu":
-        raise RuntimeError("replay plan broadcast requires a CPU/Gloo control wire")
+    control_device = torch.device(device)
+    if dist.is_available() and dist.is_initialized():
+        backend = str(dist.get_backend(binding.group)).lower()
+        if (backend == "gloo" and control_device.type != "cpu") or (
+            backend == "nccl" and control_device.type != "cuda"
+        ):
+            raise RuntimeError("replay plan wire device disagrees with its process group")
     if not 0 <= source_group_rank < binding.size:
         raise ValueError("TP source group rank is outside the verified binding")
     group_rank = dist.get_rank(binding.group) if binding.size > 1 else 0
@@ -2313,7 +2332,7 @@ class NonInterleavedReplaySchedule:
         self.completed = False
 
     def __call__(self, plan: ReplayPlan, probe: ResponseProbe, phase: str) -> None:
-        if phase not in ("pre", "post"):
+        if phase not in ("pre", "post", "post_repeat", "midpoint"):
             raise ValueError("unknown replay schedule phase")
         data_owner = self.pipeline_data_owner and self.tp_rank == 0
         iterator: Iterator[dict[str, Any]] = (
@@ -2794,7 +2813,9 @@ def _validated_probe_hook_deltas(
         return {}
     if type(probe) is not FunctionResponseProbe or type(registrations) is not tuple:
         raise TypeError("probe hook registrations require the exact bounded response probe")
-    if probe._phase not in ("pre", "post") or len(registrations) != len(probe.descriptors):
+    if probe._phase not in ("pre", "post", "post_repeat", "midpoint") or len(
+        registrations
+    ) != len(probe.descriptors):
         raise RuntimeError("probe hook registrations do not match the active capture")
     if len(probe._handles) != len(registrations):
         raise RuntimeError("probe hook handles do not match the active capture")
@@ -3059,9 +3080,15 @@ class Tier1ReplayTransaction:
             guard.prepare()
             stack.enter_context(guard)
             stack.enter_context(torch.no_grad())
-            probe_hook_registrations = stack.enter_context(
-                self.probe.capture_pre() if phase == "pre" else self.probe.capture_post()
-            )
+            if phase in ("pre", "post"):
+                probe_hook_registrations = stack.enter_context(
+                    self.probe.capture_pre() if phase == "pre" else self.probe.capture_post()
+                )
+            else:
+                capture_endpoint = getattr(self.probe, "capture_endpoint", None)
+                if not callable(capture_endpoint):
+                    raise TypeError("additional replay endpoints require an endpoint probe")
+                probe_hook_registrations = stack.enter_context(capture_endpoint(phase))
             assert self.rng_a is not None
             for _name, operation in self.rng_a.restore_stages(
                 tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
@@ -3145,6 +3172,37 @@ class Tier1ReplayTransaction:
         except BaseException as caught:
             self._fatal(caught)
         self._release_collectively("successful post transaction cleanup")
+        return result
+
+    def run_endpoint(self, phase: str) -> None:
+        """Run one post-update endpoint while retaining the transaction.
+
+        Tier 2 calls this in the exact ``post``, ``post_repeat``, ``midpoint``
+        order. The ordinary Tier-1 :meth:`finish` path remains unchanged.
+        """
+
+        if self.state != TransactionState.PRE_COMPLETE or self.rng_a is None:
+            raise RuntimeError("additional replay endpoints require a completed pre replay")
+        if phase not in ("post", "post_repeat", "midpoint"):
+            raise ValueError("unknown retained replay endpoint")
+        self._run_schedule_phase(phase)
+
+    def finalize_endpoints(self) -> Any:
+        """Finalize a retained multi-endpoint probe and release collectively."""
+
+        if self.state != TransactionState.PRE_COMPLETE or self.rng_a is None:
+            raise RuntimeError("endpoint finalization requires a completed pre replay")
+        result: Any | None = None
+        error: BaseException | None = None
+        try:
+            result = self.probe.finalize()
+        except BaseException as caught:
+            error = caught
+        try:
+            self.readiness.settle(error, "multi-endpoint finalization")
+        except BaseException as caught:
+            self._fatal(caught)
+        self._release_collectively("multi-endpoint transaction cleanup")
         return result
 
     def release(self) -> None:

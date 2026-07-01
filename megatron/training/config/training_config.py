@@ -269,6 +269,59 @@ class LoggerConfig:
     diagnostic_update_starvation_threshold: float = 0.0
     """Applied relative update at or below which a layer is starved."""
 
+    diag_schema: str = "diag/v2"
+    """Versioned tiered optimization-observability schema."""
+
+    diag_enabled: bool = False
+    """Enable Tier-1/2 selected-token replay on due heartbeat events."""
+
+    diag_max_tier: int = 0
+    diag_require_tier: int = 0
+    diag_schedule_mode: str = "successful_updates"
+    diag_early_successful_updates: list[int] = field(
+        default_factory=lambda: [1, 10, 100]
+    )
+    diag_every_successful_updates: int | None = 1000
+    diag_early_consumed_tokens: list[int] = field(default_factory=list)
+    diag_every_consumed_tokens: int | None = None
+    diag_retry_after_skipped_update: bool = True
+
+    diag_sample_selector: str = "global_topk_hash_v1"
+    diag_sample_seed: int = 1234
+    diag_max_sequences_global: int = 32
+    diag_max_positions_per_sequence: int = 128
+    diag_max_valid_positions_global: int = 4096
+    diag_replay_full_sequences: bool = True
+    diag_replay_input_bytes_per_rank: int = 256 * 1024**2
+    diag_all_layer_stats_bytes_per_rank: int = 64 * 1024**2
+
+    diag_max_extra_allocated_bytes_per_rank: int = 8 * 1024**3
+    diag_max_extra_allocated_fraction: float = 0.08
+    diag_max_total_hbm_fraction: float = 0.90
+    diag_min_free_bytes_after_reservation: int = 2 * 1024**3
+
+    diag_max_event_artifact_bytes: int = 4 * 1024**2
+    diag_max_run_artifact_bytes: int = 8 * 1024**3
+    diag_max_campaign_bytes: int = 1536 * 1024**3
+    diag_include_raw_tokens: bool = False
+    diag_include_raw_activations: bool = False
+
+    diag_tier0_optimizer_adapter: str = "bf16_distributed_optimizer_v1"
+    diag_tier1_replay_mode: str = "train_rng_restore"
+    diag_tier1_deterministic_dropout: bool = True
+    diag_tier1_equal_pipeline_participation: bool = True
+    diag_tier2_midpoint_fraction: float = 0.5
+    diag_tier2_midpoint_tolerance: float = 0.05
+    diag_tier2_min_response_over_replay_floor: float = 10.0
+    diag_tier2_enabled_by_default: bool = False
+
+    diag_capability_policy: str = "fail_closed"
+    diag_allow_vpp: bool = False
+    diag_allow_ep: bool = False
+    diag_allow_fsdp: bool = False
+    diag_allow_fp8_parameters: bool = False
+    diag_allow_fp4_parameters: bool = False
+
     diagnostic_successful_updates: int = field(init=False, default=0)
     """Checkpointed runtime count of successful optimizer updates."""
 

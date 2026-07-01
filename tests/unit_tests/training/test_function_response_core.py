@@ -90,6 +90,63 @@ def test_capture_returns_exact_immutable_probe_hook_registrations_and_cleans_up(
     assert all(not module._forward_hooks for module in modules)
 
 
+def test_tier2_probe_retains_exact_four_endpoints_and_reuses_packs() -> None:
+    descriptors, modules = _descriptors(1)
+    probe = FunctionResponseProbe(
+        descriptors,
+        global_layers=1,
+        device="cpu",
+        expected_hook_calls=1,
+        attention_owner=False,
+        attention_required=False,
+        retain_secant_endpoints=True,
+        reduction_binding=ReductionBinding.flat_world(None),
+        scratch_element_capacity=2,
+    )
+    probe.bind_preflight(
+        selected_row_capacity=1,
+        response_widths={family: 1 for family in RESPONSE_FAMILIES},
+        response_dtype=torch.float32,
+        attention_heads=1,
+        attention_key_length=1,
+    )
+
+    for phase, value in (
+        ("pre", 1.0),
+        ("post", 3.0),
+        ("post_repeat", 3.0),
+        ("midpoint", 2.0),
+    ):
+        probe.set_masks(torch.ones((1, 1), dtype=torch.bool))
+        with probe.capture_endpoint(phase):
+            for module in modules:
+                module(torch.full((1, 1, 1), value))
+
+    accumulator = probe.finalize()
+    key = descriptors[0].key
+    assert tuple(
+        float(probe.secant_endpoint_rows(phase, key)[0].item())
+        for phase in ("pre", "post", "post_repeat", "midpoint")
+    ) == (1.0, 3.0, 3.0, 2.0)
+    accumulator.finalize_local_()
+    assert derive_tier1_summaries(accumulator)[
+        "diag/v2/t1/response/residual/dy_rel/first"
+    ] == pytest.approx(2.0)
+
+    sum_storage = accumulator.statistics.sum_pack.untyped_storage().data_ptr()
+    probe.reset_event(expected_hook_calls=1)
+    assert accumulator.statistics.sum_pack.untyped_storage().data_ptr() == sum_storage
+    assert all(not probe.secant_endpoint_rows(phase, key) for phase in probe._secant_rows)
+
+
+def test_additional_response_endpoints_are_fail_closed_by_default() -> None:
+    probe, _modules = _probe(1, expected_hook_calls=1)
+
+    with pytest.raises(RuntimeError, match="Tier-2 retention"):
+        with probe.capture_endpoint("midpoint"):
+            pass
+
+
 def test_tier1_schema_is_exactly_30_unique_canonical_keys() -> None:
     fixture_path = Path(
         "/home/chawkins/src/scaling-worktrees/issue-209-launch-review/"

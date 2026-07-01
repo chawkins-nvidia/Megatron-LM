@@ -361,6 +361,8 @@ class FunctionResponseProbe:
         expected_hook_calls: int,
         sequence_parallel: bool = False,
         attention_owner: bool = True,
+        attention_required: bool = True,
+        retain_secant_endpoints: bool = False,
         reduction_binding: ReductionBinding | None = None,
         scratch_element_capacity: int = 16 * 1024,
     ) -> None:
@@ -372,6 +374,8 @@ class FunctionResponseProbe:
         self.device = torch.device(device)
         self.expected_hook_calls = expected_hook_calls
         self.sequence_parallel = sequence_parallel
+        self.attention_required = attention_required
+        self.retain_secant_endpoints = retain_secant_endpoints
         binding = reduction_binding or ReductionBinding.flat_world(None)
         self.registry = _response_registry(
             self.descriptors,
@@ -391,6 +395,15 @@ class FunctionResponseProbe:
         self._pre_rows: dict[tuple[int, ResponseFamily], list[torch.Tensor]] = {}
         self._pre_calls: dict[tuple[int, ResponseFamily], int] = {}
         self._post_calls: dict[tuple[int, ResponseFamily], int] = {}
+        self._endpoint_calls: dict[str, dict[tuple[int, ResponseFamily], int]] = {
+            "post_repeat": {},
+            "midpoint": {},
+        }
+        self._secant_rows: dict[
+            str, dict[tuple[int, ResponseFamily], list[torch.Tensor]]
+        ] = {
+            phase: {} for phase in ("pre", "post", "post_repeat", "midpoint")
+        }
         self._attention_calls: dict[int, int] = {}
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._phase: str | None = None
@@ -493,6 +506,24 @@ class FunctionResponseProbe:
         """Install hooks for the post-update forward-only schedule."""
 
         with self._capture("post") as registrations:
+            yield registrations
+
+    @contextlib.contextmanager
+    def capture_endpoint(
+        self, phase: str
+    ) -> Iterator[tuple[ResponseHookRegistration, ...]]:
+        """Install the same bounded hooks for one named replay endpoint.
+
+        ``pre`` and ``post`` retain their Tier-1 semantics. ``post_repeat`` and
+        ``midpoint`` are admitted only when the probe was constructed for a
+        Tier-2 secant event.
+        """
+
+        if phase not in ("pre", "post", "post_repeat", "midpoint"):
+            raise ValueError(f"unknown response endpoint phase: {phase}")
+        if phase in ("post_repeat", "midpoint") and not self.retain_secant_endpoints:
+            raise RuntimeError("additional response endpoints require Tier-2 retention")
+        with self._capture(phase) as registrations:
             yield registrations
 
     @contextlib.contextmanager
@@ -611,10 +642,15 @@ class FunctionResponseProbe:
         self._attention_calls[layer] = self._attention_calls.get(layer, 0) + 1
 
     def _observe(self, descriptor: ResponseHookDescriptor, output: Any) -> None:
-        if self._phase not in ("pre", "post"):
+        if self._phase not in ("pre", "post", "post_repeat", "midpoint"):
             raise RuntimeError("response hook fired outside replay capture")
         self.validate_preflight_binding()
-        calls = self._pre_calls if self._phase == "pre" else self._post_calls
+        if self._phase == "pre":
+            calls = self._pre_calls
+        elif self._phase == "post":
+            calls = self._post_calls
+        else:
+            calls = self._endpoint_calls[self._phase]
         if calls.get(descriptor.key, 0) >= self.expected_hook_calls:
             raise RuntimeError("response hook exceeded its preflight cardinality")
         mask = self._sequence_mask if descriptor.sequence_sharded else self._full_mask
@@ -645,7 +681,15 @@ class FunctionResponseProbe:
             retained_rows = sum(value.shape[0] for value in self._pre_rows.get(descriptor.key, ()))
             if retained_rows + rows.shape[0] > self._selected_row_capacity:
                 raise RuntimeError("response rows exceed their preallocated retention cap")
-            self._pre_rows.setdefault(descriptor.key, []).append(rows.detach().clone())
+            retained = rows.detach().clone()
+            self._pre_rows.setdefault(descriptor.key, []).append(retained)
+            if self.retain_secant_endpoints:
+                self._secant_rows["pre"].setdefault(descriptor.key, []).append(retained)
+            return
+        if self._phase in ("post_repeat", "midpoint"):
+            self._secant_rows[self._phase].setdefault(descriptor.key, []).append(
+                rows.detach().clone()
+            )
             return
         before_values = self._pre_rows.get(descriptor.key, [])
         before = before_values.pop(0) if before_values else None
@@ -655,7 +699,10 @@ class FunctionResponseProbe:
         if before is None or before.shape != rows.shape:
             self.registry.mark_observation_error(self.accumulator.statistics, logical_name)
             return
-        self.registry.add_update(self.accumulator.statistics, logical_name, before, rows.detach())
+        post = rows.detach().clone() if self.retain_secant_endpoints else rows.detach()
+        self.registry.add_update(self.accumulator.statistics, logical_name, before, post)
+        if self.retain_secant_endpoints:
+            self._secant_rows["post"].setdefault(descriptor.key, []).append(post)
 
     def finalize(self) -> ResponseAccumulator:
         """Mark exact hook-cardinality errors and return neutral global slots."""
@@ -671,17 +718,57 @@ class FunctionResponseProbe:
                 self.registry.mark_observation_error(
                     self.accumulator.statistics, self.registry.slot_names[self._slot(descriptor)]
                 )
-        local_layers = {descriptor.global_layer for descriptor in self.descriptors}
-        for layer in local_layers:
-            if self._attention_calls.get(layer, 0) != self.expected_hook_calls:
-                for metric in _ATTENTION_METRICS:
-                    self.registry.mark_observation_error(
-                        self.accumulator.statistics,
-                        self.registry.slot_names[self._attention_slot(layer, metric)],
-                    )
+            if self.retain_secant_endpoints and any(
+                self._endpoint_calls[phase].get(descriptor.key, 0)
+                != self.expected_hook_calls
+                for phase in ("post_repeat", "midpoint")
+            ):
+                self.registry.mark_observation_error(
+                    self.accumulator.statistics,
+                    self.registry.slot_names[self._slot(descriptor)],
+                )
+        if self.attention_required:
+            local_layers = {descriptor.global_layer for descriptor in self.descriptors}
+            for layer in local_layers:
+                if self._attention_calls.get(layer, 0) != self.expected_hook_calls:
+                    for metric in _ATTENTION_METRICS:
+                        self.registry.mark_observation_error(
+                            self.accumulator.statistics,
+                            self.registry.slot_names[self._attention_slot(layer, metric)],
+                        )
         self._pre_rows.clear()
         self._finalized = True
         return self.accumulator
+
+    def secant_endpoint_rows(
+        self, phase: str, key: tuple[int, ResponseFamily]
+    ) -> tuple[torch.Tensor, ...]:
+        """Return one immutable selected-row endpoint sequence for Tier 2."""
+
+        if not self.retain_secant_endpoints or phase not in self._secant_rows:
+            raise RuntimeError("secant endpoint rows are unavailable")
+        return tuple(self._secant_rows[phase].get(key, ()))
+
+    def reset_event(self, *, expected_hook_calls: int) -> None:
+        """Reset preallocated packs and all event-local endpoint references."""
+
+        if self._phase is not None or self._handles:
+            raise RuntimeError("cannot reset an active response capture")
+        if expected_hook_calls <= 0:
+            raise ValueError("response events require a positive replay count")
+        self.expected_hook_calls = expected_hook_calls
+        self.accumulator.statistics.reset_()
+        self._pre_rows.clear()
+        self._pre_calls.clear()
+        self._post_calls.clear()
+        for calls in self._endpoint_calls.values():
+            calls.clear()
+        for rows in self._secant_rows.values():
+            rows.clear()
+        self._attention_calls.clear()
+        self._full_mask = None
+        self._sequence_mask = None
+        self._finalized = False
 
     @property
     def retained_pre_bytes(self) -> int:
@@ -719,6 +806,8 @@ class FunctionResponseProbe:
             handle.remove()
         self._handles.clear()
         self._pre_rows.clear()
+        for rows in self._secant_rows.values():
+            rows.clear()
         self._full_mask = None
         self._sequence_mask = None
         self._phase = None
