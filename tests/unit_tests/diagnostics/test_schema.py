@@ -11,6 +11,9 @@ from megatron.training.diagnostics.schema import (
     Tier0Reason,
     Tier0Status,
     assert_payload_schema,
+    assert_tiered_payload_schema,
+    tier0_keys_for_pattern,
+    tiered_keys_for_pattern,
 )
 
 
@@ -87,6 +90,78 @@ def test_payload_validation_requires_exact_set_without_aliases() -> None:
     aliased["act/residual/rms"] = aliased.pop(TIER0_KEYS[0])
     with pytest.raises(ValueError, match="unexpected=.*act/residual/rms"):
         assert_payload_schema(aliased)
+
+
+def test_log4firstlast_r4_schema_is_exact_unpooled_and_layer_suffixed() -> None:
+    selected = (0, 3, 11)
+    t0 = tier0_keys_for_pattern(num_layers=12, layer_pattern="log4firstlast")
+    keys = tiered_keys_for_pattern(
+        effective_tier=2,
+        num_layers=12,
+        layer_pattern="log4firstlast",
+    )
+    expected_t0 = {
+        *(
+            f"diag/v2/t0/{path}/layer_{layer}"
+            for layer in selected
+            for path in (
+                "activation/residual/rms",
+                "activation/residual/max_abs",
+                "dgrad/residual/rms",
+                "update/norm/relative_rms",
+                *(
+                    item
+                    for family in ("qkv", "attn_out", "fc1", "fc2")
+                    for item in (
+                        f"activation/{family}/max_abs",
+                        f"dgrad/{family}/rms",
+                        f"update/{family}/relative_rms",
+                        f"retention/{family}/value",
+                    )
+                ),
+            )
+        ),
+        "diag/v2/t0/update/embedding/relative_rms/layer_0",
+        "diag/v2/t0/retention/embedding/value/layer_0",
+        "diag/v2/t0/update/unembedding/relative_rms/layer_11",
+        "diag/v2/t0/retention/unembedding/value/layer_11",
+        "diag/v2/event/successful_update",
+        "diag/v2/event/valid_positions",
+        "diag/v2/event/num_layers",
+        "diag/v2/status/valid",
+        "diag/v2/perf/peak_hbm_bytes_max_rank",
+        "diag/v2/perf/latency_ms_median_rank",
+        "diag/v2/perf/latency_ms_max_rank",
+    }
+
+    assert len(t0) == 71
+    assert set(t0) == expected_t0
+    assert len(keys) == len(set(keys)) == 157
+    assert_payload_schema(
+        dict.fromkeys(t0), num_layers=12, layer_pattern="log4firstlast"
+    )
+    assert_tiered_payload_schema(
+        dict.fromkeys(keys),
+        effective_tier=2,
+        num_layers=12,
+        layer_pattern="log4firstlast",
+    )
+    assert not any(
+        token in key
+        for key in keys
+        for token in (
+            "/first",
+            "/q1",
+            "/middle",
+            "/q3",
+            "/last",
+            "/p10",
+            "/p50",
+            "/p90",
+            "starved_fraction",
+            "unresolved_fraction",
+        )
+    )
 
 
 def test_status_and_reason_codes_are_stable() -> None:

@@ -29,6 +29,7 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.grad_scaler import ConstantGradScaler, DynamicGradScaler
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.training.diagnostic_layer_selection import selected_global_layer_ids
 
 from .accumulator import PackedSlots, PackedSufficientStatistics, ReductionBinding
 from .artifact_v3 import (
@@ -83,11 +84,15 @@ from .registry import (
 )
 
 from .schema import (  # isort: skip
-    TIER0_KEYS,
+    LAYERWISE_SCALAR_PATTERN,
+    LAYERWISE_TIER0_METADATA_KEYS,
     TIER0_METADATA_KEYS,
     TIER0_METRIC_KEYS,
     assert_payload_schema,
     assert_tiered_payload_schema,
+    is_layerwise_scalar_pattern,
+    layerwise_tier0_metric_keys,
+    tier0_keys_for_pattern,
 )
 
 _UPDATE_FAMILIES = (
@@ -678,6 +683,31 @@ class Tier0Heartbeat:
         """Collectively negotiate support and construct dormant run state."""
 
         self.args = args
+        self.layer_pattern = getattr(args, "diagnostic_layer_pattern", None)
+        self.layerwise_scalars = is_layerwise_scalar_pattern(self.layer_pattern)
+        self.schema_num_layers = int(getattr(args, "num_layers", 0) or 0) or None
+        if self.layerwise_scalars and self.schema_num_layers is None:
+            raise ValueError("log4firstlast diagnostics require num_layers")
+        self.selected_global_layers = (
+            selected_global_layer_ids(self.schema_num_layers, LAYERWISE_SCALAR_PATTERN)
+            if self.layerwise_scalars
+            else ()
+        )
+        self.tier0_metric_keys = (
+            layerwise_tier0_metric_keys(
+                self.selected_global_layers, num_layers=self.schema_num_layers
+            )
+            if self.layerwise_scalars
+            else TIER0_METRIC_KEYS
+        )
+        self.tier0_metadata_keys = (
+            LAYERWISE_TIER0_METADATA_KEYS
+            if self.layerwise_scalars
+            else TIER0_METADATA_KEYS
+        )
+        self.tier0_keys = tier0_keys_for_pattern(
+            num_layers=self.schema_num_layers, layer_pattern=self.layer_pattern
+        )
         self.model = tuple(model)
         self.optimizer = optimizer
         self.device = self._model_device()
@@ -764,11 +794,14 @@ class Tier0Heartbeat:
         )
 
         self.tiered_runtime = None
-        if bool(getattr(args, "diag_enabled", False)) and int(
-            getattr(args, "diag_max_tier", 0)
-        ) >= 1:
+        if (
+            bool(getattr(args, "diag_enabled", False))
+            and int(getattr(args, "diag_max_tier", 0)) >= 1
+        ):
             if forward_step_func is None or forward_backward_func is None:
-                raise RuntimeError("Tier-1/2 diagnostics require the canonical training schedule")
+                raise RuntimeError(
+                    "Tier-1/2 diagnostics require the canonical training schedule"
+                )
             from .runtime import TieredDiagnosticRuntime
 
             self.tiered_runtime = TieredDiagnosticRuntime(
@@ -879,9 +912,7 @@ class Tier0Heartbeat:
         if not max_extra_valid:
             rejection_reasons.append("invalid_max_extra_bytes")
         if not self.capability.supported:
-            rejection_reasons.append(
-                "capability=" + ",".join(self.capability.reasons)
-            )
+            rejection_reasons.append("capability=" + ",".join(self.capability.reasons))
         distributed_optimizer = _distributed_optimizer(self.optimizer)
         if self.capability.supported and distributed_optimizer is not None:
             try:
@@ -1245,7 +1276,7 @@ class Tier0Heartbeat:
         )
         return Tier0CaptureSession(
             self.model,
-            num_layers=int(self.args.num_layers),
+            num_layers=self.schema_num_layers,
             topology=CaptureTopology.from_parallel_state(
                 sequence_parallel=bool(self.args.sequence_parallel)
             ),
@@ -1606,7 +1637,7 @@ class Tier0Heartbeat:
 
     def _derive_payload(self, latencies: torch.Tensor) -> dict[str, torch.Tensor]:
         nan = torch.full((), torch.nan, dtype=torch.float64, device=self.device)
-        payload = {key: nan.clone() for key in TIER0_KEYS}
+        payload = {key: nan.clone() for key in self.tier0_keys}
         if (
             not self.capability.supported
             or self.capture is None
@@ -1622,9 +1653,12 @@ class Tier0Heartbeat:
             )
             valid = capture_result.valid & self._updates_valid()
             self.capture_result = capture_result
-            self._derive_capture_metrics(payload, capture_result)
-            self._derive_update_metrics(payload)
-            self._derive_nonfinite_health(payload)
+            if self.layerwise_scalars:
+                self._derive_layerwise_metrics(payload, capture_result)
+            else:
+                self._derive_capture_metrics(payload, capture_result)
+                self._derive_update_metrics(payload)
+                self._derive_nonfinite_health(payload)
 
         assert self.control_accumulator is not None
         control_failure = torch.stack(
@@ -1642,7 +1676,7 @@ class Tier0Heartbeat:
             torch.as_tensor(valid, dtype=torch.bool, device=self.device)
             & ~control_failure
         )
-        for key in TIER0_METRIC_KEYS:
+        for key in self.tier0_metric_keys:
             payload[key] = torch.where(valid, payload[key], nan)
         payload["diag/v2/event/successful_update"] = torch.tensor(
             self.successful_updates, dtype=torch.float64, device=self.device
@@ -1655,13 +1689,21 @@ class Tier0Heartbeat:
             payload["diag/v2/event/valid_positions"] = torch.zeros(
                 (), dtype=torch.float64, device=self.device
             )
+        if self.layerwise_scalars:
+            payload["diag/v2/event/num_layers"] = torch.tensor(
+                int(self.args.num_layers), dtype=torch.float64, device=self.device
+            )
         payload["diag/v2/status/valid"] = torch.zeros(
             (), dtype=torch.float64, device=self.device
         )
         payload["diag/v2/perf/peak_hbm_bytes_max_rank"] = nan.clone()
         payload["diag/v2/perf/latency_ms_median_rank"] = nan.clone()
         payload["diag/v2/perf/latency_ms_max_rank"] = nan.clone()
-        assert_payload_schema(payload)
+        assert_payload_schema(
+            payload,
+            num_layers=int(self.args.num_layers),
+            layer_pattern=self.layer_pattern,
+        )
         return payload
 
     def _updates_valid(self) -> torch.Tensor:
@@ -1707,6 +1749,88 @@ class Tier0Heartbeat:
             derived = getattr(result.accumulator, statistic)(name)
             values.append(derived.value)
         return torch.stack(values)
+
+    def _derive_layerwise_metrics(
+        self, payload: dict[str, torch.Tensor], result: Tier0CaptureResult
+    ) -> None:
+        """Derive one independent Tier-0 scalar for each selected layer/family."""
+
+        assert self.update_accumulator is not None
+        capture = result.accumulator
+        for layer in self.selected_global_layers:
+            suffix = f"layer_{layer}"
+            residual_name = f"activation/residual/{suffix}"
+            residual_maximum = capture.maximum(residual_name).value
+            residual_minimum = capture.minimum(residual_name).value
+            payload[f"diag/v2/t0/activation/residual/rms/{suffix}"] = capture.rms(
+                residual_name
+            ).value
+            payload[f"diag/v2/t0/activation/residual/max_abs/{suffix}"] = torch.maximum(
+                residual_maximum.abs(), residual_minimum.abs()
+            )
+            payload[f"diag/v2/t0/dgrad/residual/rms/{suffix}"] = capture.rms(
+                f"dgrad/residual/{suffix}"
+            ).value
+            payload[f"diag/v2/t0/update/norm/relative_rms/{suffix}"] = (
+                self.update_accumulator.relative_rms(f"update/norm/{suffix}").value
+            )
+            for family in (
+                MetricFamily.QKV,
+                MetricFamily.ATTN_OUT,
+                MetricFamily.FC1,
+                MetricFamily.FC2,
+            ):
+                activation_name = f"activation/{family.value}/{suffix}"
+                maximum = capture.maximum(activation_name).value
+                minimum = capture.minimum(activation_name).value
+                payload[f"diag/v2/t0/activation/{family.value}/max_abs/{suffix}"] = (
+                    torch.maximum(maximum.abs(), minimum.abs())
+                )
+                payload[f"diag/v2/t0/dgrad/{family.value}/rms/{suffix}"] = capture.rms(
+                    f"dgrad/{family.value}/{suffix}"
+                ).value
+                update_name = f"update/{family.value}/{suffix}"
+                payload[f"diag/v2/t0/update/{family.value}/relative_rms/{suffix}"] = (
+                    self.update_accumulator.relative_rms(update_name).value
+                )
+                payload[f"diag/v2/t0/retention/{family.value}/value/{suffix}"] = (
+                    self.update_accumulator.norm_retention(update_name).value
+                )
+
+        embedding_update = self.update_accumulator.relative_rms(
+            "update/embedding"
+        ).value
+        embedding_retention = self.update_accumulator.norm_retention(
+            "update/embedding"
+        ).value
+        payload["diag/v2/t0/update/embedding/relative_rms/layer_0"] = embedding_update
+        payload["diag/v2/t0/retention/embedding/value/layer_0"] = embedding_retention
+        last = int(self.args.num_layers) - 1
+        if self._has_tied_output_weights():
+            output_update = embedding_update
+            output_retention = embedding_retention
+        else:
+            output_update = self.update_accumulator.relative_rms("update/output").value
+            output_retention = self.update_accumulator.norm_retention(
+                "update/output"
+            ).value
+        payload[f"diag/v2/t0/update/unembedding/relative_rms/layer_{last}"] = (
+            output_update
+        )
+        payload[f"diag/v2/t0/retention/unembedding/value/layer_{last}"] = (
+            output_retention
+        )
+
+    def _has_tied_output_weights(self) -> bool:
+        """Return whether embedding and output roles share one optimizer update."""
+
+        return any(
+            isinstance(_unwrap_module(chunk), GPTModel)
+            and getattr(
+                _unwrap_module(chunk), "share_embeddings_and_output_weights", False
+            )
+            for chunk in self.model
+        )
 
     @staticmethod
     def _summary(values: torch.Tensor, quantile: float) -> torch.Tensor:
@@ -1907,7 +2031,9 @@ class Tier0Heartbeat:
             assert self.tiered_runtime is not None
             assert self._tier_output is not None
             if tuple(self._runtime_payload) != self.tiered_runtime.output_keys:
-                raise RuntimeError("runtime diagnostic output order changed before sink transfer")
+                raise RuntimeError(
+                    "runtime diagnostic output order changed before sink transfer"
+                )
             for index, key in enumerate(self.tiered_runtime.output_keys):
                 self._tier_output[index].copy_(self._runtime_payload[key])
             runtime_end = runtime_start + self._tier_output.numel()
@@ -1933,7 +2059,11 @@ class Tier0Heartbeat:
             }
         try:
             host_payload = self._derive_host_payload(host_packs, rank_evidence)
-            assert_payload_schema(host_payload)
+            assert_payload_schema(
+                host_payload,
+                num_layers=self.schema_num_layers,
+                layer_pattern=self.layer_pattern,
+            )
             if self._runtime_payload:
                 assert self.tiered_runtime is not None
                 runtime_values = host_combined[
@@ -1962,10 +2092,11 @@ class Tier0Heartbeat:
                 host_payload,
                 effective_tier=(
                     self.tiered_runtime.tier
-                    if self.tiered_runtime is not None
-                    and self.tiered_runtime.active
+                    if self.tiered_runtime is not None and self.tiered_runtime.active
                     else 0
                 ),
+                num_layers=self.schema_num_layers,
+                layer_pattern=self.layer_pattern,
             )
             artifact_written = False
             artifact_error: Exception | None = None
@@ -2168,7 +2299,9 @@ class Tier0Heartbeat:
             status_reason="Tier 0 does not capture replay identity or restorable state",
             capability_signature=build_runtime_signature(
                 self.optimizer,
-                precision="bf16" if bool(getattr(self.args, "bf16", False)) else "unknown",
+                precision="bf16"
+                if bool(getattr(self.args, "bf16", False))
+                else "unknown",
                 dp=topology["dp"],
                 tp=tp,
                 pp=pp,
@@ -2224,7 +2357,8 @@ class Tier0Heartbeat:
                     "pre_event_reserved_bytes": pre_reserved,
                     "predicted_post_gather_peak_allocated_bytes": pre_allocated
                     + predicted,
-                    "predicted_post_gather_peak_reserved_bytes": pre_reserved + predicted,
+                    "predicted_post_gather_peak_reserved_bytes": pre_reserved
+                    + predicted,
                     "post_gather_peak_allocated_bytes": max(
                         pre_allocated, float(source[7])
                     ),
@@ -2258,9 +2392,7 @@ class Tier0Heartbeat:
         def hashes(phase: str, component: str) -> list[str]:
             component_offset = 0 if component == "optimizer" else 2
             start = (
-                _BASE_RANK_EVIDENCE_FIELDS
-                + phase_index[phase] * 4
-                + component_offset
+                _BASE_RANK_EVIDENCE_FIELDS + phase_index[phase] * 4 + component_offset
             )
             return [
                 hashlib.sha256(
@@ -2344,9 +2476,7 @@ class Tier0Heartbeat:
             if self._reduction_arenas is not None
             else 0
         )
-        operations = {
-            name: [] for name in self._process_group_memberships
-        }
+        operations = {name: [] for name in self._process_group_memberships}
         operations["world"] = [
             {
                 "name": "all_reduce",
@@ -2494,15 +2624,21 @@ class Tier0Heartbeat:
             repeat_sq = error_values[5]
             pre_sq = pre_values[2]
             count = response_values[1]
-            errors = sum(response_values[7:11]) + sum(error_values[7:11]) + sum(
-                pre_values[7:11]
+            errors = (
+                sum(response_values[7:11])
+                + sum(error_values[7:11])
+                + sum(pre_values[7:11])
             )
             values = {
                 "true_response": (
-                    math.sqrt(true_sq / pre_sq) if true_sq >= 0 and pre_sq > 0 else math.nan
+                    math.sqrt(true_sq / pre_sq)
+                    if true_sq >= 0 and pre_sq > 0
+                    else math.nan
                 ),
                 "secant_error": (
-                    math.sqrt(error_sq / true_sq) if error_sq >= 0 and true_sq > 0 else math.nan
+                    math.sqrt(error_sq / true_sq)
+                    if error_sq >= 0 and true_sq > 0
+                    else math.nan
                 ),
                 "secant_cosine": (
                     response_values[3] / math.sqrt(true_sq * predicted_sq)
@@ -2511,7 +2647,9 @@ class Tier0Heartbeat:
                 ),
                 "realized_midpoint_fraction": midpoint_fraction,
                 "replay_floor": (
-                    math.sqrt(repeat_sq / true_sq) if repeat_sq >= 0 and true_sq > 0 else math.nan
+                    math.sqrt(repeat_sq / true_sq)
+                    if repeat_sq >= 0 and true_sq > 0
+                    else math.nan
                 ),
             }
             denominators = {
@@ -2586,7 +2724,7 @@ class Tier0Heartbeat:
     ) -> dict[str, float | int]:
         """Derive all fixed metrics from CPU-resident reduced sufficient statistics."""
 
-        payload: dict[str, float | int] = {key: math.nan for key in TIER0_KEYS}
+        payload: dict[str, float | int] = {key: math.nan for key in self.tier0_keys}
         capture = (
             host_packs.get(self.capture_accumulator.descriptor_hash)
             if self.capture_accumulator is not None
@@ -2631,6 +2769,7 @@ class Tier0Heartbeat:
         event_valid = bool(
             self.capability.supported and capture is not None and update is not None
         )
+        tied_output = self._has_tied_output_weights()
         if capture is not None:
             token_values, _, _ = fields(capture, "event/valid_tokens")
             valid_positions = int(token_values[0])
@@ -2659,13 +2798,6 @@ class Tier0Heartbeat:
                     f"event/valid_tokens(count={token_values[1]:g},sum={token_values[0]:g})"
                 )
         if update is not None:
-            tied_output = any(
-                isinstance(_unwrap_module(chunk), GPTModel)
-                and getattr(
-                    _unwrap_module(chunk), "share_embeddings_and_output_weights", False
-                )
-                for chunk in self.model
-            )
             for name in update["names"]:
                 values, _, _ = fields(update, name)
                 errors_valid = all(value == 0 for value in values[7:11])
@@ -2726,7 +2858,74 @@ class Tier0Heartbeat:
             ratio = values[numerator] / values[denominator]
             return math.sqrt(ratio) if ratio >= 0 and math.isfinite(ratio) else math.nan
 
-        if event_valid and capture is not None and update is not None:
+        if (
+            event_valid
+            and capture is not None
+            and update is not None
+            and self.layerwise_scalars
+        ):
+            for layer in self.selected_global_layers:
+                suffix = f"layer_{layer}"
+                residual_values, residual_maximum, residual_minimum = fields(
+                    capture, f"activation/residual/{suffix}"
+                )
+                payload[f"diag/v2/t0/activation/residual/rms/{suffix}"] = capture_rms(
+                    f"activation/residual/{suffix}"
+                )
+                payload[f"diag/v2/t0/activation/residual/max_abs/{suffix}"] = (
+                    max(abs(residual_maximum), abs(residual_minimum))
+                    if slot_valid(residual_values)
+                    else math.nan
+                )
+                payload[f"diag/v2/t0/dgrad/residual/rms/{suffix}"] = capture_rms(
+                    f"dgrad/residual/{suffix}"
+                )
+                payload[f"diag/v2/t0/update/norm/relative_rms/{suffix}"] = update_ratio(
+                    f"update/norm/{suffix}", 4, 5
+                )
+                for family in ("qkv", "attn_out", "fc1", "fc2"):
+                    activation_values, maximum, minimum = fields(
+                        capture, f"activation/{family}/{suffix}"
+                    )
+                    payload[f"diag/v2/t0/activation/{family}/max_abs/{suffix}"] = (
+                        max(abs(maximum), abs(minimum))
+                        if slot_valid(activation_values)
+                        else math.nan
+                    )
+                    payload[f"diag/v2/t0/dgrad/{family}/rms/{suffix}"] = capture_rms(
+                        f"dgrad/{family}/{suffix}"
+                    )
+                    update_name = f"update/{family}/{suffix}"
+                    payload[f"diag/v2/t0/update/{family}/relative_rms/{suffix}"] = (
+                        update_ratio(update_name, 4, 5)
+                    )
+                    payload[f"diag/v2/t0/retention/{family}/value/{suffix}"] = (
+                        update_ratio(update_name, 4, 2)
+                    )
+            embedding_update = update_ratio("update/embedding", 4, 5)
+            embedding_retention = update_ratio("update/embedding", 4, 2)
+            payload["diag/v2/t0/update/embedding/relative_rms/layer_0"] = (
+                embedding_update
+            )
+            payload["diag/v2/t0/retention/embedding/value/layer_0"] = (
+                embedding_retention
+            )
+            last = int(self.args.num_layers) - 1
+            payload[f"diag/v2/t0/update/unembedding/relative_rms/layer_{last}"] = (
+                embedding_update if tied_output else update_ratio("update/output", 4, 5)
+            )
+            payload[f"diag/v2/t0/retention/unembedding/value/layer_{last}"] = (
+                embedding_retention
+                if tied_output
+                else update_ratio("update/output", 4, 2)
+            )
+
+        if (
+            event_valid
+            and capture is not None
+            and update is not None
+            and not self.layerwise_scalars
+        ):
             anchors = {
                 "first": 0,
                 "q1": round((int(self.args.num_layers) - 1) * 0.25),
@@ -2856,6 +3055,8 @@ class Tier0Heartbeat:
 
         payload["diag/v2/event/successful_update"] = self.successful_updates
         payload["diag/v2/event/valid_positions"] = valid_positions
+        if self.layerwise_scalars:
+            payload["diag/v2/event/num_layers"] = int(self.args.num_layers)
         payload["diag/v2/status/valid"] = int(event_valid)
         payload["diag/v2/perf/peak_hbm_bytes_max_rank"] = math.nan
         payload["diag/v2/perf/latency_ms_median_rank"] = math.nan

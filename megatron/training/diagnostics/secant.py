@@ -63,6 +63,33 @@ TIER2_OUTPUT_KEYS: tuple[str, ...] = (
     "diag/v2/t2/unresolved_fraction",
     "diag/v2/t2/valid",
 )
+_LAYERWISE_TIER2_FAMILIES = ("residual", "qkv", "attn_out", "fc1", "fc2")
+_LAYERWISE_TIER2_METRICS = (
+    "true_response",
+    "secant_error",
+    "secant_cosine",
+    "replay_floor",
+)
+_LAYERWISE_TIER2_GLOBAL_KEYS = (
+    "diag/v2/t2/realized_midpoint_fraction",
+    "diag/v2/t2/valid",
+)
+
+
+def layerwise_tier2_keys(global_layers: tuple[int, ...]) -> tuple[str, ...]:
+    """Return exact per-cell Tier-2 keys plus two global controls."""
+
+    if not global_layers or global_layers != tuple(sorted(set(global_layers))):
+        raise ValueError("layerwise Tier-2 keys require ordered unique global layers")
+    return (
+        *(
+            f"diag/v2/t2/{family}/{metric}/layer_{layer}"
+            for layer in global_layers
+            for family in _LAYERWISE_TIER2_FAMILIES
+            for metric in _LAYERWISE_TIER2_METRICS
+        ),
+        *_LAYERWISE_TIER2_GLOBAL_KEYS,
+    )
 
 
 @dataclass(frozen=True)
@@ -117,7 +144,8 @@ def canonical_secant_cells(
         raise ValueError("secant cell logical names must be unique")
     return tuple(
         sorted(
-            materialized, key=lambda cell: (cell.global_layer, cell.family.value, cell.logical_name)
+            materialized,
+            key=lambda cell: (cell.global_layer, cell.family.value, cell.logical_name),
         )
     )
 
@@ -133,7 +161,9 @@ def build_secant_registry(
     for cell in ordered:
         for suffix in _SECANT_SLOT_SUFFIXES:
             statistic_kind = (
-                StatisticKind.TENSOR_MOMENTS if suffix == "pre" else StatisticKind.PAIR_MOMENTS
+                StatisticKind.TENSOR_MOMENTS
+                if suffix == "pre"
+                else StatisticKind.PAIR_MOMENTS
             )
             descriptors.append(
                 MetricDescriptor(
@@ -216,7 +246,9 @@ class SecantStatistics:
                 "secant observations must exactly match canonical global cell order: "
                 f"expected={self.binding.observation_names}, received={received}"
             )
-        prepared = tuple(self._validate_observation(observation) for observation in observations)
+        prepared = tuple(
+            self._validate_observation(observation) for observation in observations
+        )
         for cell, observation, observation_tensors in zip(
             self.binding.cells, observations, prepared
         ):
@@ -226,7 +258,9 @@ class SecantStatistics:
             if not self.binding.registry.owns(response_name):
                 continue
             pre, post, repeat, midpoint, mask = observation_tensors
-            flattened = tuple(tensor.view(-1) for tensor in (pre, post, repeat, midpoint))
+            flattened = tuple(
+                tensor.view(-1) for tensor in (pre, post, repeat, midpoint)
+            )
             for start in range(0, pre.numel(), self.chunk_elements):
                 end = min(start + self.chunk_elements, pre.numel())
                 pre_chunk, post_chunk, repeat_chunk, midpoint_chunk = (
@@ -250,7 +284,9 @@ class SecantStatistics:
     @staticmethod
     def _validate_observation(
         observation: SecantObservation,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
+    ]:
         tensors = tuple(
             tensor.detach()
             for tensor in (
@@ -293,7 +329,9 @@ class SecantStatistics:
                 mask_extent not in (1, observation_extent)
                 for mask_extent, observation_extent in zip(mask_shape, reference.shape)
             ):
-                raise ValueError("secant mask is not broadcast-aligned to the observation")
+                raise ValueError(
+                    "secant mask is not broadcast-aligned to the observation"
+                )
         return (*tensors, mask)
 
     @staticmethod
@@ -357,13 +395,17 @@ class SecantSufficientStatisticsView:
         if cell not in binding.cells:
             raise ValueError("secant cell is not present in the bound global registry")
         if not accumulator.reduced:
-            raise RuntimeError("secant statistics must be globally reduced before derivation")
+            raise RuntimeError(
+                "secant statistics must be globally reduced before derivation"
+            )
 
         response = accumulator.slots(binding.slot_name(cell, "response"))
         error_replay = accumulator.slots(binding.slot_name(cell, "error_replay"))
         pre = accumulator.slots(binding.slot_name(cell, "pre"))
         pack = accumulator.sum_pack
-        counts = torch.stack((pack[response.count], pack[error_replay.count], pack[pre.count]))
+        counts = torch.stack(
+            (pack[response.count], pack[error_replay.count], pack[pre.count])
+        )
         contract_error = (
             (counts != counts[0]).to(dtype=torch.float64).sum()
             + pack[response.mask_error]
@@ -385,7 +427,9 @@ class SecantSufficientStatisticsView:
             repeat_error_sq=pack[error_replay.rhs_sumsq],
             count=counts[0],
             nonfinite=(
-                pack[response.nonfinite] + pack[error_replay.nonfinite] + pack[pre.nonfinite]
+                pack[response.nonfinite]
+                + pack[error_replay.nonfinite]
+                + pack[pre.nonfinite]
             ),
             contract_error=contract_error,
         )
@@ -446,8 +490,12 @@ def derive_secant_cell(
     midpoint_sq = torch.as_tensor(
         midpoint_displacement_sq, dtype=torch.float64, device=reference.device
     )
-    full_sq = torch.as_tensor(full_displacement_sq, dtype=torch.float64, device=reference.device)
-    restored = torch.as_tensor(restore_verified, dtype=torch.bool, device=reference.device)
+    full_sq = torch.as_tensor(
+        full_displacement_sq, dtype=torch.float64, device=reference.device
+    )
+    restored = torch.as_tensor(
+        restore_verified, dtype=torch.bool, device=reference.device
+    )
     raw = torch.stack(
         (
             statistics.true_sq,
@@ -489,9 +537,19 @@ def derive_secant_cell(
     resolved = statistics.true_sq >= (
         replay_floor_multiplier * replay_floor_multiplier * statistics.repeat_error_sq
     )
-    midpoint_valid = (midpoint_fraction >= midpoint_min) & (midpoint_fraction <= midpoint_max)
+    midpoint_valid = (midpoint_fraction >= midpoint_min) & (
+        midpoint_fraction <= midpoint_max
+    )
     derived_finite = (
-        torch.stack((true_response, secant_error, secant_cosine, midpoint_fraction, replay_floor))
+        torch.stack(
+            (
+                true_response,
+                secant_error,
+                secant_cosine,
+                midpoint_fraction,
+                replay_floor,
+            )
+        )
         .isfinite()
         .all()
     )
@@ -509,10 +567,14 @@ def derive_secant_cell(
 
     status = torch.zeros((), dtype=torch.int64, device=reference.device)
     status = torch.where(
-        ~contributors, torch.full_like(status, int(SecantMathStatus.NO_CONTRIBUTORS)), status
+        ~contributors,
+        torch.full_like(status, int(SecantMathStatus.NO_CONTRIBUTORS)),
+        status,
     )
     status = torch.where(
-        ~finite | ~no_nonfinite, torch.full_like(status, int(SecantMathStatus.NONFINITE)), status
+        ~finite | ~no_nonfinite,
+        torch.full_like(status, int(SecantMathStatus.NONFINITE)),
+        status,
     )
     status = torch.where(
         contributors & finite & no_nonfinite & ~contract_valid,
@@ -535,7 +597,12 @@ def derive_secant_cell(
         status,
     )
     status = torch.where(
-        contributors & finite & no_nonfinite & contract_valid & denominators_valid & ~resolved,
+        contributors
+        & finite
+        & no_nonfinite
+        & contract_valid
+        & denominators_valid
+        & ~resolved,
         torch.full_like(status, int(SecantMathStatus.REPLAY_UNRESOLVED)),
         status,
     )
@@ -583,12 +650,16 @@ def derive_secant_cell(
     )
 
 
-def derive_tier2_outputs(metrics: Sequence[SecantCellMetrics]) -> dict[str, torch.Tensor]:
+def derive_tier2_outputs(
+    metrics: Sequence[SecantCellMetrics],
+) -> dict[str, torch.Tensor]:
     """Return the exact ordered 17-key Tier-2 payload from pooled cell metrics."""
 
     if not metrics:
         raise ValueError("Tier-2 output derivation requires at least one cell")
-    quantiles = torch.tensor((0.1, 0.5, 0.9), dtype=torch.float64, device=metrics[0].valid.device)
+    quantiles = torch.tensor(
+        (0.1, 0.5, 0.9), dtype=torch.float64, device=metrics[0].valid.device
+    )
     values: list[torch.Tensor] = []
     for attribute in (
         "true_response",
@@ -607,7 +678,56 @@ def derive_tier2_outputs(metrics: Sequence[SecantCellMetrics]) -> dict[str, torc
     return dict(zip(TIER2_OUTPUT_KEYS, values))
 
 
-def _bounded_nanquantiles(values: torch.Tensor, quantiles: torch.Tensor) -> torch.Tensor:
+def derive_tier2_layerwise_outputs(
+    cells: Sequence[SecantCellDescriptor],
+    metrics: Sequence[SecantCellMetrics],
+    global_layers: tuple[int, ...],
+    *,
+    midpoint_fraction: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Return unpooled Tier-2 values for selected global layer/family cells."""
+
+    expected = layerwise_tier2_keys(global_layers)
+    if len(cells) != len(metrics):
+        raise ValueError("Tier-2 cells and metrics must have identical cardinality")
+    lookup = {
+        (cell.global_layer, cell.family.value): metric
+        for cell, metric in zip(cells, metrics, strict=True)
+    }
+    if len(lookup) != len(cells):
+        raise ValueError("Tier-2 cells must have unique layer/family identities")
+    payload: dict[str, torch.Tensor] = {}
+    selected_metrics: list[SecantCellMetrics] = []
+    for layer in global_layers:
+        for family in _LAYERWISE_TIER2_FAMILIES:
+            try:
+                cell_metrics = lookup[(layer, family)]
+            except KeyError as error:
+                raise ValueError(
+                    f"missing Tier-2 layerwise cell layer={layer}, family={family}"
+                ) from error
+            selected_metrics.append(cell_metrics)
+            for metric in _LAYERWISE_TIER2_METRICS:
+                payload[f"diag/v2/t2/{family}/{metric}/layer_{layer}"] = getattr(
+                    cell_metrics, metric
+                )
+    reference = selected_metrics[0].valid
+    midpoint = torch.as_tensor(
+        midpoint_fraction, dtype=torch.float64, device=reference.device
+    )
+    payload[_LAYERWISE_TIER2_GLOBAL_KEYS[0]] = midpoint
+    payload[_LAYERWISE_TIER2_GLOBAL_KEYS[1]] = (
+        torch.stack(tuple(metric.valid for metric in selected_metrics)).all()
+        & torch.isfinite(midpoint)
+    ).to(dtype=torch.float64)
+    if tuple(payload) != expected:
+        raise RuntimeError("derived layerwise Tier-2 payload order changed")
+    return payload
+
+
+def _bounded_nanquantiles(
+    values: torch.Tensor, quantiles: torch.Tensor
+) -> torch.Tensor:
     """Derive linear quantiles with three explicitly bounded cell-sized buffers."""
 
     sorted_values = torch.sort(values).values
@@ -654,7 +774,9 @@ class RestorationReport:
 class IndependentRestorer:
     """Attempt every fixed restoration stage even when earlier stages fail."""
 
-    def __init__(self, stages: Iterable[RestorationStage], device: torch.device | str) -> None:
+    def __init__(
+        self, stages: Iterable[RestorationStage], device: torch.device | str
+    ) -> None:
         """Require every independent state class exactly once and in fixed order."""
 
         self.stages = tuple(stages)
@@ -666,7 +788,9 @@ class IndependentRestorer:
                 f"expected={expected}, received={received}"
             )
         self.device = torch.device(device)
-        self._stage_valid = torch.ones(len(self.stages), dtype=torch.bool, device=self.device)
+        self._stage_valid = torch.ones(
+            len(self.stages), dtype=torch.bool, device=self.device
+        )
         self._valid = torch.ones((), dtype=torch.bool, device=self.device)
         self._verified = torch.ones((), dtype=torch.bool, device=self.device)
 
@@ -683,9 +807,13 @@ class IndependentRestorer:
                 stage_valid[index] = False
                 failed.append(stage.kind)
             try:
-                verified = stage.verify().detach().to(device=self.device, dtype=torch.bool)
+                verified = (
+                    stage.verify().detach().to(device=self.device, dtype=torch.bool)
+                )
                 torch.all(verified, dim=tuple(range(verified.ndim)), out=self._verified)
-                torch.logical_and(stage_valid[index], self._verified, out=stage_valid[index])
+                torch.logical_and(
+                    stage_valid[index], self._verified, out=stage_valid[index]
+                )
             except Exception:
                 stage_valid[index] = False
                 if stage.kind not in failed:
@@ -704,7 +832,9 @@ class IndependentRestorer:
 class TensorBitwiseSnapshot:
     """Capture, independently restore, and device-verify unique tensor storage views."""
 
-    def __init__(self, tensors: Iterable[torch.Tensor], *, chunk_elements: int = 65_536) -> None:
+    def __init__(
+        self, tensors: Iterable[torch.Tensor], *, chunk_elements: int = 65_536
+    ) -> None:
         """Clone each exact physical view once, preserving alias ownership."""
 
         if chunk_elements <= 0:
@@ -713,7 +843,9 @@ class TensorBitwiseSnapshot:
         identities: set[tuple[object, ...]] = set()
         for tensor in tensors:
             if not tensor.is_contiguous():
-                raise ValueError("bitwise restoration snapshots require contiguous tensor views")
+                raise ValueError(
+                    "bitwise restoration snapshots require contiguous tensor views"
+                )
             identity = (
                 tensor.device,
                 tensor.untyped_storage().data_ptr(),
@@ -764,7 +896,9 @@ class TensorBitwiseSnapshot:
             expected_bytes = snapshot.view(torch.uint8).view(-1)
             for start in range(0, expected_bytes.numel(), self.chunk_elements):
                 end = min(start + self.chunk_elements, expected_bytes.numel())
-                mismatch = torch.ne(current_bytes[start:end], expected_bytes[start:end]).any()
+                mismatch = torch.ne(
+                    current_bytes[start:end], expected_bytes[start:end]
+                ).any()
                 torch.logical_and(valid, ~mismatch, out=valid)
         return valid
 
@@ -839,7 +973,10 @@ class SecantLocalTransaction:
             return self.result()
         if self.state == SecantTransactionState.RESTORED:
             return self.result()
-        if self.error != SecantTransactionError.NONE or int(target) != int(self.state) + 1:
+        if (
+            self.error != SecantTransactionError.NONE
+            or int(target) != int(self.state) + 1
+        ):
             return self.fail(SecantTransactionError.INVALID_TRANSITION)
         if target == SecantTransactionState.PRE_CAPTURED:
             self._work_started = True
@@ -854,7 +991,9 @@ class SecantLocalTransaction:
             self.error = torch.where(
                 restore_failed,
                 torch.full_like(
-                    restore_failed, int(SecantTransactionError.RESTORE_FAILED), dtype=torch.int64
+                    restore_failed,
+                    int(SecantTransactionError.RESTORE_FAILED),
+                    dtype=torch.int64,
                 ),
                 torch.full_like(
                     restore_failed, int(SecantTransactionError.NONE), dtype=torch.int64
@@ -913,7 +1052,9 @@ class SecantOptimizerLayout:
         if not self.distributed_optimizer:
             raise SecantUnsupportedLayoutError("distributed optimizer is required")
         if not self.bf16_parameters or not self.fp32_masters:
-            raise SecantUnsupportedLayoutError("BF16 parameters with FP32 masters are required")
+            raise SecantUnsupportedLayoutError(
+                "BF16 parameters with FP32 masters are required"
+            )
         if self.precision_aware or self.fsdp or self.fp8_or_fp4 or self.cpu_offload:
             raise SecantUnsupportedLayoutError(
                 "optimizer layout uses an unsupported representation"
@@ -999,15 +1140,21 @@ class SecantMemoryEstimate:
         """Compose this authoritative peak with adapter preflight without double counting."""
 
         if adapter.owner_elements != self.unique_owner_elements:
-            raise ValueError("adapter owner count does not match the maximum-loaded rank")
+            raise ValueError(
+                "adapter owner count does not match the maximum-loaded rank"
+            )
         if (
             adapter.fp32_master_bytes != 4 * self.unique_owner_elements
             or adapter.bf16_applied_bytes != 2 * self.unique_owner_elements
             or adapter.post_fingerprint_bytes != 4 * 8
         ):
-            raise ValueError("adapter shared snapshot schema does not match the secant estimate")
+            raise ValueError(
+                "adapter shared snapshot schema does not match the secant estimate"
+            )
         if adapter.total_bytes > self.peak_bytes:
-            raise SecantMemoryEstimateError("adapter lifecycle exceeds the complete secant peak")
+            raise SecantMemoryEstimateError(
+                "adapter lifecycle exceeds the complete secant peak"
+            )
         return self.peak_bytes - adapter.total_bytes
 
     @classmethod
@@ -1028,14 +1175,20 @@ class SecantMemoryEstimate:
         if any(size <= 0 for size in sizes):
             raise ValueError("parallel sizes must be positive")
         if any(size > _MAX_REPRESENTABLE_BYTES for size in sizes):
-            raise SecantMemoryEstimateError("parallel size exceeds the representable cap")
+            raise SecantMemoryEstimateError(
+                "parallel size exceeds the representable cap"
+            )
         world_size = math.prod(sizes)
         if world_size > _MAX_REPRESENTABLE_BYTES:
             raise SecantMemoryEstimateError("world size exceeds the representable cap")
         if len(inputs.loaded_owner_elements_by_rank) != world_size:
-            raise ValueError("loaded owner counts must contain exactly one entry per world rank")
+            raise ValueError(
+                "loaded owner counts must contain exactly one entry per world rank"
+            )
         if len(inputs.tied_alias_elements_by_rank) != world_size:
-            raise ValueError("tied alias counts must contain exactly one entry per world rank")
+            raise ValueError(
+                "tied alias counts must contain exactly one entry per world rank"
+            )
         scalar_values = (
             *inputs.loaded_owner_elements_by_rank,
             *inputs.tied_alias_elements_by_rank,
@@ -1052,19 +1205,25 @@ class SecantMemoryEstimate:
         if any(value < 0 for value in scalar_values):
             raise ValueError("memory inputs must be nonnegative")
         if any(value > _MAX_REPRESENTABLE_BYTES for value in scalar_values):
-            raise SecantMemoryEstimateError("memory input exceeds the representable cap")
+            raise SecantMemoryEstimateError(
+                "memory input exceeds the representable cap"
+            )
         if not isinstance(inputs.chunk_elements, int):
             raise ValueError("chunk elements must be an integer")
         if inputs.chunk_elements <= 0:
             raise ValueError("chunk elements must be positive")
         if inputs.chunk_elements > _MAX_REPRESENTABLE_BYTES:
-            raise SecantMemoryEstimateError("chunk elements exceed the representable cap")
+            raise SecantMemoryEstimateError(
+                "chunk elements exceed the representable cap"
+            )
         if not isinstance(inputs.alignment_bytes, int):
             raise ValueError("allocation alignment must be an integer")
         if inputs.alignment_bytes <= 0:
             raise ValueError("allocation alignment must be positive")
         if inputs.alignment_bytes > _MAX_REPRESENTABLE_BYTES:
-            raise SecantMemoryEstimateError("allocation alignment exceeds the representable cap")
+            raise SecantMemoryEstimateError(
+                "allocation alignment exceeds the representable cap"
+            )
         if not math.isfinite(inputs.allocator_headroom_fraction) or not (
             0 <= inputs.allocator_headroom_fraction < 1
         ):
@@ -1073,13 +1232,22 @@ class SecantMemoryEstimate:
             0 <= inputs.driver_headroom_fraction < 1
         ):
             raise ValueError("driver headroom fraction must be in [0, 1)")
-        if inputs.registry_slots <= 0 or inputs.registry_slots % len(_SECANT_SLOT_SUFFIXES) != 0:
-            raise ValueError("registry slots must contain complete canonical secant cells")
+        if (
+            inputs.registry_slots <= 0
+            or inputs.registry_slots % len(_SECANT_SLOT_SUFFIXES) != 0
+        ):
+            raise ValueError(
+                "registry slots must contain complete canonical secant cells"
+            )
         replay_bytes = (
-            inputs.replay_payload_bytes + inputs.replay_mask_bytes + inputs.replay_state_bytes
+            inputs.replay_payload_bytes
+            + inputs.replay_mask_bytes
+            + inputs.replay_state_bytes
         )
         if replay_bytes > inputs.replay_cap_bytes:
-            raise ValueError("replay payload, masks, and state exceed the hard byte cap")
+            raise ValueError(
+                "replay payload, masks, and state exceed the hard byte cap"
+            )
         unique_by_rank = tuple(
             loaded - tied
             for loaded, tied in zip(
@@ -1096,7 +1264,9 @@ class SecantMemoryEstimate:
         def align(value: int) -> int:
             aligned = _align_bytes(value, inputs.alignment_bytes)
             if aligned > _MAX_REPRESENTABLE_BYTES:
-                raise SecantMemoryEstimateError("aligned allocation exceeds the representable cap")
+                raise SecantMemoryEstimateError(
+                    "aligned allocation exceeds the representable cap"
+                )
             return aligned
 
         fp32 = align(4 * unique)
@@ -1106,7 +1276,11 @@ class SecantMemoryEstimate:
         replay_mask = align(inputs.replay_mask_bytes)
         replay_state = align(inputs.replay_state_bytes)
         replay_cap_reserve = max(
-            0, align(inputs.replay_cap_bytes) - replay_payload - replay_mask - replay_state
+            0,
+            align(inputs.replay_cap_bytes)
+            - replay_payload
+            - replay_mask
+            - replay_state,
         )
         # PackedSufficientStatistics and reduce_many_ each own three simultaneous
         # allocations. Apply alignment to the real SUM, MAX, and MIN tensors rather
@@ -1118,24 +1292,33 @@ class SecantMemoryEstimate:
         reduction_sum_arena = align(inputs.registry_slots * _PACKED_SUM_BYTES_PER_SLOT)
         reduction_max_arena = align(inputs.registry_slots * _PACKED_MAX_BYTES_PER_SLOT)
         reduction_min_arena = align(inputs.registry_slots * _PACKED_MIN_BYTES_PER_SLOT)
-        reduction_arena = reduction_sum_arena + reduction_max_arena + reduction_min_arena
+        reduction_arena = (
+            reduction_sum_arena + reduction_max_arena + reduction_min_arena
+        )
         chunk = min(unique, inputs.chunk_elements)
         secant_math_workspace = align(
             chunk
-            * (_CANONICAL_SCRATCH_BYTES_PER_ELEMENT + _SECANT_INPUT_AND_MATH_BYTES_PER_ELEMENT)
+            * (
+                _CANONICAL_SCRATCH_BYTES_PER_ELEMENT
+                + _SECANT_INPUT_AND_MATH_BYTES_PER_ELEMENT
+            )
         )
         owner_finish_workspace = align(
             chunk * _OWNER_FINISH_BYTES_PER_ELEMENT + _OWNER_FINISH_SCALAR_BYTES
         )
         cell_count = inputs.registry_slots // len(_SECANT_SLOT_SUFFIXES)
-        derived_metric_storage = cell_count * (_TIER2_METRIC_COUNT * align(8) + align(1) + align(8))
+        derived_metric_storage = cell_count * (
+            _TIER2_METRIC_COUNT * align(8) + align(1) + align(8)
+        )
         quantile_cell_workspace = (
             align(cell_count * 8)
             + align(cell_count * 8)
             + align(cell_count * 8)
             + align(cell_count)
         )
-        tier2_output_storage = _TIER2_METRIC_COUNT * align(_TIER2_QUANTILE_COUNT * 8) + (
+        tier2_output_storage = _TIER2_METRIC_COUNT * align(
+            _TIER2_QUANTILE_COUNT * 8
+        ) + (
             _TIER2_OUTPUT_SCALAR_COUNT - _TIER2_METRIC_COUNT * _TIER2_QUANTILE_COUNT
         ) * align(8)
         quantile_scalar_workspace = 24 * align(8)
@@ -1154,7 +1337,10 @@ class SecantMemoryEstimate:
         # Keep the phase maximum explicit so each simultaneously-live graph stands
         # on its own rather than relying on slack from a non-live phase.
         workspace = max(
-            reduction_arena, secant_math_workspace, owner_finish_workspace, quantile_sink_workspace
+            reduction_arena,
+            secant_math_workspace,
+            owner_finish_workspace,
+            quantile_sink_workspace,
         )
         retained = (
             fp32
@@ -1168,19 +1354,29 @@ class SecantMemoryEstimate:
             + workspace
         )
         if retained > _MAX_REPRESENTABLE_BYTES:
-            raise SecantMemoryEstimateError("retained estimate exceeds the representable cap")
+            raise SecantMemoryEstimateError(
+                "retained estimate exceeds the representable cap"
+            )
         numerator, denominator = inputs.allocator_headroom_fraction.as_integer_ratio()
         fractional_headroom = (retained * numerator + denominator - 1) // denominator
-        allocator_headroom = max(inputs.minimum_allocator_headroom_bytes, fractional_headroom)
+        allocator_headroom = max(
+            inputs.minimum_allocator_headroom_bytes, fractional_headroom
+        )
         allocator_headroom = align(allocator_headroom)
-        driver_numerator, driver_denominator = inputs.driver_headroom_fraction.as_integer_ratio()
+        driver_numerator, driver_denominator = (
+            inputs.driver_headroom_fraction.as_integer_ratio()
+        )
         fractional_driver_headroom = (
             retained * driver_numerator + driver_denominator - 1
         ) // driver_denominator
-        driver_headroom = max(inputs.minimum_driver_headroom_bytes, fractional_driver_headroom)
+        driver_headroom = max(
+            inputs.minimum_driver_headroom_bytes, fractional_driver_headroom
+        )
         driver_headroom = align(driver_headroom)
         if retained + allocator_headroom + driver_headroom > _MAX_REPRESENTABLE_BYTES:
-            raise SecantMemoryEstimateError("peak estimate exceeds the representable cap")
+            raise SecantMemoryEstimateError(
+                "peak estimate exceeds the representable cap"
+            )
         return cls(
             world_size=world_size,
             maximum_loaded_rank=maximum_rank,

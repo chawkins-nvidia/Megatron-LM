@@ -3,6 +3,7 @@
 from megatron.training.diagnostic_layer_selection import (
     DEFAULT_LAYER_PATTERN,
     DiagnosticLayerSelector,
+    selected_global_layer_ids,
     selected_layers,
 )
 
@@ -10,6 +11,12 @@ from megatron.training.diagnostic_layer_selection import (
 def test_log4pluslast_selects_power_of_four_and_predecessor_pairs():
     # 1-indexed internally: 0/1, 3/4, 15/16, last=20 in 0-indexed layer names.
     assert selected_layers(21, "log4pluslast") == {1, 2, 4, 5, 16, 17, 21}
+
+
+def test_log4firstlast_selects_first_powers_of_four_and_last():
+    assert selected_layers(16, "log4firstlast") == {1, 4, 16}
+    assert selected_layers(17, "log4firstlast") == {1, 4, 16, 17}
+    assert selected_global_layer_ids(12, "log4firstlast") == (0, 3, 11)
 
 
 def test_log4plusonelast_alias_matches_log4pluslast():

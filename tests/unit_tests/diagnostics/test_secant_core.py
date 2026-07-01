@@ -10,7 +10,10 @@ import pytest
 import torch
 
 import megatron.training.diagnostics.secant as secant_module
-from megatron.training.diagnostics.accumulator import PackedSufficientStatistics, ReductionBinding
+from megatron.training.diagnostics.accumulator import (
+    PackedSufficientStatistics,
+    ReductionBinding,
+)
 from megatron.training.diagnostics.registry import MetricFamily
 from megatron.training.diagnostics.secant import (
     TIER2_OUTPUT_KEYS,
@@ -18,6 +21,7 @@ from megatron.training.diagnostics.secant import (
     RestorationKind,
     RestorationStage,
     SecantCellDescriptor,
+    SecantCellMetrics,
     SecantLocalTransaction,
     SecantMathStatus,
     SecantMemoryEstimate,
@@ -33,7 +37,9 @@ from megatron.training.diagnostics.secant import (
     TensorBitwiseSnapshot,
     build_secant_registry,
     derive_secant_cell,
+    derive_tier2_layerwise_outputs,
     derive_tier2_outputs,
+    layerwise_tier2_keys,
 )
 
 
@@ -46,7 +52,8 @@ def _cells(*, owner: bool = True) -> tuple[SecantCellDescriptor, ...]:
 
 def _binding(*, owner: bool = True):
     return build_secant_registry(
-        reversed(_cells(owner=owner)), reduction_binding=ReductionBinding.flat_world(None)
+        reversed(_cells(owner=owner)),
+        reduction_binding=ReductionBinding.flat_world(None),
     )
 
 
@@ -63,9 +70,13 @@ def _observation(name: str, pre, post, repeat, midpoint) -> SecantObservation:
 
 def _one_cell_metrics(pre, post, repeat, midpoint, *, midpoint_sq=1.0, full_sq=4.0):
     cell = SecantCellDescriptor("layer_0/residual", MetricFamily.RESIDUAL, 0)
-    binding = build_secant_registry((cell,), reduction_binding=ReductionBinding.flat_world(None))
+    binding = build_secant_registry(
+        (cell,), reduction_binding=ReductionBinding.flat_world(None)
+    )
     statistics = SecantStatistics(binding, "cpu", chunk_elements=2)
-    statistics.add_observations((_observation(cell.logical_name, pre, post, repeat, midpoint),))
+    statistics.add_observations(
+        (_observation(cell.logical_name, pre, post, repeat, midpoint),)
+    )
     statistics.accumulator.finalize_local_()
     view = SecantSufficientStatisticsView.from_accumulator(
         binding, statistics.accumulator, binding.cells[0]
@@ -140,7 +151,9 @@ def test_reversed_packed_slots_are_rejected_before_formula_binding() -> None:
 
 
 @pytest.mark.parametrize("mismatch", ("binding", "schema"))
-def test_formula_binding_reuses_complete_canonical_registry_validation(mismatch) -> None:
+def test_formula_binding_reuses_complete_canonical_registry_validation(
+    mismatch,
+) -> None:
     binding = _binding()
     accumulator = PackedSufficientStatistics(
         binding.registry.slot_names,
@@ -156,14 +169,17 @@ def test_formula_binding_reuses_complete_canonical_registry_validation(mismatch)
     accumulator.finalize_local_()
 
     with pytest.raises(ValueError, match="descriptor/schema identity|slot order"):
-        SecantSufficientStatisticsView.from_accumulator(binding, accumulator, binding.cells[0])
+        SecantSufficientStatisticsView.from_accumulator(
+            binding, accumulator, binding.cells[0]
+        )
 
 
 def test_nonowner_contributions_leave_all_canonical_packs_neutral() -> None:
     binding = _binding(owner=False)
     statistics = SecantStatistics(binding, "cpu")
     observations = tuple(
-        _observation(cell.logical_name, [1.0], [2.0], [2.0], [1.5]) for cell in binding.cells
+        _observation(cell.logical_name, [1.0], [2.0], [2.0], [1.5])
+        for cell in binding.cells
     )
     statistics.add_observations(observations)
 
@@ -202,7 +218,9 @@ def test_misaligned_noncontiguous_and_stride_zero_observations_fail_before_accum
     observation,
 ) -> None:
     cell = SecantCellDescriptor("layer_0/residual", MetricFamily.RESIDUAL, 0)
-    binding = build_secant_registry((cell,), reduction_binding=ReductionBinding.flat_world(None))
+    binding = build_secant_registry(
+        (cell,), reduction_binding=ReductionBinding.flat_world(None)
+    )
     statistics = SecantStatistics(binding, "cpu", chunk_elements=2)
 
     with pytest.raises(ValueError, match="identical|contiguous"):
@@ -212,16 +230,18 @@ def test_misaligned_noncontiguous_and_stride_zero_observations_fail_before_accum
 
 def test_preselected_owner_rows_need_no_second_mask_and_contribute() -> None:
     cell = SecantCellDescriptor("layer_0/residual", MetricFamily.RESIDUAL, 0)
-    binding = build_secant_registry((cell,), reduction_binding=ReductionBinding.flat_world(None))
+    binding = build_secant_registry(
+        (cell,), reduction_binding=ReductionBinding.flat_world(None)
+    )
     statistics = SecantStatistics(binding, "cpu", chunk_elements=2)
     pre = torch.tensor([[1.0, 2.0, 3.0]])
-    observation = SecantObservation(
-        cell.logical_name, pre, pre + 1, pre + 1, pre + 0.5
-    )
+    observation = SecantObservation(cell.logical_name, pre, pre + 1, pre + 1, pre + 0.5)
 
     statistics.add_observations((observation,))
     statistics.accumulator.finalize_local_()
-    view = SecantSufficientStatisticsView.from_accumulator(binding, statistics.accumulator, cell)
+    view = SecantSufficientStatisticsView.from_accumulator(
+        binding, statistics.accumulator, cell
+    )
     metrics = derive_secant_cell(
         view,
         midpoint_displacement_sq=1.0,
@@ -237,7 +257,9 @@ def test_preselected_owner_rows_need_no_second_mask_and_contribute() -> None:
 
 def test_preselected_secant_rows_reject_a_second_mask() -> None:
     cell = SecantCellDescriptor("layer_0/residual", MetricFamily.RESIDUAL, 0)
-    binding = build_secant_registry((cell,), reduction_binding=ReductionBinding.flat_world(None))
+    binding = build_secant_registry(
+        (cell,), reduction_binding=ReductionBinding.flat_world(None)
+    )
     statistics = SecantStatistics(binding, "cpu", chunk_elements=2)
     pre = torch.tensor([[1.0, 2.0, 3.0]])
     observation = SecantObservation(
@@ -259,13 +281,21 @@ def test_affine_and_quadratic_formula_references() -> None:
     quadratic = _one_cell_metrics([4.0], [16.0], [16.0], [9.0])
 
     assert affine.valid
-    torch.testing.assert_close(affine.true_response, torch.tensor(2.0, dtype=torch.float64))
-    torch.testing.assert_close(affine.secant_error, torch.tensor(0.0, dtype=torch.float64))
-    torch.testing.assert_close(affine.secant_cosine, torch.tensor(1.0, dtype=torch.float64))
+    torch.testing.assert_close(
+        affine.true_response, torch.tensor(2.0, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        affine.secant_error, torch.tensor(0.0, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        affine.secant_cosine, torch.tensor(1.0, dtype=torch.float64)
+    )
     torch.testing.assert_close(
         affine.realized_midpoint_fraction, torch.tensor(0.5, dtype=torch.float64)
     )
-    torch.testing.assert_close(quadratic.secant_error, torch.tensor(1.0 / 6.0, dtype=torch.float64))
+    torch.testing.assert_close(
+        quadratic.secant_error, torch.tensor(1.0 / 6.0, dtype=torch.float64)
+    )
 
 
 @pytest.mark.parametrize(
@@ -277,7 +307,9 @@ def test_affine_and_quadratic_formula_references() -> None:
         ([1.0], [float("nan")], [2.0], [1.5], SecantMathStatus.NONFINITE),
     ),
 )
-def test_zero_tiny_unresolved_and_nonfinite_behavior(pre, post, repeat, midpoint, status) -> None:
+def test_zero_tiny_unresolved_and_nonfinite_behavior(
+    pre, post, repeat, midpoint, status
+) -> None:
     metrics = _one_cell_metrics(pre, post, repeat, midpoint)
 
     assert not metrics.valid
@@ -297,9 +329,64 @@ def test_exact_17_key_order_and_q3_outputs() -> None:
     assert outputs["diag/v2/t2/valid"] == 1
 
 
+def test_layerwise_secant_outputs_do_not_mix_layers_or_families() -> None:
+    selected = (0, 3, 11)
+    families = (
+        MetricFamily.RESIDUAL,
+        MetricFamily.QKV,
+        MetricFamily.ATTN_OUT,
+        MetricFamily.FC1,
+        MetricFamily.FC2,
+    )
+    cells = []
+    metrics = []
+    expected = {}
+    for layer in selected:
+        for family_index, family in enumerate(families):
+            value = float(100 * layer + 10 * family_index + 1)
+            cells.append(
+                SecantCellDescriptor(f"layer_{layer}/{family.value}", family, layer)
+            )
+            metric = SecantCellMetrics(
+                true_response=torch.tensor(value, dtype=torch.float64),
+                secant_error=torch.tensor(value + 1, dtype=torch.float64),
+                secant_cosine=torch.tensor(value + 2, dtype=torch.float64),
+                realized_midpoint_fraction=torch.tensor(0.5, dtype=torch.float64),
+                replay_floor=torch.tensor(value + 3, dtype=torch.float64),
+                valid=torch.tensor(True),
+                status=torch.tensor(SecantMathStatus.OK),
+                true_sq=torch.tensor(1.0, dtype=torch.float64),
+                predicted_sq=torch.tensor(1.0, dtype=torch.float64),
+                error_sq=torch.tensor(1.0, dtype=torch.float64),
+                repeat_error_sq=torch.tensor(0.0, dtype=torch.float64),
+                count=torch.tensor(1.0, dtype=torch.float64),
+            )
+            metrics.append(metric)
+            expected[(layer, family.value)] = value
+
+    payload = derive_tier2_layerwise_outputs(
+        cells,
+        metrics,
+        selected,
+        midpoint_fraction=torch.tensor(0.5, dtype=torch.float64),
+    )
+
+    assert tuple(payload) == layerwise_tier2_keys(selected)
+    for layer in selected:
+        for family in families:
+            assert (
+                payload[f"diag/v2/t2/{family.value}/true_response/layer_{layer}"]
+                == expected[(layer, family.value)]
+            )
+    assert payload["diag/v2/t2/realized_midpoint_fraction"] == 0.5
+    assert payload["diag/v2/t2/valid"] == 1
+
+
 def test_unresolved_fraction_excludes_midpoint_and_other_non_replay_failures() -> None:
     valid = _one_cell_metrics([1.0], [2.0], [2.0], [1.5])
-    midpoint_invalid = _one_cell_metrics([1.0], [2.0], [2.0], [1.5], midpoint_sq=3.24, full_sq=4.0)
+    midpoint_invalid = _one_cell_metrics(
+        [1.0], [2.0], [2.0], [1.5], midpoint_sq=3.24, full_sq=4.0
+    )
     unresolved = _one_cell_metrics([1.0], [2.0], [2.5], [1.5])
 
     outputs = derive_tier2_outputs((valid, midpoint_invalid, unresolved))
@@ -307,19 +394,26 @@ def test_unresolved_fraction_excludes_midpoint_and_other_non_replay_failures() -
     assert midpoint_invalid.status == SecantMathStatus.MIDPOINT_OUT_OF_RANGE
     assert unresolved.status == SecantMathStatus.REPLAY_UNRESOLVED
     torch.testing.assert_close(
-        outputs["diag/v2/t2/unresolved_fraction"], torch.tensor(1 / 3, dtype=torch.float64)
+        outputs["diag/v2/t2/unresolved_fraction"],
+        torch.tensor(1 / 3, dtype=torch.float64),
     )
     assert outputs["diag/v2/t2/valid"] == 0
 
 
 @pytest.mark.parametrize("failed_kind", tuple(RestorationKind))
-def test_every_restoration_stage_is_attempted_after_each_injected_failure(failed_kind) -> None:
+def test_every_restoration_stage_is_attempted_after_each_injected_failure(
+    failed_kind,
+) -> None:
     calls = []
     report = _restorer(fail_restore=failed_kind, calls=calls).run()
 
     assert len(calls) == 2 * len(RestorationKind)
-    assert {kind for kind, operation in calls if operation == "restore"} == set(RestorationKind)
-    assert {kind for kind, operation in calls if operation == "verify"} == set(RestorationKind)
+    assert {kind for kind, operation in calls if operation == "restore"} == set(
+        RestorationKind
+    )
+    assert {kind for kind, operation in calls if operation == "verify"} == set(
+        RestorationKind
+    )
     assert not report.valid
     assert failed_kind in report.failed_kinds
 
@@ -334,10 +428,14 @@ def test_verifier_exception_still_attempts_every_restoration_stage(failed_kind) 
     assert failed_kind in report.failed_kinds
 
 
-def test_false_restoration_verifier_runs_all_stages_and_requires_central_fatal() -> None:
+def test_false_restoration_verifier_runs_all_stages_and_requires_central_fatal() -> (
+    None
+):
     calls = []
     failed_kind = RestorationKind.FP32_MASTERS
-    transaction = SecantLocalTransaction(_restorer(false_verify=failed_kind, calls=calls))
+    transaction = SecantLocalTransaction(
+        _restorer(false_verify=failed_kind, calls=calls)
+    )
     result = None
     for target in tuple(SecantTransactionState)[1:]:
         result = transaction.advance(target)
@@ -351,9 +449,13 @@ def test_false_restoration_verifier_runs_all_stages_and_requires_central_fatal()
     assert not result.restoration.stage_valid[int(failed_kind)]
 
 
-def test_restorer_level_exception_becomes_complete_typed_fatal_report(monkeypatch) -> None:
+def test_restorer_level_exception_becomes_complete_typed_fatal_report(
+    monkeypatch,
+) -> None:
     restorer = _restorer()
-    monkeypatch.setattr(restorer, "run", lambda: (_ for _ in ()).throw(RuntimeError("OOM")))
+    monkeypatch.setattr(
+        restorer, "run", lambda: (_ for _ in ()).throw(RuntimeError("OOM"))
+    )
     transaction = SecantLocalTransaction(restorer)
     result = None
     for target in tuple(SecantTransactionState)[1:]:
@@ -383,11 +485,15 @@ def test_tensor_snapshot_restores_aliases_and_verifies_bits() -> None:
 
 
 @pytest.mark.parametrize("target", tuple(SecantTransactionState)[1:])
-def test_failure_at_every_transaction_stage_restores_then_requires_central_fatal(target) -> None:
+def test_failure_at_every_transaction_stage_restores_then_requires_central_fatal(
+    target,
+) -> None:
     transaction = SecantLocalTransaction(_restorer())
     for state in tuple(SecantTransactionState)[1:]:
         action = (
-            (lambda: (_ for _ in ()).throw(RuntimeError("injected"))) if state == target else None
+            (lambda: (_ for _ in ()).throw(RuntimeError("injected")))
+            if state == target
+            else None
         )
         result = transaction.advance(state, action)
         if state == target:
@@ -425,9 +531,12 @@ def test_invalid_transition_is_typed_and_centrally_fatal() -> None:
 
 
 @pytest.mark.parametrize(
-    ("dp", "tp", "pp", "cp"), ((1024, 1, 1, 1), (128, 8, 1, 1), (16, 8, 8, 1), (8, 8, 8, 2))
+    ("dp", "tp", "pp", "cp"),
+    ((1024, 1, 1, 1), (128, 8, 1, 1), (16, 8, 8, 1), (8, 8, 8, 2)),
 )
-def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(dp, tp, pp, cp) -> None:
+def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(
+    dp, tp, pp, cp
+) -> None:
     world_size = dp * tp * pp * cp
     loaded = [1_000] * world_size
     tied = [100] * world_size
@@ -450,7 +559,9 @@ def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(dp, tp
         allocator_headroom_fraction=0.1,
         minimum_allocator_headroom_bytes=4096,
     )
-    estimate = SecantMemoryEstimate.calculate(inputs, optimizer_layout=SecantOptimizerLayout())
+    estimate = SecantMemoryEstimate.calculate(
+        inputs, optimizer_layout=SecantOptimizerLayout()
+    )
 
     assert estimate.world_size == 1024
     assert estimate.maximum_loaded_rank == 777
@@ -481,7 +592,9 @@ def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(dp, tp
         + estimate.chunk_workspace_bytes
     )
     assert estimate.peak_bytes == (
-        estimate.retained_bytes + estimate.allocator_headroom_bytes + estimate.driver_headroom_bytes
+        estimate.retained_bytes
+        + estimate.allocator_headroom_bytes
+        + estimate.driver_headroom_bytes
     )
 
 
@@ -490,10 +603,20 @@ def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(dp, tp
     (
         (256, 1, 1_024, 1_060_864),
         (256, 100, 29_184, 1_274_880),
-        (256, 4_252_361_473_883_687, 1_224_680_104_478_502_144, 9_223_372_036_854_775_040),
+        (
+            256,
+            4_252_361_473_883_687,
+            1_224_680_104_478_502_144,
+            9_223_372_036_854_775_040,
+        ),
         (512, 1, 1_536, 1_072_640),
         (512, 100, 29_696, 1_463_296),
-        (512, 2_328_546_335_989_322, 670_621_344_764_925_440, 9_223_372_036_854_772_224),
+        (
+            512,
+            2_328_546_335_989_322,
+            670_621_344_764_925_440,
+            9_223_372_036_854_772_224,
+        ),
     ),
 )
 def test_zero_headroom_memory_estimate_aligns_each_pack_allocation_and_composes_live_phases(
@@ -517,7 +640,9 @@ def test_zero_headroom_memory_estimate_aligns_each_pack_allocation_and_composes_
         driver_headroom_fraction=0.0,
     )
 
-    estimate = SecantMemoryEstimate.calculate(inputs, optimizer_layout=SecantOptimizerLayout())
+    estimate = SecantMemoryEstimate.calculate(
+        inputs, optimizer_layout=SecantOptimizerLayout()
+    )
 
     slots = 3 * cell_count
 
@@ -530,7 +655,9 @@ def test_zero_headroom_memory_estimate_aligns_each_pack_allocation_and_composes_
     assert estimate.reduction_arena_bytes == independently_aligned_pack
     if alignment == 512 and cell_count == 1:
         assert estimate.packed_statistics_bytes == 1_536
-        assert estimate.packed_statistics_bytes + estimate.reduction_arena_bytes == 3_072
+        assert (
+            estimate.packed_statistics_bytes + estimate.reduction_arena_bytes == 3_072
+        )
 
     phase_workspace = max(
         estimate.reduction_arena_bytes,
@@ -558,14 +685,19 @@ def test_zero_headroom_memory_estimate_aligns_each_pack_allocation_and_composes_
     if cell_count == maximum_cells:
         with pytest.raises(SecantMemoryEstimateError):
             SecantMemoryEstimate.calculate(
-                SecantMemoryInputs(**{**inputs.__dict__, "registry_slots": 3 * (cell_count + 1)}),
+                SecantMemoryInputs(
+                    **{**inputs.__dict__, "registry_slots": 3 * (cell_count + 1)}
+                ),
                 optimizer_layout=SecantOptimizerLayout(),
             )
 
 
-def test_memory_estimate_covers_independent_100_cell_derived_and_quantile_live_graph() -> None:
+def test_memory_estimate_covers_independent_100_cell_derived_and_quantile_live_graph() -> (
+    None
+):
     row = torch.tensor(
-        (4.0, 4.0, 0.04, 4.0, 1.0, 1.0e-6, 10.0, 0.0, 0.0, 1.0, 4.0), dtype=torch.float64
+        (4.0, 4.0, 0.04, 4.0, 1.0, 1.0e-6, 10.0, 0.0, 0.0, 1.0, 4.0),
+        dtype=torch.float64,
     )
     source_pack = row.repeat(100, 1)
     metrics = []

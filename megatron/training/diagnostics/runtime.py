@@ -20,6 +20,7 @@ from megatron.core import parallel_state
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import unwrap_model
+from megatron.training.diagnostic_layer_selection import selected_global_layer_ids
 
 from .accumulator import PackedSufficientStatistics, ReductionBinding
 from .diagnostic_replay import (
@@ -45,10 +46,13 @@ from .function_response import (
     FunctionResponseProbe,
     ResponseAccumulator,
     ResponseFamily,
+    derive_tier1_layerwise,
     derive_tier1_summaries,
     discover_response_hooks,
+    layerwise_tier1_keys,
 )
 from .registry import MetricFamily
+from .schema import LAYERWISE_SCALAR_PATTERN, is_layerwise_scalar_pattern
 from .secant import (
     TIER2_OUTPUT_KEYS,
     SecantCellDescriptor,
@@ -57,7 +61,9 @@ from .secant import (
     SecantSufficientStatisticsView,
     build_secant_registry,
     derive_secant_cell,
+    derive_tier2_layerwise_outputs,
     derive_tier2_outputs,
+    layerwise_tier2_keys,
 )
 
 _FAMILY_MAP = {
@@ -116,6 +122,14 @@ class TieredDiagnosticRuntime:
         self.forward_backward_func = forward_backward_func
         self.reduction_binding = reduction_binding
         self.tier = diagnostics_requested_tier(args)
+        self.layerwise_scalars = is_layerwise_scalar_pattern(
+            getattr(args, "diagnostic_layer_pattern", None)
+        )
+        self.selected_global_layers = (
+            selected_global_layer_ids(int(args.num_layers), LAYERWISE_SCALAR_PATTERN)
+            if self.layerwise_scalars
+            else ()
+        )
         self.required_tier = int(getattr(args, "diag_require_tier", 0))
         self.num_microbatches = int(num_microbatches)
         self.fatal_abort = fatal_abort or ProductionFatalAbort()
@@ -128,12 +142,8 @@ class TieredDiagnosticRuntime:
         self._full_displacement_sq = torch.zeros(
             (), dtype=torch.float64, device=self.device
         )
-        self._midpoint_displacement_sq = torch.zeros_like(
-            self._full_displacement_sq
-        )
-        self._restore_verified = torch.zeros(
-            (), dtype=torch.bool, device=self.device
-        )
+        self._midpoint_displacement_sq = torch.zeros_like(self._full_displacement_sq)
+        self._restore_verified = torch.zeros((), dtype=torch.bool, device=self.device)
 
         if self.tier < 1:
             self.probe = None
@@ -180,7 +190,9 @@ class TieredDiagnosticRuntime:
         self.secant_binding = None
         self.secant = None
         if self.tier >= 2:
-            local_owners = {descriptor.key: descriptor.owner for descriptor in descriptors}
+            local_owners = {
+                descriptor.key: descriptor.owner for descriptor in descriptors
+            }
             cells = tuple(
                 SecantCellDescriptor(
                     logical_name=f"layer_{layer}/{family.value}",
@@ -223,7 +235,19 @@ class TieredDiagnosticRuntime:
 
         if self.tier < 1:
             return ()
-        return (*TIER1_KEYS, *(TIER2_OUTPUT_KEYS if self.tier >= 2 else ()))
+        tier1 = (
+            layerwise_tier1_keys(self.selected_global_layers)
+            if self.layerwise_scalars
+            else TIER1_KEYS
+        )
+        tier2 = (
+            layerwise_tier2_keys(self.selected_global_layers)
+            if self.layerwise_scalars and self.tier >= 2
+            else TIER2_OUTPUT_KEYS
+            if self.tier >= 2
+            else ()
+        )
+        return (*tier1, *tier2)
 
     @property
     def accumulators(self) -> tuple[PackedSufficientStatistics, ...]:
@@ -244,7 +268,9 @@ class TieredDiagnosticRuntime:
         if not self._attempt_due:
             return
         if num_microbatches != self.num_microbatches:
-            raise RuntimeError("diagnostic replay microbatch count changed after startup")
+            raise RuntimeError(
+                "diagnostic replay microbatch count changed after startup"
+            )
 
     def wrap_data_iterator(self, data_iterator: Any) -> Any:
         """Record raw CPU batches while transparently advancing the real iterator."""
@@ -276,7 +302,9 @@ class TieredDiagnosticRuntime:
         error: BaseException | None = None
         try:
             if self.recorder is None:
-                raise RuntimeError("diagnostic replay did not record the training schedule")
+                raise RuntimeError(
+                    "diagnostic replay did not record the training schedule"
+                )
             plan = build_distributed_source_plan(
                 self.recorder.recorded,
                 workspace=self.population_workspace,
@@ -400,9 +428,10 @@ class TieredDiagnosticRuntime:
         assert self.secant is not None
         failure: BaseException | None = None
         try:
-            if adapter.commit_secant_delta(
-                update_accumulator, update_successful=True
-            ) is None:
+            if (
+                adapter.commit_secant_delta(update_accumulator, update_successful=True)
+                is None
+            ):
                 raise RuntimeError("optimizer secant delta commit failed")
             self._require_adapter_ok(adapter, "post-update delta commit")
             delta = adapter.secant_delta_buffer
@@ -441,7 +470,8 @@ class TieredDiagnosticRuntime:
                     restore_error
                     if failure is None
                     else BaseExceptionGroup(
-                        "secant endpoint and restoration failed", (failure, restore_error)
+                        "secant endpoint and restoration failed",
+                        (failure, restore_error),
                     )
                 )
         if failure is not None:
@@ -457,8 +487,17 @@ class TieredDiagnosticRuntime:
             return {}
         if self.response is None:
             raise RuntimeError("diagnostic response accumulator is unavailable")
-        payload = derive_tier1_summaries(self.response)
-        if tuple(payload) != TIER1_KEYS:
+        tier1_keys = (
+            layerwise_tier1_keys(self.selected_global_layers)
+            if self.layerwise_scalars
+            else TIER1_KEYS
+        )
+        payload = (
+            derive_tier1_layerwise(self.response, self.selected_global_layers)
+            if self.layerwise_scalars
+            else derive_tier1_summaries(self.response)
+        )
+        if tuple(payload) != tier1_keys:
             raise RuntimeError("Tier-1 runtime payload order changed")
         if self.tier >= 2:
             assert self.secant_binding is not None and self.secant is not None
@@ -484,12 +523,30 @@ class TieredDiagnosticRuntime:
                 )
                 for cell in self.secant_binding.cells
             )
-            tier2 = derive_tier2_outputs(metrics)
-            if tuple(tier2) != TIER2_OUTPUT_KEYS:
+            tier2_keys = (
+                layerwise_tier2_keys(self.selected_global_layers)
+                if self.layerwise_scalars
+                else TIER2_OUTPUT_KEYS
+            )
+            tier2 = (
+                derive_tier2_layerwise_outputs(
+                    self.secant_binding.cells,
+                    metrics,
+                    self.selected_global_layers,
+                    midpoint_fraction=torch.sqrt(
+                        self._midpoint_displacement_sq / self._full_displacement_sq
+                    ),
+                )
+                if self.layerwise_scalars
+                else derive_tier2_outputs(metrics)
+            )
+            if tuple(tier2) != tier2_keys:
                 raise RuntimeError("Tier-2 runtime payload order changed")
             payload.update(tier2)
         if tuple(payload) != self.output_keys:
-            raise RuntimeError("tiered diagnostic payload does not match exact key order")
+            raise RuntimeError(
+                "tiered diagnostic payload does not match exact key order"
+            )
         return payload
 
     def abort_attempt(self) -> None:
@@ -513,7 +570,9 @@ class TieredDiagnosticRuntime:
     def _accumulate_secant_rows(self) -> None:
         assert self.probe is not None
         assert self.secant_binding is not None and self.secant is not None
-        descriptors = {descriptor.key: descriptor for descriptor in self.probe.descriptors}
+        descriptors = {
+            descriptor.key: descriptor for descriptor in self.probe.descriptors
+        }
         empty = torch.empty(
             0,
             dtype=self.models[0].config.params_dtype,
@@ -538,16 +597,16 @@ class TieredDiagnosticRuntime:
                     raise RuntimeError(f"missing {phase} rows for {cell.logical_name}")
                 else:
                     endpoints.append(torch.cat(rows, dim=0).contiguous())
-            observations.append(
-                SecantObservation(cell.logical_name, *endpoints)
-            )
+            observations.append(SecantObservation(cell.logical_name, *endpoints))
         self.secant.add_observations(tuple(observations))
 
     def _materialize_parameters(self) -> None:
         for model_chunk in self.wrapped_models:
             start = getattr(model_chunk, "start_param_sync", None)
             if not callable(start):
-                raise RuntimeError("distributed model chunk lacks parameter materialization")
+                raise RuntimeError(
+                    "distributed model chunk lacks parameter materialization"
+                )
             start(force_sync=True, force_dispatch=True)
 
     def _require_adapter_ok(
@@ -559,7 +618,9 @@ class TieredDiagnosticRuntime:
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(status, op=dist.ReduceOp.MAX)
         if int(status.reshape(-1)[0]) != int(DistributedOptimizerEventStatus.OK):
-            raise RuntimeError(f"{phase} failed with adapter status {int(status.reshape(-1)[0])}")
+            raise RuntimeError(
+                f"{phase} failed with adapter status {int(status.reshape(-1)[0])}"
+            )
 
     def _all_reduce_sum(self, tensor: torch.Tensor) -> None:
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
@@ -592,9 +653,11 @@ class TieredDiagnosticRuntime:
         if getattr(self.args, "transformer_impl", "transformer_engine") != "local":
             reasons.append("local_transformer_required")
         if reasons:
-            if self.required_tier >= 1 or getattr(
-                self.args, "diagnostic_unsupported_policy", "error"
-            ) == "error":
+            if (
+                self.required_tier >= 1
+                or getattr(self.args, "diagnostic_unsupported_policy", "error")
+                == "error"
+            ):
                 raise RuntimeError(
                     "Tier-1/2 diagnostic backend is unsupported: " + ", ".join(reasons)
                 )
@@ -625,7 +688,11 @@ class TieredDiagnosticRuntime:
     def _cuda_control(
         self, identity: str, group: object | None
     ) -> tuple[CollectiveBinding, ReadinessConsensus]:
-        size = dist.get_world_size(group) if dist.is_available() and dist.is_initialized() else 1
+        size = (
+            dist.get_world_size(group)
+            if dist.is_available() and dist.is_initialized()
+            else 1
+        )
         binding = CollectiveBinding(identity, group, size)
         device: torch.device | str = self.device if size > 1 else "cpu"
         if size == 1 and dist.is_available() and dist.is_initialized():

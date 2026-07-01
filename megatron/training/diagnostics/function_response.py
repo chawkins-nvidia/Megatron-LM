@@ -72,13 +72,39 @@ TIER1_KEYS: tuple[str, ...] = (
         for family in ("qkv", "attn_out", "fc1", "fc2")
         for name in _QUANTILE_NAMES
     ),
-    *(f"{TIER1_PREFIX}{family.value}/starved_fraction" for family in _STARVATION_FAMILIES),
+    *(
+        f"{TIER1_PREFIX}{family.value}/starved_fraction"
+        for family in _STARVATION_FAMILIES
+    ),
     f"{TIER1_ATTENTION_PREFIX}logit_abs_p50",
     f"{TIER1_ATTENTION_PREFIX}logit_abs_p90",
     f"{TIER1_ATTENTION_PREFIX}entropy_p10",
     f"{TIER1_ATTENTION_PREFIX}entropy_p50",
     f"{TIER1_ATTENTION_PREFIX}collapse_fraction",
 )
+_LAYERWISE_ATTENTION_NAMES = (
+    ("logit_abs", "logit_abs_mean"),
+    ("entropy", "entropy_mean"),
+    ("collapse", "collapse_fraction"),
+)
+
+
+def layerwise_tier1_keys(global_layers: tuple[int, ...]) -> tuple[str, ...]:
+    """Return exact per-layer Tier-1 keys with the layer identity at the suffix."""
+
+    if not global_layers or global_layers != tuple(sorted(set(global_layers))):
+        raise ValueError("layerwise Tier-1 keys require ordered unique global layers")
+    keys: list[str] = []
+    for layer in global_layers:
+        keys.extend(
+            f"{TIER1_PREFIX}{family.value}/dy_rel/layer_{layer}"
+            for family in RESPONSE_FAMILIES
+        )
+        keys.extend(
+            f"{TIER1_ATTENTION_PREFIX}{output_name}/layer_{layer}"
+            for _source_name, output_name in _LAYERWISE_ATTENTION_NAMES
+        )
+    return tuple(keys)
 
 
 @dataclass(frozen=True)
@@ -159,15 +185,22 @@ def discover_response_hooks(
                         global_layer=global_layer,
                         family=family,
                         module=modules[family],
-                        owner=feature_sharded or sequence_parallel or tensor_parallel_rank == 0,
+                        owner=feature_sharded
+                        or sequence_parallel
+                        or tensor_parallel_rank == 0,
                         sequence_sharded=sequence_sharded,
                         affine_bias_output=family != ResponseFamily.RESIDUAL,
                     )
                 )
     if discovered != set(expected):
-        raise ValueError(f"missing local response layers: {sorted(set(expected) - discovered)}")
+        raise ValueError(
+            f"missing local response layers: {sorted(set(expected) - discovered)}"
+        )
     descriptors.sort(
-        key=lambda descriptor: (descriptor.global_layer, _FAMILY_INDEX[descriptor.family])
+        key=lambda descriptor: (
+            descriptor.global_layer,
+            _FAMILY_INDEX[descriptor.family],
+        )
     )
     return tuple(descriptors)
 
@@ -177,7 +210,9 @@ def _validate_descriptor_order(descriptors: Sequence[ResponseHookDescriptor]) ->
     if len(keys) != len(set(keys)):
         raise ValueError("response hook descriptors contain duplicate global slots")
     if keys != tuple(sorted(keys, key=lambda key: (key[0], _FAMILY_INDEX[key[1]]))):
-        raise ValueError("response hook descriptors are not in canonical global slot order")
+        raise ValueError(
+            "response hook descriptors are not in canonical global slot order"
+        )
 
 
 def _response_registry(
@@ -263,7 +298,9 @@ def _response_registry(
                 )
             )
             owners.append(attention_owner and layer in {key[0] for key in local})
-    return MetricRegistry(metrics, reduction_binding=reduction_binding, local_owners=owners)
+    return MetricRegistry(
+        metrics, reduction_binding=reduction_binding, local_owners=owners
+    )
 
 
 @dataclass
@@ -301,7 +338,9 @@ def verify_response_descriptor_consensus(
     )
     digest = bytes.fromhex(accumulator.descriptor_hash)
     wire = torch.tensor(
-        [len(accumulator.registry.slot_names), *digest], dtype=torch.int64, device=device
+        [len(accumulator.registry.slot_names), *digest],
+        dtype=torch.int64,
+        device=device,
     )
     minimum = wire.clone()
     maximum = wire.clone()
@@ -407,9 +446,7 @@ class FunctionResponseProbe:
         }
         self._secant_rows: dict[
             str, dict[tuple[int, ResponseFamily], list[torch.Tensor]]
-        ] = {
-            phase: {} for phase in ("pre", "post", "post_repeat", "midpoint")
-        }
+        ] = {phase: {} for phase in ("pre", "post", "post_repeat", "midpoint")}
         self._attention_calls: dict[int, int] = {}
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._phase: str | None = None
@@ -489,13 +526,19 @@ class FunctionResponseProbe:
         return self.registry.descriptor_hash
 
     def set_masks(
-        self, full_mask: torch.Tensor, *, sequence_parallel_mask: torch.Tensor | None = None
+        self,
+        full_mask: torch.Tensor,
+        *,
+        sequence_parallel_mask: torch.Tensor | None = None,
     ) -> None:
         """Set CP-local and optional SP-local masks for one schedule microbatch."""
 
         if full_mask.device != self.device:
             raise ValueError("response mask is on the wrong device")
-        if sequence_parallel_mask is not None and sequence_parallel_mask.device != self.device:
+        if (
+            sequence_parallel_mask is not None
+            and sequence_parallel_mask.device != self.device
+        ):
             raise ValueError("sequence-parallel response mask is on the wrong device")
         self._full_mask = full_mask
         self._sequence_mask = sequence_parallel_mask
@@ -535,7 +578,9 @@ class FunctionResponseProbe:
     @contextlib.contextmanager
     def _capture(self, phase: str) -> Iterator[tuple[ResponseHookRegistration, ...]]:
         if self._phase is not None or self._finalized:
-            raise RuntimeError("response capture phases cannot overlap or follow finalize")
+            raise RuntimeError(
+                "response capture phases cannot overlap or follow finalize"
+            )
         self._phase = phase
         try:
             registrations: list[ResponseHookRegistration] = []
@@ -568,19 +613,25 @@ class FunctionResponseProbe:
             self._sequence_mask = None
 
     def _make_hook(self, descriptor: ResponseHookDescriptor):
-        def hook(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+        def hook(
+            _module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any
+        ) -> None:
             try:
                 self._observe(descriptor, output)
             except (RuntimeError, TypeError, ValueError):
                 self.registry.mark_observation_error(
-                    self.accumulator.statistics, self.registry.slot_names[self._slot(descriptor)]
+                    self.accumulator.statistics,
+                    self.registry.slot_names[self._slot(descriptor)],
                 )
                 raise
 
         return hook
 
     def _slot(self, descriptor: ResponseHookDescriptor) -> int:
-        return descriptor.global_layer * len(RESPONSE_FAMILIES) + _FAMILY_INDEX[descriptor.family]
+        return (
+            descriptor.global_layer * len(RESPONSE_FAMILIES)
+            + _FAMILY_INDEX[descriptor.family]
+        )
 
     def _attention_slot(self, layer: int, metric: str) -> int:
         return (
@@ -627,7 +678,9 @@ class FunctionResponseProbe:
             raise ValueError("attention collapse threshold must be in (0, 1]")
         mask = self._full_mask
         if mask is None or mask.shape != (logits.shape[0], logits.shape[2]):
-            raise ValueError("attention observation does not match its selected-token mask")
+            raise ValueError(
+                "attention observation does not match its selected-token mask"
+            )
         selected = mask if mask.dtype == torch.bool else mask != 0
         selected_logits = logits.permute(0, 2, 1, 3)[selected]
         selected_probabilities = probabilities.permute(0, 2, 1, 3)[selected]
@@ -696,9 +749,13 @@ class FunctionResponseProbe:
         if not descriptor.owner:
             return
         if self._phase == "pre":
-            retained_rows = sum(value.shape[0] for value in self._pre_rows.get(descriptor.key, ()))
+            retained_rows = sum(
+                value.shape[0] for value in self._pre_rows.get(descriptor.key, ())
+            )
             if retained_rows + rows.shape[0] > self._selected_row_capacity:
-                raise RuntimeError("response rows exceed their preallocated retention cap")
+                raise RuntimeError(
+                    "response rows exceed their preallocated retention cap"
+                )
             retained = rows.detach().clone()
             self._pre_rows.setdefault(descriptor.key, []).append(retained)
             if self.retain_secant_endpoints:
@@ -715,10 +772,14 @@ class FunctionResponseProbe:
             self._pre_rows.pop(descriptor.key, None)
         logical_name = self.registry.slot_names[self._slot(descriptor)]
         if before is None or before.shape != rows.shape:
-            self.registry.mark_observation_error(self.accumulator.statistics, logical_name)
+            self.registry.mark_observation_error(
+                self.accumulator.statistics, logical_name
+            )
             return
         post = rows.detach().clone() if self.retain_secant_endpoints else rows.detach()
-        self.registry.add_update(self.accumulator.statistics, logical_name, before, post)
+        self.registry.add_update(
+            self.accumulator.statistics, logical_name, before, post
+        )
         if self.retain_secant_endpoints:
             self._secant_rows["post"].setdefault(descriptor.key, []).append(post)
 
@@ -726,7 +787,9 @@ class FunctionResponseProbe:
         """Mark exact hook-cardinality errors and return neutral global slots."""
 
         if self._phase is not None or self._finalized:
-            raise RuntimeError("response probe finalizes exactly once after both schedules")
+            raise RuntimeError(
+                "response probe finalizes exactly once after both schedules"
+            )
         for descriptor in self.descriptors:
             if (
                 self._pre_calls.get(descriptor.key, 0) != self.expected_hook_calls
@@ -734,7 +797,8 @@ class FunctionResponseProbe:
                 or descriptor.key in self._pre_rows
             ):
                 self.registry.mark_observation_error(
-                    self.accumulator.statistics, self.registry.slot_names[self._slot(descriptor)]
+                    self.accumulator.statistics,
+                    self.registry.slot_names[self._slot(descriptor)],
                 )
             if self.retain_secant_endpoints and any(
                 self._endpoint_calls[phase].get(descriptor.key, 0)
@@ -752,7 +816,9 @@ class FunctionResponseProbe:
                     for metric in _ATTENTION_METRICS:
                         self.registry.mark_observation_error(
                             self.accumulator.statistics,
-                            self.registry.slot_names[self._attention_slot(layer, metric)],
+                            self.registry.slot_names[
+                                self._attention_slot(layer, metric)
+                            ],
                         )
         self._pre_rows.clear()
         self._finalized = True
@@ -815,13 +881,19 @@ class FunctionResponseProbe:
         """Return bytes in the actual canonical persistent packs."""
 
         statistics = self.accumulator.statistics
-        return statistics.sum_pack.nbytes + statistics.max_pack.nbytes + statistics.min_pack.nbytes
+        return (
+            statistics.sum_pack.nbytes
+            + statistics.max_pack.nbytes
+            + statistics.min_pack.nbytes
+        )
 
     @property
     def reduction_arena_bytes(self) -> int:
         """Return bytes in the actual canonical temporary reduction arena."""
 
-        return PackedSufficientStatistics.reduction_arena_bytes((self.accumulator.statistics,))
+        return PackedSufficientStatistics.reduction_arena_bytes(
+            (self.accumulator.statistics,)
+        )
 
     def release(self) -> None:
         """Remove temporary hooks and release all retained response rows."""
@@ -851,7 +923,9 @@ class FunctionResponseResult:
         """Derive ratios only after canonical packed reduction/finalization."""
 
         if not accumulator.statistics.reduced:
-            raise RuntimeError("Tier-1 response statistics must be reduced before derivation")
+            raise RuntimeError(
+                "Tier-1 response statistics must be reduced before derivation"
+            )
         values = torch.empty(
             (accumulator.global_layers, len(RESPONSE_FAMILIES)),
             dtype=torch.float64,
@@ -871,7 +945,9 @@ class FunctionResponseResult:
                 )
                 valid[layer, family] = slot_valid
                 values[layer, family] = torch.where(
-                    slot_valid, statistic.value, torch.full_like(statistic.value, torch.nan)
+                    slot_valid,
+                    statistic.value,
+                    torch.full_like(statistic.value, torch.nan),
                 )
                 count[layer, family] = accumulator.statistics.sum_pack[packed.count]
                 delta[layer, family] = accumulator.statistics.sum_pack[packed.lhs_sumsq]
@@ -883,7 +959,9 @@ def derive_tier1_summaries(accumulator: ResponseAccumulator) -> dict[str, torch.
 
     result = FunctionResponseResult.from_reduced(accumulator)
     values_by_key: dict[str, torch.Tensor] = {}
-    quantiles = torch.tensor((0.1, 0.5, 0.9), dtype=torch.float64, device=result.dy_rel.device)
+    quantiles = torch.tensor(
+        (0.1, 0.5, 0.9), dtype=torch.float64, device=result.dy_rel.device
+    )
     for family in RESPONSE_FAMILIES:
         family_index = _FAMILY_INDEX[family]
         response = result.dy_rel[:, family_index]
@@ -935,15 +1013,21 @@ def derive_tier1_summaries(accumulator: ResponseAccumulator) -> dict[str, torch.
             attention_means[layer, metric_index] = torch.where(
                 valid, statistic.value, torch.full_like(statistic.value, torch.nan)
             )
-            attention_sums[layer, metric_index] = accumulator.statistics.sum_pack[packed.sum]
-            attention_counts[layer, metric_index] = accumulator.statistics.sum_pack[packed.count]
+            attention_sums[layer, metric_index] = accumulator.statistics.sum_pack[
+                packed.sum
+            ]
+            attention_counts[layer, metric_index] = accumulator.statistics.sum_pack[
+                packed.count
+            ]
     for metric_index, names, quantiles_requested in (
         (0, ("logit_abs_p50", "logit_abs_p90"), (0.5, 0.9)),
         (1, ("entropy_p10", "entropy_p50"), (0.1, 0.5)),
     ):
         values = torch.nanquantile(
             attention_means[:, metric_index],
-            torch.tensor(quantiles_requested, dtype=torch.float64, device=attention_means.device),
+            torch.tensor(
+                quantiles_requested, dtype=torch.float64, device=attention_means.device
+            ),
         )
         for name, value in zip(names, values, strict=True):
             values_by_key[f"{TIER1_ATTENTION_PREFIX}{name}"] = value
@@ -961,7 +1045,54 @@ def derive_tier1_summaries(accumulator: ResponseAccumulator) -> dict[str, torch.
     )
     payload = {key: values_by_key[key] for key in TIER1_KEYS}
     if len(set(payload)) != 30:
-        raise RuntimeError("derived Tier-1 payload does not match the canonical 30-key list")
+        raise RuntimeError(
+            "derived Tier-1 payload does not match the canonical 30-key list"
+        )
+    return payload
+
+
+def derive_tier1_layerwise(
+    accumulator: ResponseAccumulator, global_layers: tuple[int, ...]
+) -> dict[str, torch.Tensor]:
+    """Derive unpooled Tier-1 values for explicit global layer/family cells."""
+
+    if (
+        not global_layers
+        or global_layers != tuple(sorted(set(global_layers)))
+        or global_layers[0] < 0
+        or global_layers[-1] >= accumulator.global_layers
+    ):
+        raise ValueError(
+            "layerwise Tier-1 derivation requires valid ordered global layers"
+        )
+    result = FunctionResponseResult.from_reduced(accumulator)
+    payload: dict[str, torch.Tensor] = {}
+    for layer in global_layers:
+        for family in RESPONSE_FAMILIES:
+            payload[f"{TIER1_PREFIX}{family.value}/dy_rel/layer_{layer}"] = (
+                result.dy_rel[layer, _FAMILY_INDEX[family]]
+            )
+        for source_name, output_name in _LAYERWISE_ATTENTION_NAMES:
+            slot = (
+                accumulator.global_layers * len(RESPONSE_FAMILIES)
+                + layer * len(_ATTENTION_METRICS)
+                + _ATTENTION_METRICS.index(source_name)
+            )
+            statistic = accumulator.statistics.mean(slot)
+            packed = accumulator.statistics.slots(slot)
+            valid = statistic.valid & (
+                accumulator.statistics.sum_pack[packed.observation_error] == 0
+            )
+            payload[f"{TIER1_ATTENTION_PREFIX}{output_name}/layer_{layer}"] = (
+                torch.where(
+                    valid,
+                    statistic.value,
+                    torch.full_like(statistic.value, torch.nan),
+                )
+            )
+    expected = layerwise_tier1_keys(global_layers)
+    if tuple(payload) != expected:
+        raise RuntimeError("derived layerwise Tier-1 payload order changed")
     return payload
 
 

@@ -57,6 +57,7 @@ def selected_layers(num_layers: int, pattern: str | None = None) -> set[int]:
     Supported patterns:
 
     * ``log2pluslast``: layers 1,2,4,... plus the final layer.
+    * ``log4firstlast``: 0-indexed layers 0,3,15,... plus the final layer.
     * ``log4pluslast``: 0-indexed layer pairs 0/1,3/4,15/16,... plus the final layer.
     * ``log4plusonelast``: backward-compatible alias for ``log4pluslast``.
     * ``all``: every layer.
@@ -80,6 +81,14 @@ def selected_layers(num_layers: int, pattern: str | None = None) -> set[int]:
         while layer <= num_layers:
             layers.add(layer)
             layer *= 2
+        layers.add(num_layers)
+        return layers
+    if raw == "log4firstlast":
+        layers = set()
+        layer = 1
+        while layer <= num_layers:
+            layers.add(layer)
+            layer *= 4
         layers.add(num_layers)
         return layers
     if raw in {"log4pluslast", "log4plusonelast"}:
@@ -119,6 +128,14 @@ def selected_layers(num_layers: int, pattern: str | None = None) -> set[int]:
                     layers.add(layer)
         return layers
     raise ValueError(f"invalid diagnostic layer pattern {pattern!r}")
+
+
+def selected_global_layer_ids(
+    num_layers: int, pattern: str | None = None
+) -> tuple[int, ...]:
+    """Return ordered zero-indexed global layer IDs for ``pattern``."""
+
+    return tuple(layer - 1 for layer in sorted(selected_layers(num_layers, pattern)))
 
 
 def _stream_attr(stream: str) -> str:

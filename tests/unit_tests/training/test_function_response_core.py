@@ -21,8 +21,10 @@ from megatron.training.diagnostics.function_response import (
     ResponseHookDescriptor,
     ResponseHookRegistration,
     _selected_rows,
+    derive_tier1_layerwise,
     derive_tier1_summaries,
     descriptor_fingerprint,
+    layerwise_tier1_keys,
 )
 
 
@@ -66,7 +68,9 @@ def _probe(layers: int, *, owner: bool = True, expected_hook_calls: int = 0):
     return probe, modules
 
 
-def _add_relative_response(probe: FunctionResponseProbe, slot: int, response: float) -> None:
+def _add_relative_response(
+    probe: FunctionResponseProbe, slot: int, response: float
+) -> None:
     before = torch.tensor([3.0, 4.0], dtype=torch.bfloat16)
     after = before.float() * (1 + response)
     probe.registry.add_update(
@@ -74,7 +78,9 @@ def _add_relative_response(probe: FunctionResponseProbe, slot: int, response: fl
     )
 
 
-def test_capture_returns_exact_immutable_probe_hook_registrations_and_cleans_up() -> None:
+def test_capture_returns_exact_immutable_probe_hook_registrations_and_cleans_up() -> (
+    None
+):
     probe, modules = _probe(1)
 
     with probe.capture_pre() as registrations:
@@ -140,7 +146,9 @@ def test_tier2_probe_retains_exact_four_endpoints_and_reuses_packs() -> None:
     sum_storage = accumulator.statistics.sum_pack.untyped_storage().data_ptr()
     probe.reset_event(expected_hook_calls=1)
     assert accumulator.statistics.sum_pack.untyped_storage().data_ptr() == sum_storage
-    assert all(not probe.secant_endpoint_rows(phase, key) for phase in probe._secant_rows)
+    assert all(
+        not probe.secant_endpoint_rows(phase, key) for phase in probe._secant_rows
+    )
 
 
 def test_zero_local_rows_are_neutral_and_preflight_rebinds_only_after_reset() -> None:
@@ -225,7 +233,9 @@ def test_exact_pooled_formulas_produce_all_30_outputs() -> None:
     for layer in range(layers):
         for family in range(len(RESPONSE_FAMILIES)):
             _add_relative_response(
-                probe, layer * len(RESPONSE_FAMILIES) + family, response=(layer + 1) / 16
+                probe,
+                layer * len(RESPONSE_FAMILIES) + family,
+                response=(layer + 1) / 16,
             )
     probe.accumulator.finalize_local_()
 
@@ -240,8 +250,36 @@ def test_exact_pooled_formulas_produce_all_30_outputs() -> None:
     assert payload["diag/v2/t1/response/residual/dy_rel/first"] == pytest.approx(1 / 16)
     assert payload["diag/v2/t1/response/residual/dy_rel/last"] == pytest.approx(5 / 16)
     assert all(
-        math.isnan(payload[key]) for key in TIER1_KEYS if key.startswith("diag/v2/t1/attention/")
+        math.isnan(payload[key])
+        for key in TIER1_KEYS
+        if key.startswith("diag/v2/t1/attention/")
     )
+
+
+def test_layerwise_outputs_keep_layer_and_family_values_independent() -> None:
+    layers = 12
+    selected = (0, 3, 11)
+    probe, _modules = _probe(layers)
+    expected = {}
+    for layer in range(layers):
+        for family_index, family in enumerate(RESPONSE_FAMILIES):
+            response = (10 * layer + family_index + 1) / 256
+            _add_relative_response(
+                probe,
+                layer * len(RESPONSE_FAMILIES) + family_index,
+                response=response,
+            )
+            expected[(layer, family)] = response
+    probe.accumulator.finalize_local_()
+
+    payload = derive_tier1_layerwise(probe.accumulator, selected)
+
+    assert tuple(payload) == layerwise_tier1_keys(selected)
+    for layer in selected:
+        for family in RESPONSE_FAMILIES:
+            assert payload[
+                f"diag/v2/t1/response/{family.value}/dy_rel/layer_{layer}"
+            ] == pytest.approx(expected[(layer, family)])
 
 
 def test_pooled_sums_are_not_an_average_of_rank_or_microbatch_ratios() -> None:
@@ -340,7 +378,9 @@ def test_nonowner_slots_remain_exactly_neutral() -> None:
     assert torch.isposinf(probe.accumulator.statistics.min_pack).all()
 
 
-def test_rows_are_selected_before_bias_and_unselected_nonfinite_values_are_ignored() -> None:
+def test_rows_are_selected_before_bias_and_unselected_nonfinite_values_are_ignored() -> (
+    None
+):
     activation = torch.tensor(
         [[[1.0, 2.0]], [[torch.inf, torch.inf]], [[5.0, 6.0]], [[torch.nan, torch.nan]]]
     )
@@ -409,7 +449,10 @@ def test_extra_pre_hook_observation_rejects_before_cloning() -> None:
 
 @pytest.mark.parametrize(
     ("activation", "message"),
-    ((torch.ones(1, 1, 2), "activation"), (torch.ones(1, 1, 1, dtype=torch.float64), "activation")),
+    (
+        (torch.ones(1, 1, 2), "activation"),
+        (torch.ones(1, 1, 1, dtype=torch.float64), "activation"),
+    ),
 )
 def test_live_response_shape_and_dtype_must_match_preflight(
     activation: torch.Tensor, message: str
