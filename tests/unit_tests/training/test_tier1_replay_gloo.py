@@ -125,6 +125,7 @@ class _Probe:
 
     def __init__(self, release_fault: bool = False) -> None:
         self.release_fault = release_fault
+        self.release_calls = 0
 
     @contextlib.contextmanager
     def capture_pre(self):
@@ -141,6 +142,7 @@ class _Probe:
         return self
 
     def release(self):
+        self.release_calls += 1
         if self.release_fault:
             raise RuntimeError("injected probe release fault")
         return None
@@ -210,6 +212,45 @@ def _transaction_worker(rank: int, init_method: str, directory: str, fault: str)
         transaction.run_pre()
     except _FatalRaised:
         _write_result(directory, rank, "fatal")
+    else:
+        _write_result(directory, rank, "unexpected-return")
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _ordinary_cleanup_worker(rank: int, init_method: str, directory: str, outcome: str) -> None:
+    _init(rank, init_method)
+    tracker = _FailOnSecondSetTracker(fail=False)
+    probe = _Probe(release_fault=rank == 0)
+
+    def fatal_abort(error: BaseException) -> None:
+        result = (
+            f"fatal:{type(error).__name__}:release_calls={probe.release_calls}:"
+            f"state={transaction.state}"
+        )
+        _write_result(directory, rank, result)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        raise _FatalRaised(str(error))
+
+    transaction = Tier1ReplayTransaction(
+        models=(torch.nn.Identity(),),
+        plan=_source_plan(),
+        probe=probe,
+        schedule=_FaultSchedule(rank, "none"),
+        readiness=ReadinessConsensus(CollectiveBinding("world", None, 2)),
+        mutable_buffer_names=(),
+        tracker_getter=lambda: tracker,
+        cuda_device=None,
+        samplers=(),
+        overlap_objects=(),
+        fatal_abort=fatal_abort,
+    )
+    try:
+        transaction.run_pre()
+        transaction.finish(update_succeeded=outcome == "post")
+    except _FatalRaised:
+        pass
     else:
         _write_result(directory, rank, "unexpected-return")
         if dist.is_initialized():
@@ -287,3 +328,13 @@ def test_two_rank_guard_fault_settles_before_peer_barrier_schedule(
 @pytest.mark.parametrize("fault", ("schedule", "restore", "cleanup_schedule"))
 def test_two_rank_post_p2p_fault_is_fatal_on_every_rank(tmp_path: Path, fault: str) -> None:
     assert _run_two_rank(tmp_path, _transaction_worker, fault) == ["fatal", "fatal"]
+
+
+@pytest.mark.parametrize("outcome", ("overflow", "post"))
+def test_two_rank_one_rank_ordinary_release_fault_is_collectively_fatal(
+    tmp_path: Path, outcome: str
+) -> None:
+    results = _run_two_rank(tmp_path, _ordinary_cleanup_worker, outcome)
+
+    assert all(result.startswith("fatal:ReplayPreflightError:") for result in results)
+    assert all("release_calls=1:state=closed" in result for result in results)

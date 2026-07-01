@@ -14,10 +14,12 @@ import hashlib
 import math
 import os
 import random
+import sys
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass, field, fields, replace
-from enum import StrEnum
+from dataclasses import dataclass, field, fields, is_dataclass, replace
+from enum import Enum, StrEnum
 from typing import Any, Protocol
 
 import numpy as np
@@ -202,28 +204,43 @@ class RecordedBatch:
 class ReplayBatchRecorder(Iterator[Mapping[str, Any]]):
     """Read through a training iterator while recording raw batch references."""
 
-    def __init__(self, source: Iterator[Mapping[str, Any]]) -> None:
+    def __init__(
+        self, source: Iterator[Mapping[str, Any]], *, maximum_batches: int, maximum_host_bytes: int
+    ) -> None:
+        if maximum_batches <= 0 or not 0 <= maximum_host_bytes <= _CAPACITY_LIMIT:
+            raise ValueError("replay recorder caps are invalid")
         self.source = source
+        self.maximum_batches = maximum_batches
+        self.maximum_host_bytes = maximum_host_bytes
         self.recorded: list[RecordedBatch] = []
+        self._host_capture_bytes = 0
 
     def __iter__(self) -> "ReplayBatchRecorder":
         return self
 
     def __next__(self) -> Mapping[str, Any]:
         raw = next(self.source)
-        self.recorded.append(RecordedBatch.from_raw(raw))
+        batch = RecordedBatch.from_raw(raw)
+        retained_bytes = _checked_sum(self._host_capture_bytes, batch.tensor_bytes)
+        if len(self.recorded) >= self.maximum_batches:
+            raise ReplayPreflightError("replay recorder batch cap exceeded")
+        if retained_bytes > self.maximum_host_bytes:
+            raise ReplayPreflightError("replay recorder byte cap exceeded")
+        self.recorded.append(batch)
+        self._host_capture_bytes = retained_bytes
         return raw
 
     @property
     def host_capture_bytes(self) -> int:
         """Return event-local referenced host tensor bytes."""
 
-        return sum(batch.tensor_bytes for batch in self.recorded)
+        return self._host_capture_bytes
 
     def clear(self) -> None:
         """Release references without advancing or replacing the source iterator."""
 
         self.recorded.clear()
+        self._host_capture_bytes = 0
 
 
 @dataclass(frozen=True)
@@ -482,6 +499,85 @@ class ReplayPlan:
         )
 
 
+@dataclass(frozen=True)
+class _ReplayPlanFacts:
+    descriptor_hash: str
+    selected_tokens: int
+    microbatches: int
+    host_tensor_bytes: int
+    tensor_bindings: tuple[tuple[int, str, int, tuple[int, ...], torch.dtype, int], ...]
+
+    @classmethod
+    def observe(cls, plan: ReplayPlan) -> "_ReplayPlanFacts":
+        metadata = plan.metadata
+        if (
+            metadata.micro_batch_size <= 0
+            or metadata.sequence_length <= 0
+            or metadata.num_microbatches <= 0
+            or metadata.global_selected_tokens <= 0
+        ):
+            raise ValueError("replay plan dimensions and selection must be positive")
+        if len(metadata.diagnostic_masks) != metadata.num_microbatches:
+            raise ValueError("replay plan mask cardinality disagrees with its schedule")
+        mask_size = _checked_product(metadata.micro_batch_size, metadata.sequence_length)
+        if any(len(mask) != mask_size for mask in metadata.diagnostic_masks):
+            raise ValueError("replay plan contains a malformed diagnostic mask")
+        actual_selected = sum(
+            sum(bool(value) for value in mask) for mask in metadata.diagnostic_masks
+        )
+        if actual_selected != metadata.global_selected_tokens:
+            raise ValueError("replay plan selected-token metadata disagrees with fixed masks")
+        if (
+            len(metadata.selected_tokens) != actual_selected
+            or len(set(metadata.selected_tokens)) != actual_selected
+        ):
+            raise ValueError("replay plan selected-token identities are inconsistent")
+        expected_fields = {
+            **dict(_MODEL_FIELDS),
+            DIAGNOSTIC_MASK_FIELD: torch.bool,
+            SAMPLE_INDEX_FIELD: torch.int64,
+            SAMPLE_EPOCH_FIELD: torch.int64,
+        }
+        if plan.source_rank and len(plan.microbatches) != metadata.num_microbatches:
+            raise ValueError("TP source replay plan has the wrong microbatch count")
+        if not plan.source_rank and plan.microbatches:
+            raise ValueError("non-source replay plans cannot retain source microbatches")
+        bindings = []
+        total_bytes = 0
+        for batch_index, batch in enumerate(plan.microbatches):
+            if set(batch.data) != set(expected_fields):
+                raise ValueError("replay microbatch fields changed after fixed-field admission")
+            if len(batch.sample_ids) != metadata.micro_batch_size:
+                raise ValueError("replay microbatch sample identities have the wrong size")
+            for name, dtype in expected_fields.items():
+                value = batch.data[name]
+                if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+                    raise TypeError(f"replay field {name!r} must remain a CPU tensor")
+                expected_shape = (
+                    (metadata.micro_batch_size,)
+                    if name in _RESERVED_FIELDS
+                    else (metadata.micro_batch_size, metadata.sequence_length)
+                )
+                if value.dtype != dtype or tuple(value.shape) != expected_shape:
+                    raise ValueError(f"replay field {name!r} changed shape or dtype")
+                field_bytes = _checked_product(value.numel(), value.element_size())
+                total_bytes = _checked_sum(total_bytes, field_bytes)
+                bindings.append(
+                    (batch_index, name, id(value), tuple(value.shape), value.dtype, field_bytes)
+                )
+        return cls(
+            descriptor_hash=metadata.descriptor_hash,
+            selected_tokens=actual_selected,
+            microbatches=metadata.num_microbatches,
+            host_tensor_bytes=total_bytes,
+            tensor_bindings=tuple(bindings),
+        )
+
+    def revalidate(self, plan: ReplayPlan) -> None:
+        if _ReplayPlanFacts.observe(plan) != self:
+            raise RuntimeError("replay plan changed after memory preflight")
+
+
 def _assemble_microbatch(
     samples: Sequence[RecordedSample], selected: set[TokenId], real_lanes: int
 ) -> ReplayMicrobatch:
@@ -608,11 +704,11 @@ def build_local_replay_plan(
         if filler is None:
             raise ValueError("padding requires one shape-compatible local sample")
         batches.append(_assemble_microbatch([filler] * micro_batch_size, set(), 0))
-    sequence_length = (
-        int(batches[0].data["loss_mask"].shape[1])
-        if batches
-        else int(next(iter(by_id.values())).loss_mask.numel()) if by_id else 0
-    )
+    sequence_length = 0
+    if batches:
+        sequence_length = int(batches[0].data["loss_mask"].shape[1])
+    elif by_id:
+        sequence_length = int(next(iter(by_id.values())).loss_mask.numel())
     masks = tuple(
         tuple(bool(value) for value in batch.data[DIAGNOSTIC_MASK_FIELD].reshape(-1))
         for batch in batches
@@ -1158,30 +1254,38 @@ class _ValueSnapshot:
     def capture(cls, value: Any) -> "_ValueSnapshot":
         if isinstance(value, torch.Tensor):
             contents = value.detach().clone()
-        elif isinstance(value, list):
+        elif type(value) is list:
             contents = tuple(cls.capture(item) for item in value)
-        elif isinstance(value, tuple):
+        elif type(value) is tuple:
             contents = tuple(cls.capture(item) for item in value)
-        elif isinstance(value, dict):
+        elif type(value) in (dict, OrderedDict):
+            if any(not _is_snapshot_key(key) for key in value):
+                raise TypeError("mutable model-state mappings require immutable scalar keys")
             contents = tuple((key, cls.capture(item)) for key, item in value.items())
-        elif isinstance(value, set):
+        elif type(value) is set:
+            if any(not _is_snapshot_key(item) for item in value):
+                raise TypeError("mutable model-state sets require immutable scalar values")
             contents = frozenset(value)
+        elif _is_snapshot_leaf(value):
+            contents = value
         else:
-            contents = copy.deepcopy(value)
+            raise TypeError(f"unsupported mutable model-state value: {type(value).__qualname__}")
         return cls(value, contents)
 
     def restore(self) -> Any:
         if isinstance(self.original, torch.Tensor):
             self.original.copy_(self.contents)
-        elif isinstance(self.original, list):
+        elif type(self.original) is list:
             self.original.clear()
             self.original.extend(item.restore() for item in self.contents)
-        elif isinstance(self.original, tuple):
-            return tuple(item.restore() for item in self.contents)
-        elif isinstance(self.original, dict):
+        elif type(self.original) is tuple:
+            for item in self.contents:
+                item.restore()
+            return self.original
+        elif type(self.original) in (dict, OrderedDict):
             self.original.clear()
             self.original.update((key, item.restore()) for key, item in self.contents)
-        elif isinstance(self.original, set):
+        elif type(self.original) is set:
             self.original.clear()
             self.original.update(self.contents)
         return self.original
@@ -1191,37 +1295,59 @@ class _ValueSnapshot:
             return False
         if isinstance(value, torch.Tensor):
             return torch.equal(value, self.contents)
-        if isinstance(value, list):
+        if type(value) is list:
             return len(value) == len(self.contents) and all(
                 snapshot.verify(item) for snapshot, item in zip(self.contents, value, strict=True)
             )
-        if isinstance(value, tuple):
+        if type(value) is tuple:
             return len(value) == len(self.contents) and all(
                 snapshot.verify(item) for snapshot, item in zip(self.contents, value, strict=True)
             )
-        if isinstance(value, dict):
+        if type(value) in (dict, OrderedDict):
+            if type(value) is not type(self.original):
+                return False
             return tuple(value) == tuple(key for key, _ in self.contents) and all(
                 snapshot.verify(value[key]) for key, snapshot in self.contents
             )
-        if isinstance(value, set):
+        if type(value) is set:
             return value == self.contents
-        return value is self.original or value == self.contents
+        return value is self.original
 
     @property
     def tensor_bytes(self) -> int:
-        """Return tensor storage cloned recursively by this snapshot."""
+        """Return recursively cloned tensor and mutable-container storage."""
 
         if isinstance(self.original, torch.Tensor):
-            return self.contents.numel() * self.contents.element_size()
-        if isinstance(self.original, (list, tuple)):
-            return sum(item.tensor_bytes for item in self.contents)
-        if isinstance(self.original, dict):
-            return sum(item.tensor_bytes for _key, item in self.contents)
+            return self.contents.numel() * self.contents.element_size() + sys.getsizeof(
+                self.contents
+            )
+        if type(self.original) in (list, tuple):
+            return (sys.getsizeof(self.contents) if self.contents else 0) + sum(
+                item.tensor_bytes for item in self.contents
+            )
+        if type(self.original) in (dict, OrderedDict):
+            return (sys.getsizeof(self.contents) if self.contents else 0) + sum(
+                sys.getsizeof(entry) + entry[1].tensor_bytes for entry in self.contents
+            )
+        if type(self.original) is set:
+            return sys.getsizeof(self.contents) if self.contents else 0
         return 0
 
 
+def _is_snapshot_key(value: Any) -> bool:
+    return value is None or type(value) in (bool, int, float, complex, str, bytes)
+
+
+def _is_snapshot_leaf(value: Any) -> bool:
+    return (
+        _is_snapshot_key(value)
+        or isinstance(value, (Enum, torch.dtype, torch.device))
+        or callable(value)
+    )
+
+
 def _value_tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
-    """Conservatively count recursively reachable tensor storage before cloning."""
+    """Conservatively count recursively cloned state storage before capture."""
 
     seen = set() if seen is None else seen
     identity = id(value)
@@ -1229,11 +1355,21 @@ def _value_tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
         return 0
     seen.add(identity)
     if isinstance(value, torch.Tensor):
-        return value.numel() * value.element_size()
-    if isinstance(value, (list, tuple)):
-        return _checked_sum(*(_value_tensor_bytes(item, seen) for item in value))
-    if isinstance(value, dict):
-        return _checked_sum(*(_value_tensor_bytes(item, seen) for item in value.values()))
+        return value.numel() * value.element_size() + sys.getsizeof(value)
+    if type(value) in (list, tuple):
+        container_bytes = sys.getsizeof(value) if value else 0
+        return _checked_sum(container_bytes, *(_value_tensor_bytes(item, seen) for item in value))
+    if type(value) in (dict, OrderedDict):
+        container_bytes = sys.getsizeof(value) if value else 0
+        return _checked_sum(
+            container_bytes,
+            *(
+                _checked_sum(sys.getsizeof((key, item)), _value_tensor_bytes(item, seen))
+                for key, item in value.items()
+            ),
+        )
+    if type(value) is set:
+        return sys.getsizeof(value) if value else 0
     return 0
 
 
@@ -1282,7 +1418,7 @@ class DenseGPTStateSnapshot:
         "rotary_pos_emb_cache",
         "_decoder_hidden_states_cache",
     )
-    _MUTABLE_NAME_FRAGMENTS = ("cache", "buffer")
+    _STATIC_ATTRIBUTES = {"config", "pg_collection", "submodules", "transformer_layer_spec"}
 
     def __init__(
         self,
@@ -1296,6 +1432,7 @@ class DenseGPTStateSnapshot:
         self.mutable_buffers = frozenset(mutable_buffers)
         self.maximum_tensor_bytes = maximum_tensor_bytes
         self.modes: list[tuple[torch.nn.Module, bool]] = []
+        self.module_maps: list[tuple[torch.nn.Module, tuple[tuple[str, torch.nn.Module], ...]]] = []
         self.buffer_maps: list[tuple[torch.nn.Module, tuple[str, ...]]] = []
         self.buffers: list[tuple[str, torch.nn.Module, str, torch.Tensor, torch.Tensor]] = []
         self.none_buffers: list[tuple[str, torch.nn.Module, str]] = []
@@ -1317,6 +1454,7 @@ class DenseGPTStateSnapshot:
         seen: set[tuple[int, str]] = set()
         for model_index, model in enumerate(self.models):
             for module_name, module in model.named_modules():
+                self.module_maps.append((module, tuple(module._modules.items())))
                 self.buffer_maps.append((module, tuple(module._buffers)))
                 for local_name, buffer in module._buffers.items():
                     name = f"{module_name}.{local_name}" if module_name else local_name
@@ -1338,8 +1476,9 @@ class DenseGPTStateSnapshot:
                 attribute_names.update(
                     name
                     for name in vars(module)
-                    if "hook" in name
-                    or any(fragment in name for fragment in self._MUTABLE_NAME_FRAGMENTS)
+                    if name not in self._STATIC_ATTRIBUTES
+                    and not name.endswith("_group")
+                    and "process_group" not in name
                 )
                 attribute_names.difference_update({"_buffers", "_parameters", "_modules"})
                 for name in sorted(attribute_names):
@@ -1381,6 +1520,9 @@ class DenseGPTStateSnapshot:
             for local_name in tuple(module._buffers):
                 if local_name not in names:
                     del module._buffers[local_name]
+        for module, entries in self.module_maps:
+            module._modules.clear()
+            module._modules.update(entries)
         for _name, module, local_name, buffer, snapshot in self.buffers:
             module._buffers[local_name] = buffer
             buffer.copy_(snapshot)
@@ -1398,6 +1540,8 @@ class DenseGPTStateSnapshot:
 
         if any(tuple(module._buffers) != names for module, names in self.buffer_maps):
             raise RuntimeError("model buffer registry restoration failed")
+        if any(tuple(module._modules.items()) != entries for module, entries in self.module_maps):
+            raise RuntimeError("model module graph restoration failed")
         for name, module, local_name, buffer, snapshot in self.buffers:
             if module._buffers.get(local_name) is not buffer or not torch.equal(buffer, snapshot):
                 raise RuntimeError(f"model buffer restoration failed: {name}")
@@ -1427,6 +1571,7 @@ class DenseGPTStateSnapshot:
         """Release all captured model references."""
 
         self.modes.clear()
+        self.module_maps.clear()
         self.buffer_maps.clear()
         self.buffers.clear()
         self.none_buffers.clear()
@@ -1639,6 +1784,12 @@ class ReplayMemoryConfig:
     headroom_fraction: float = 0.1
     tp_source: bool = True
     sequence_parallel: bool = False
+    gated_linear_unit: bool = False
+    observed_host_replay_bytes: int | None = None
+    observed_packed_statistics_bytes: int | None = None
+    observed_reduction_arena_bytes: int | None = None
+    observed_accumulator_scratch_bytes: int | None = None
+    observed_attention_workspace_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1731,6 +1882,15 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
     )
     if any(value <= 0 for value in integers) or config.selected_tokens < 0:
         raise ValueError("replay memory dimensions must be positive")
+    observed = (
+        config.observed_host_replay_bytes,
+        config.observed_packed_statistics_bytes,
+        config.observed_reduction_arena_bytes,
+        config.observed_accumulator_scratch_bytes,
+        config.observed_attention_workspace_bytes,
+    )
+    if any(value is not None and not 0 <= value <= _CAPACITY_LIMIT for value in observed):
+        raise ValueError("observed replay memory facts are invalid")
     if not 0 <= config.headroom_fraction <= 1:
         raise ValueError("replay memory headroom fraction must be in [0, 1]")
     if config.sequence_length % (2 * config.context_parallel_size):
@@ -1761,8 +1921,13 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
         config.micro_batch_size, config.sequence_length, 8 + 8 + 8 + 4 + 1
     )
     full_batch = _checked_sum(full_batch, _checked_product(config.micro_batch_size, 2, 8))
-    host_inputs = (
+    modeled_host_inputs = (
         _checked_product(config.replay_microbatches, full_batch) if config.tp_source else 0
+    )
+    host_inputs = (
+        modeled_host_inputs
+        if config.observed_host_replay_bytes is None
+        else config.observed_host_replay_bytes
     )
     cp_local = _checked_product(
         config.micro_batch_size, config.sequence_length // config.context_parallel_size
@@ -1775,7 +1940,7 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
         config.hidden_size,
         3 * config.hidden_size // config.tensor_parallel_size,
         config.hidden_size,
-        config.ffn_hidden_size // config.tensor_parallel_size,
+        (1 + int(config.gated_linear_unit)) * config.ffn_hidden_size // config.tensor_parallel_size,
         config.hidden_size,
     )
     response = 0
@@ -1787,15 +1952,35 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
         response = _checked_sum(response, allocation)
         max_response = max(max_response, _checked_product(local_rows, width, config.element_size))
     slots = _checked_product(config.global_layers, 8)
-    packed = _packed_storage_bytes(slots)
-    reduction_arena = packed
-    accumulator_scratch = PackedSufficientStatistics.scratch_bytes_for_capacity()
+    modeled_packed = _packed_storage_bytes(slots)
+    packed = (
+        modeled_packed
+        if config.observed_packed_statistics_bytes is None
+        else config.observed_packed_statistics_bytes
+    )
+    reduction_arena = (
+        packed
+        if config.observed_reduction_arena_bytes is None
+        else config.observed_reduction_arena_bytes
+    )
+    accumulator_scratch = (
+        PackedSufficientStatistics.scratch_bytes_for_capacity()
+        if config.observed_accumulator_scratch_bytes is None
+        else config.observed_accumulator_scratch_bytes
+    )
     attention_elements = _checked_product(
         config.selected_tokens,
         config.num_attention_heads // config.tensor_parallel_size,
         config.sequence_length,
     )
-    attention_workspace = _checked_product(8, attention_elements, max(config.element_size, 4))
+    modeled_attention_workspace = _checked_product(
+        8, attention_elements, max(config.element_size, 4)
+    )
+    attention_workspace = (
+        modeled_attention_workspace
+        if config.observed_attention_workspace_bytes is None
+        else config.observed_attention_workspace_bytes
+    )
     hook_workspace = _checked_sum(_checked_product(2, max_response), attention_workspace)
     terms = (
         ("host_replay_inputs", host_inputs),
@@ -1899,7 +2084,7 @@ class NonInterleavedReplaySchedule:
             raise ValueError("Tier-1 replay does not support interleaved/virtual pipeline")
         self.forward_backward_func = forward_backward_func
         self.forward_step_func = forward_step_func
-        self.model = list(model)
+        self.model = tuple(model)
         self.sequence_length = sequence_length
         self.micro_batch_size = micro_batch_size
         self.probe_device = torch.device(probe_device)
@@ -1940,7 +2125,7 @@ class NonInterleavedReplaySchedule:
             output, _reducer = self.forward_step_func(data_iterator, model, *args)
 
             def zero_reducer(output_tensor: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
-                return torch.zeros((), dtype=torch.float32, device=output_tensor.device), {}
+                return (torch.zeros((), dtype=torch.float32, device=output_tensor.device), {})
 
             return output, zero_reducer
 
@@ -1963,6 +2148,70 @@ class NonInterleavedReplaySchedule:
         if calls != plan.num_microbatches:
             raise RuntimeError("replay schedule executed an unexpected microbatch count")
         self.completed = True
+
+
+@dataclass(frozen=True)
+class _ReplayScheduleFacts:
+    model_ids: tuple[int, ...]
+    sequence_length: int
+    micro_batch_size: int
+    probe_device: torch.device
+    tp_rank: int
+    tp_size: int
+    cp_rank: int
+    cp_size: int
+    sequence_parallel: bool
+    pipeline_data_owner: bool
+    forward_backward_id: int
+    forward_step_id: int
+
+    @classmethod
+    def observe(
+        cls,
+        schedule: NonInterleavedReplaySchedule,
+        models: Sequence[torch.nn.Module],
+        plan: ReplayPlan,
+    ) -> "_ReplayScheduleFacts":
+        if len(schedule.model) != len(models) or any(
+            scheduled is not guarded
+            for scheduled, guarded in zip(schedule.model, models, strict=True)
+        ):
+            raise ValueError("replay schedule model tuple is not the guarded engine model tuple")
+        if (
+            schedule.sequence_length != plan.metadata.sequence_length
+            or schedule.micro_batch_size != plan.metadata.micro_batch_size
+        ):
+            raise ValueError("replay schedule dimensions disagree with the fixed plan")
+        if (
+            schedule.tp_size <= 0
+            or schedule.cp_size <= 0
+            or not 0 <= schedule.tp_rank < schedule.tp_size
+            or not 0 <= schedule.cp_rank < schedule.cp_size
+        ):
+            raise ValueError("replay schedule topology is invalid")
+        return cls(
+            model_ids=tuple(id(model) for model in schedule.model),
+            sequence_length=schedule.sequence_length,
+            micro_batch_size=schedule.micro_batch_size,
+            probe_device=schedule.probe_device,
+            tp_rank=schedule.tp_rank,
+            tp_size=schedule.tp_size,
+            cp_rank=schedule.cp_rank,
+            cp_size=schedule.cp_size,
+            sequence_parallel=schedule.sequence_parallel,
+            pipeline_data_owner=schedule.pipeline_data_owner,
+            forward_backward_id=id(schedule.forward_backward_func),
+            forward_step_id=id(schedule.forward_step_func),
+        )
+
+    def revalidate(
+        self,
+        schedule: NonInterleavedReplaySchedule,
+        models: Sequence[torch.nn.Module],
+        plan: ReplayPlan,
+    ) -> None:
+        if _ReplayScheduleFacts.observe(schedule, models, plan) != self:
+            raise RuntimeError("replay schedule changed after memory preflight")
 
 
 class FatalAbort(Protocol):
@@ -1998,8 +2247,55 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
     """Admit only the explicitly inspected dense local-MCore GPT surface."""
 
     from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
     from megatron.core.transformer.enums import ModelType
+    from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.spec_utils import ModuleSpec
     from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    allowed_prefixes = (
+        "megatron.core.models.common.",
+        "megatron.core.models.gpt.",
+        "megatron.core.tensor_parallel.",
+        "megatron.core.transformer.",
+        "megatron.core.fusions.",
+        "torch.nn.modules.",
+    )
+
+    def validate_spec_value(value: Any) -> None:
+        if value is None or type(value) in (bool, int, float, str, bytes):
+            return
+        if type(value) in (tuple, list):
+            for item in value:
+                validate_spec_value(item)
+            return
+        if type(value) is dict:
+            if any(type(key) is not str for key in value):
+                raise TypeError("dense GPT specs require string mapping keys")
+            for item in value.values():
+                validate_spec_value(item)
+            return
+        if type(value) is ModuleSpec:
+            if isinstance(value.module, tuple):
+                raise TypeError("dense GPT specs cannot use dynamic import tuples")
+            validate_spec_value(value.module)
+            validate_spec_value(value.params)
+            validate_spec_value(value.submodules)
+            validate_spec_value(value.metainfo)
+            return
+        if isinstance(value, type) or callable(value):
+            module_name = getattr(value, "__module__", "")
+            if not module_name.startswith(allowed_prefixes):
+                raise TypeError("dense GPT spec contains an unsupported builder")
+            return
+        if is_dataclass(value) and type(value).__module__.startswith("megatron.core."):
+            for spec_field in fields(value):
+                validate_spec_value(getattr(value, spec_field.name))
+            return
+        raise TypeError(f"dense GPT spec contains unsupported value {type(value).__qualname__}")
 
     if len(models) != 1:
         raise TypeError("Tier-1 replay requires one noninterleaved dense GPTModel chunk")
@@ -2027,6 +2323,30 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
             raise ValueError(f"Tier-1 replay does not support GPT capabilities: {enabled}")
         if getattr(model, "model_type", None) != ModelType.encoder_or_decoder:
             raise ValueError("Tier-1 replay requires the dense GPT model type")
+        if hasattr(model, "transformer_layer_spec"):
+            validate_spec_value(model.transformer_layer_spec)
+        for module in model.modules():
+            if not type(module).__module__.startswith(allowed_prefixes):
+                raise TypeError(
+                    f"Tier-1 replay rejects unsupported child module {type(module).__qualname__}"
+                )
+            if type(module) is TransformerLayer:
+                if getattr(module, "is_moe_layer", False):
+                    raise ValueError("Tier-1 replay rejects MoE transformer layers")
+                if type(module.self_attention) is not SelfAttention or type(module.mlp) is not MLP:
+                    raise TypeError("Tier-1 replay requires exact dense local layer children")
+                if (
+                    type(module.self_attention.linear_qkv) is not ColumnParallelLinear
+                    or type(module.mlp.linear_fc1) is not ColumnParallelLinear
+                ):
+                    raise TypeError("Tier-1 replay requires exact local column-parallel linears")
+                if (
+                    type(module.self_attention.linear_proj) is not RowParallelLinear
+                    or type(module.mlp.linear_fc2) is not RowParallelLinear
+                ):
+                    raise TypeError("Tier-1 replay requires exact local row-parallel linears")
+                if type(module.self_attention.core_attention) is not DotProductAttention:
+                    raise TypeError("Tier-1 replay requires exact local dot-product attention")
 
 
 class Tier1ReplayTransaction:
@@ -2048,6 +2368,7 @@ class Tier1ReplayTransaction:
         fatal_abort: FatalAbort,
         maximum_model_state_bytes: int = _CAPACITY_LIMIT,
         memory_estimate: ReplayMemoryEstimate | None = None,
+        preflight_validator: Callable[[], None] | None = None,
     ) -> None:
         self.models = tuple(models)
         self.plan = plan
@@ -2062,6 +2383,7 @@ class Tier1ReplayTransaction:
         self.fatal_abort = fatal_abort
         self.maximum_model_state_bytes = maximum_model_state_bytes
         self.memory_estimate = memory_estimate
+        self.preflight_validator = preflight_validator
         self.rng_a: ReplayRngState | None = None
         self.state = TransactionState.READY
 
@@ -2078,15 +2400,39 @@ class Tier1ReplayTransaction:
 
     def _fatal(self, error: BaseException) -> None:
         fatal_error = error
+        cleanup_error = self._release_local()
         try:
-            self.release()
-        except BaseException as cleanup_error:
+            self.readiness.settle(cleanup_error, "fatal transaction cleanup")
+        except BaseException as collective_cleanup_error:
             fatal_error = BaseExceptionGroup(
-                "Tier-1 post-commit failure and cleanup failure", (error, cleanup_error)
+                "Tier-1 post-commit failure and cleanup failure", (error, collective_cleanup_error)
             )
-        finally:
-            self.fatal_abort(fatal_error)
+        self.fatal_abort(fatal_error)
         raise RuntimeError("Tier-1 fatal-abort protocol returned") from error
+
+    def _release_local(self) -> BaseException | None:
+        if self.state == TransactionState.CLOSED:
+            return None
+        failures: list[tuple[str, BaseException]] = []
+        for name, operation in (
+            ("probe_release", self.probe.release),
+            ("plan_release", self.plan.release),
+            ("rng_release", lambda: setattr(self, "rng_a", None)),
+        ):
+            try:
+                operation()
+            except BaseException as error:
+                failures.append((name, error))
+        self.state = TransactionState.CLOSED
+        return ReplayRestorationError(failures) if failures else None
+
+    def _release_collectively(self, phase: str) -> None:
+        cleanup_error = self._release_local()
+        try:
+            self.readiness.settle(cleanup_error, phase)
+        except BaseException as collective_error:
+            self.fatal_abort(collective_error)
+            raise RuntimeError("Tier-1 fatal-abort protocol returned") from collective_error
 
     def _prepare_phase(self, phase: str) -> ExitStack:
         """Prepare guard, hooks, modes, and RNG before the last readiness gate."""
@@ -2152,6 +2498,8 @@ class Tier1ReplayTransaction:
             raise RuntimeError("pre replay can run exactly once")
         error: BaseException | None = None
         try:
+            if self.preflight_validator is not None:
+                self.preflight_validator()
             self.rng_a = ReplayRngState.capture(
                 tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
             )
@@ -2168,42 +2516,26 @@ class Tier1ReplayTransaction:
         if self.state != TransactionState.PRE_COMPLETE or self.rng_a is None:
             raise RuntimeError("post replay requires a completed pre replay")
         if not update_succeeded:
-            self.release()
+            self._release_collectively("overflow transaction cleanup")
             return None
+        self._run_schedule_phase("post")
+        result: Any | None = None
+        finalize_error: BaseException | None = None
         try:
-            self._run_schedule_phase("post")
-            result: Any | None = None
-            finalize_error: BaseException | None = None
-            try:
-                result = self.probe.finalize()
-            except BaseException as caught:
-                finalize_error = caught
-            try:
-                self.readiness.settle(finalize_error, "post-schedule finalization")
-            except BaseException as caught:
-                self._fatal(caught)
-            return result
-        finally:
-            self.release()
+            result = self.probe.finalize()
+        except BaseException as caught:
+            finalize_error = caught
+        try:
+            self.readiness.settle(finalize_error, "post-schedule finalization")
+        except BaseException as caught:
+            self._fatal(caught)
+        self._release_collectively("successful post transaction cleanup")
+        return result
 
     def release(self) -> None:
         """Release plan, hooks, retained responses, and RNG snapshots."""
 
-        if self.state == TransactionState.CLOSED:
-            return
-        failures: list[tuple[str, BaseException]] = []
-        for name, operation in (
-            ("probe_release", self.probe.release),
-            ("plan_release", self.plan.release),
-            ("rng_release", lambda: setattr(self, "rng_a", None)),
-        ):
-            try:
-                operation()
-            except BaseException as error:
-                failures.append((name, error))
-        self.state = TransactionState.CLOSED
-        if failures:
-            raise ReplayRestorationError(failures)
+        self._release_collectively("explicit transaction cleanup")
 
 
 class Tier1ReplayEngine:
@@ -2279,11 +2611,21 @@ class Tier1ReplayEngine:
             self.readiness.settle(error, "response descriptor identity")
         error = None
         memory_estimate: ReplayMemoryEstimate | None = None
+        plan_facts: _ReplayPlanFacts | None = None
+        schedule_facts: _ReplayScheduleFacts | None = None
+        model_config_facts: tuple[Any, ...] | None = None
         try:
+            from megatron.core.transformer.transformer_layer import TransformerLayer
+
+            from .function_response import RESPONSE_FAMILIES, FunctionResponseProbe, ResponseFamily
+
+            if type(probe) is not FunctionResponseProbe:
+                raise TypeError("Tier-1 replay requires the exact bounded response probe")
             if probe.expected_hook_calls != plan.num_microbatches:
                 raise ValueError("response hook cardinality disagrees with replay plan")
             if not plan.metadata.descriptor_hash:
                 raise ValueError("replay plan has no canonical descriptor hash")
+            plan_facts = _ReplayPlanFacts.observe(plan)
             if self.tracker_getter is None:
                 raise TypeError("Tier-1 replay requires an inspected Megatron RNG tracker")
             tracker = _validated_tracker(self.tracker_getter)
@@ -2292,6 +2634,7 @@ class Tier1ReplayEngine:
             _validate_dense_gpt_models(self.models)
             if type(schedule) is not NonInterleavedReplaySchedule:
                 raise TypeError("Tier-1 replay requires the verified noninterleaved schedule")
+            schedule_facts = _ReplayScheduleFacts.observe(schedule, self.models, plan)
             memory_policy.validate()
             state_guard = ReplayStateGuard(
                 self.models,
@@ -2311,13 +2654,65 @@ class Tier1ReplayEngine:
             model_config = self.models[0].config
             if any(model.config is not model_config for model in self.models):
                 raise ValueError("pipeline model chunks have inconsistent GPT configs")
+            model_config_facts = (
+                id(model_config),
+                model_config.num_layers,
+                model_config.hidden_size,
+                model_config.ffn_hidden_size,
+                model_config.num_attention_heads,
+                model_config.params_dtype,
+                model_config.gated_linear_unit,
+                model_config.tensor_model_parallel_size,
+                model_config.context_parallel_size,
+                model_config.pipeline_model_parallel_size,
+            )
             global_layers = getattr(probe, "global_layers", None)
             descriptors = getattr(probe, "descriptors", None)
             if not isinstance(global_layers, int) or not isinstance(descriptors, tuple):
                 raise TypeError("response probe lacks verified layer descriptors")
-            local_layers = len({descriptor.global_layer for descriptor in descriptors})
+            descriptor_layers = {descriptor.global_layer for descriptor in descriptors}
+            local_layers = len(descriptor_layers)
             if local_layers <= 0:
                 raise ValueError("response probe has no local dense GPT layers")
+            if len(descriptors) != local_layers * len(RESPONSE_FAMILIES) or any(
+                {
+                    descriptor.family
+                    for descriptor in descriptors
+                    if descriptor.global_layer == layer
+                }
+                != set(RESPONSE_FAMILIES)
+                for layer in descriptor_layers
+            ):
+                raise ValueError("response probe does not cover every local response family")
+            model_module_ids = {id(module) for model in self.models for module in model.modules()}
+            if any(id(descriptor.module) not in model_module_ids for descriptor in descriptors):
+                raise ValueError("response probe references a module outside the guarded model")
+            transformer_layers = {
+                module.layer_number - 1: module
+                for model in self.models
+                for module in model.modules()
+                if type(module) is TransformerLayer
+            }
+            if set(transformer_layers) != descriptor_layers:
+                raise ValueError("response probe layer set disagrees with the dense GPT graph")
+            expected_modules = {
+                layer: {
+                    ResponseFamily.RESIDUAL: module,
+                    ResponseFamily.QKV: module.self_attention.linear_qkv,
+                    ResponseFamily.ATTN_OUT: module.self_attention.linear_proj,
+                    ResponseFamily.FC1: module.mlp.linear_fc1,
+                    ResponseFamily.FC2: module.mlp.linear_fc2,
+                }
+                for layer, module in transformer_layers.items()
+            }
+            if any(
+                descriptor.module
+                is not expected_modules[descriptor.global_layer][descriptor.family]
+                for descriptor in descriptors
+            ):
+                raise ValueError("response hooks are not bound to canonical dense GPT modules")
+            if probe.device != schedule.probe_device:
+                raise ValueError("response probe and replay schedule devices disagree")
             params_dtype = model_config.params_dtype
             if not isinstance(params_dtype, torch.dtype):
                 raise TypeError("GPT parameter dtype is not a torch dtype")
@@ -2334,6 +2729,25 @@ class Tier1ReplayEngine:
             if world_size % model_parallel_size:
                 raise ValueError("world size is not divisible by model parallel topology")
             data_parallel_size = world_size // model_parallel_size
+            gated_linear_unit = bool(model_config.gated_linear_unit)
+            response_widths = {
+                ResponseFamily.RESIDUAL: model_config.hidden_size,
+                ResponseFamily.QKV: 3 * model_config.hidden_size // schedule.tp_size,
+                ResponseFamily.ATTN_OUT: model_config.hidden_size,
+                ResponseFamily.FC1: (
+                    (1 + int(gated_linear_unit)) * model_config.ffn_hidden_size // schedule.tp_size
+                ),
+                ResponseFamily.FC2: model_config.hidden_size,
+            }
+            local_attention_heads = model_config.num_attention_heads // schedule.tp_size
+            probe.bind_preflight(
+                selected_row_capacity=plan_facts.selected_tokens,
+                response_widths=response_widths,
+                response_dtype=params_dtype,
+                attention_heads=local_attention_heads,
+                attention_key_length=plan.metadata.sequence_length,
+            )
+            probe.validate_preflight_binding()
             fixed_workspace_bytes = _checked_sum(
                 _checked_product(plan.metadata.micro_batch_size, plan.metadata.sequence_length),
                 _checked_product(plan.metadata.micro_batch_size, cp_local),
@@ -2341,6 +2755,26 @@ class Tier1ReplayEngine:
                     plan.metadata.micro_batch_size,
                     cp_local // schedule.tp_size if schedule.sequence_parallel else 0,
                 ),
+            )
+            expected_host_bytes = _checked_product(
+                plan.num_microbatches,
+                _checked_sum(
+                    _checked_product(
+                        plan.metadata.micro_batch_size,
+                        plan.metadata.sequence_length,
+                        8 + 8 + 4 + 8 + 1,
+                    ),
+                    _checked_product(plan.metadata.micro_batch_size, 2, 8),
+                ),
+            )
+            if plan.source_rank and plan_facts.host_tensor_bytes != expected_host_bytes:
+                raise ValueError("source replay tensors disagree with fixed-field byte accounting")
+            attention_workspace_bytes = _checked_product(
+                8,
+                plan_facts.selected_tokens,
+                local_attention_heads,
+                plan.metadata.sequence_length,
+                max(torch.empty((), dtype=params_dtype).element_size(), 4),
             )
             actual_config = ReplayMemoryConfig(
                 sequence_length=plan.metadata.sequence_length,
@@ -2365,6 +2799,12 @@ class Tier1ReplayEngine:
                 headroom_fraction=memory_policy.headroom_fraction,
                 tp_source=True,
                 sequence_parallel=schedule.sequence_parallel,
+                gated_linear_unit=gated_linear_unit,
+                observed_host_replay_bytes=expected_host_bytes,
+                observed_packed_statistics_bytes=probe.packed_statistics_bytes,
+                observed_reduction_arena_bytes=probe.reduction_arena_bytes,
+                observed_accumulator_scratch_bytes=probe.maximum_accumulator_scratch_bytes,
+                observed_attention_workspace_bytes=attention_workspace_bytes,
             )
             memory_estimate = estimate_replay_memory(actual_config)
             if plan.num_microbatches and memory_estimate.predicted_reserved_bytes <= 0:
@@ -2380,7 +2820,33 @@ class Tier1ReplayEngine:
         except BaseException as caught:
             error = caught
         self.readiness.settle(error, "transaction preflight")
-        assert memory_estimate is not None
+        assert (
+            memory_estimate is not None
+            and plan_facts is not None
+            and schedule_facts is not None
+            and model_config_facts is not None
+        )
+
+        def revalidate_preflight() -> None:
+            plan_facts.revalidate(plan)
+            schedule_facts.revalidate(schedule, self.models, plan)
+            probe.validate_preflight_binding()
+            current_config = self.models[0].config
+            current_facts = (
+                id(current_config),
+                current_config.num_layers,
+                current_config.hidden_size,
+                current_config.ffn_hidden_size,
+                current_config.num_attention_heads,
+                current_config.params_dtype,
+                current_config.gated_linear_unit,
+                current_config.tensor_model_parallel_size,
+                current_config.context_parallel_size,
+                current_config.pipeline_model_parallel_size,
+            )
+            if current_facts != model_config_facts:
+                raise RuntimeError("dense GPT configuration changed after memory preflight")
+
         return Tier1ReplayTransaction(
             models=self.models,
             plan=plan,
@@ -2395,4 +2861,5 @@ class Tier1ReplayEngine:
             fatal_abort=self.fatal_abort,
             maximum_model_state_bytes=maximum_extra_bytes,
             memory_estimate=memory_estimate,
+            preflight_validator=revalidate_preflight,
         )

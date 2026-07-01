@@ -7,7 +7,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import math
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -386,6 +386,71 @@ class FunctionResponseProbe:
         self._full_mask: torch.Tensor | None = None
         self._sequence_mask: torch.Tensor | None = None
         self._finalized = False
+        self._selected_row_capacity: int | None = None
+        self._response_widths: tuple[tuple[ResponseFamily, int], ...] | None = None
+        self._response_dtype: torch.dtype | None = None
+        self._attention_heads: int | None = None
+        self._attention_key_length: int | None = None
+        self._preflight_binding: tuple[Any, ...] | None = None
+
+    def bind_preflight(
+        self,
+        *,
+        selected_row_capacity: int,
+        response_widths: Mapping[ResponseFamily, int],
+        response_dtype: torch.dtype,
+        attention_heads: int,
+        attention_key_length: int,
+    ) -> None:
+        """Bind immutable live-response limits before either replay schedule."""
+
+        if (
+            selected_row_capacity <= 0
+            or set(response_widths) != set(RESPONSE_FAMILIES)
+            or any(width <= 0 for width in response_widths.values())
+            or not isinstance(response_dtype, torch.dtype)
+            or attention_heads <= 0
+            or attention_key_length <= 0
+        ):
+            raise ValueError("response preflight limits are invalid")
+        binding = (
+            selected_row_capacity,
+            tuple((family, response_widths[family]) for family in RESPONSE_FAMILIES),
+            response_dtype,
+            attention_heads,
+            attention_key_length,
+        )
+        if self._preflight_binding is not None and self._preflight_binding != binding:
+            raise RuntimeError("response probe preflight binding changed")
+        (
+            self._selected_row_capacity,
+            self._response_widths,
+            self._response_dtype,
+            self._attention_heads,
+            self._attention_key_length,
+        ) = binding
+        self._preflight_binding = binding
+
+    def validate_preflight_binding(self) -> None:
+        """Require all response allocation dimensions to be engine-bound."""
+
+        if (
+            self._selected_row_capacity is None
+            or self._response_widths is None
+            or self._response_dtype is None
+            or self._attention_heads is None
+            or self._attention_key_length is None
+        ):
+            raise RuntimeError("response probe is not bound to memory preflight")
+        current = (
+            self._selected_row_capacity,
+            self._response_widths,
+            self._response_dtype,
+            self._attention_heads,
+            self._attention_key_length,
+        )
+        if current != self._preflight_binding:
+            raise RuntimeError("response probe changed after memory preflight")
 
     @property
     def descriptor_hash(self) -> str:
@@ -485,8 +550,15 @@ class FunctionResponseProbe:
             or logits.ndim != 4
             or logits.device != self.device
             or probabilities.device != self.device
+            or logits.dtype != self._response_dtype
+            or probabilities.dtype != self._response_dtype
         ):
             raise ValueError("attention logits/probabilities have an invalid layout")
+        if (
+            logits.shape[1] != self._attention_heads
+            or logits.shape[3] != self._attention_key_length
+        ):
+            raise ValueError("attention response shape disagrees with memory preflight")
         if not 0 < collapse_threshold <= 1:
             raise ValueError("attention collapse threshold must be in (0, 1]")
         mask = self._full_mask
@@ -495,6 +567,8 @@ class FunctionResponseProbe:
         selected = mask if mask.dtype == torch.bool else mask != 0
         selected_logits = logits.permute(0, 2, 1, 3)[selected]
         selected_probabilities = probabilities.permute(0, 2, 1, 3)[selected]
+        if selected_logits.shape[0] > self._selected_row_capacity:
+            raise ValueError("attention selected rows exceed memory preflight")
         logit_abs = selected_logits.abs().mean(dim=-1)
         entropy = -(
             selected_probabilities
@@ -518,18 +592,38 @@ class FunctionResponseProbe:
     def _observe(self, descriptor: ResponseHookDescriptor, output: Any) -> None:
         if self._phase not in ("pre", "post"):
             raise RuntimeError("response hook fired outside replay capture")
+        self.validate_preflight_binding()
+        calls = self._pre_calls if self._phase == "pre" else self._post_calls
+        if calls.get(descriptor.key, 0) >= self.expected_hook_calls:
+            raise RuntimeError("response hook exceeded its preflight cardinality")
         mask = self._sequence_mask if descriptor.sequence_sharded else self._full_mask
         if mask is None:
             raise ValueError("response schedule did not supply the required mask")
         activation, bias = _canonical_output(
             output, affine_bias_output=descriptor.affine_bias_output
         )
+        widths = dict(self._response_widths)
+        if (
+            activation.device != self.device
+            or activation.dtype != self._response_dtype
+            or activation.shape[-1] != widths[descriptor.family]
+        ):
+            raise ValueError("response activation disagrees with memory preflight")
+        if bias is not None and (
+            bias.device != self.device
+            or bias.dtype != self._response_dtype
+            or bias.ndim != 1
+            or bias.shape[0] != widths[descriptor.family]
+        ):
+            raise ValueError("response bias disagrees with memory preflight")
         rows = _selected_rows(activation, mask, bias)
-        calls = self._pre_calls if self._phase == "pre" else self._post_calls
         calls[descriptor.key] = calls.get(descriptor.key, 0) + 1
         if not descriptor.owner:
             return
         if self._phase == "pre":
+            retained_rows = sum(value.shape[0] for value in self._pre_rows.get(descriptor.key, ()))
+            if retained_rows + rows.shape[0] > self._selected_row_capacity:
+                raise RuntimeError("response rows exceed their preallocated retention cap")
             self._pre_rows.setdefault(descriptor.key, []).append(rows.detach().clone())
             return
         before_values = self._pre_rows.get(descriptor.key, [])
@@ -583,6 +677,19 @@ class FunctionResponseProbe:
         """Return canonical bounded FP32/FP64 update scratch."""
 
         return self.accumulator.statistics.maximum_scratch_bytes
+
+    @property
+    def packed_statistics_bytes(self) -> int:
+        """Return bytes in the actual canonical persistent packs."""
+
+        statistics = self.accumulator.statistics
+        return statistics.sum_pack.nbytes + statistics.max_pack.nbytes + statistics.min_pack.nbytes
+
+    @property
+    def reduction_arena_bytes(self) -> int:
+        """Return bytes in the actual canonical temporary reduction arena."""
+
+        return PackedSufficientStatistics.reduction_arena_bytes((self.accumulator.statistics,))
 
     def release(self) -> None:
         """Remove temporary hooks and release all retained response rows."""

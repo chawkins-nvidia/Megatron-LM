@@ -12,14 +12,20 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.datasets.data_samplers import (
     MegatronPretrainingRandomSampler,
     MegatronPretrainingSampler,
     RandomSeedDataset,
     SamplerIssuedIndex,
 )
+from megatron.training.diagnostics.accumulator import ReductionBinding
 from megatron.training.diagnostics.diagnostic_replay import (
     DIAGNOSTIC_MASK_FIELD,
     SAMPLE_EPOCH_FIELD,
@@ -30,6 +36,7 @@ from megatron.training.diagnostics.diagnostic_replay import (
     PopulationCollectiveWorkspace,
     ReadinessConsensus,
     RecordedBatch,
+    ReplayBatchRecorder,
     ReplayIterator,
     ReplayMemoryConfig,
     ReplayMemoryPolicy,
@@ -48,6 +55,12 @@ from megatron.training.diagnostics.diagnostic_replay import (
     local_sample_populations,
     select_local_token_ids,
     slice_replay_mask,
+)
+from megatron.training.diagnostics.function_response import (
+    RESPONSE_FAMILIES,
+    FunctionResponseProbe,
+    ResponseFamily,
+    ResponseHookDescriptor,
 )
 
 
@@ -234,6 +247,26 @@ def test_raw_replay_fields_are_fixed_and_attention_masks_fail_closed() -> None:
 
     with pytest.raises(ValueError, match="exactly the fixed"):
         RecordedBatch.from_raw(raw)
+
+
+def test_replay_recorder_rejects_batch_and_byte_overflow_before_retaining() -> None:
+    raw = _raw_batch()
+    one_batch_bytes = RecordedBatch.from_raw(raw).tensor_bytes
+    batch_limited = ReplayBatchRecorder(
+        iter((raw, raw)), maximum_batches=1, maximum_host_bytes=2 * one_batch_bytes
+    )
+    next(batch_limited)
+    with pytest.raises(ReplayPreflightError, match="batch cap"):
+        next(batch_limited)
+    assert len(batch_limited.recorded) == 1
+
+    byte_limited = ReplayBatchRecorder(
+        iter((raw,)), maximum_batches=1, maximum_host_bytes=one_batch_bytes - 1
+    )
+    with pytest.raises(ReplayPreflightError, match="byte cap"):
+        next(byte_limited)
+    assert byte_limited.recorded == []
+    assert byte_limited.host_capture_bytes == 0
 
 
 def test_fixed_plan_codec_constructs_equal_neutral_non_source_plan() -> None:
@@ -472,6 +505,18 @@ def test_declared_buffer_registry_and_lazily_created_cache_are_restored() -> Non
     assert not hasattr(model, "_decoder_hidden_states_cache")
 
 
+def test_mutable_bytearray_cache_is_rejected_even_with_zero_snapshot_cap() -> None:
+    model = torch.nn.Identity()
+    model.custom_cache = bytearray(b"abc")
+
+    with pytest.raises(TypeError, match="unsupported mutable model-state value"):
+        ReplayStateGuard(
+            (model,), tracker_getter=lambda: _Tracker(), maximum_model_state_bytes=0
+        ).prepare()
+
+    assert model.custom_cache == bytearray(b"abc")
+
+
 class _Probe:
     def __init__(self, expected: int) -> None:
         self.expected_hook_calls = expected
@@ -587,6 +632,93 @@ def _dense_gpt_stub() -> GPTModel:
     return model
 
 
+def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):
+    model = _dense_gpt_stub()
+    model.config.gated_linear_unit = gated
+    layer = TransformerLayer.__new__(TransformerLayer)
+    torch.nn.Module.__init__(layer)
+    layer.layer_number = 1
+    layer.is_moe_layer = False
+    attention = SelfAttention.__new__(SelfAttention)
+    torch.nn.Module.__init__(attention)
+    mlp = MLP.__new__(MLP)
+    torch.nn.Module.__init__(mlp)
+    qkv = ColumnParallelLinear.__new__(ColumnParallelLinear)
+    torch.nn.Module.__init__(qkv)
+    projection = RowParallelLinear.__new__(RowParallelLinear)
+    torch.nn.Module.__init__(projection)
+    fc1 = ColumnParallelLinear.__new__(ColumnParallelLinear)
+    torch.nn.Module.__init__(fc1)
+    fc2 = RowParallelLinear.__new__(RowParallelLinear)
+    torch.nn.Module.__init__(fc2)
+    core_attention = DotProductAttention.__new__(DotProductAttention)
+    torch.nn.Module.__init__(core_attention)
+    attention.linear_qkv = qkv
+    attention.linear_proj = projection
+    attention.core_attention = core_attention
+    mlp.linear_fc1 = fc1
+    mlp.linear_fc2 = fc2
+    layer.self_attention = attention
+    layer.mlp = mlp
+    model.decoder_layer = layer
+    modules = {
+        ResponseFamily.RESIDUAL: layer,
+        ResponseFamily.QKV: qkv,
+        ResponseFamily.ATTN_OUT: projection,
+        ResponseFamily.FC1: fc1,
+        ResponseFamily.FC2: fc2,
+    }
+    descriptors = tuple(
+        ResponseHookDescriptor(
+            global_layer=0,
+            family=family,
+            module=modules[family],
+            owner=True,
+            sequence_sharded=False,
+            affine_bias_output=family != ResponseFamily.RESIDUAL,
+        )
+        for family in RESPONSE_FAMILIES
+    )
+    plan = _plan()
+    probe = FunctionResponseProbe(
+        descriptors,
+        global_layers=1,
+        device="cpu",
+        expected_hook_calls=plan.num_microbatches,
+        reduction_binding=ReductionBinding.flat_world(None),
+        scratch_element_capacity=scratch_capacity,
+    )
+    schedule = NonInterleavedReplaySchedule(
+        forward_backward_func=lambda **kwargs: None,
+        forward_step_func=lambda *args: None,
+        model=(model,),
+        sequence_length=8,
+        micro_batch_size=2,
+        probe_device="cpu",
+        tensor_parallel_rank=0,
+        tensor_parallel_size=1,
+    )
+    tracker = _Tracker()
+    engine = Tier1ReplayEngine(
+        (model,),
+        readiness=ReadinessConsensus(CollectiveBinding("world", None, 1)),
+        tracker_getter=lambda: tracker,
+    )
+    return engine, model, plan, probe, schedule
+
+
+def _prepare_fixture(engine, plan, probe, schedule, *, maximum_extra_bytes: int = 2**40):
+    return engine.prepare(
+        plan=plan,
+        probe=probe,
+        schedule=schedule,
+        memory_policy=ReplayMemoryPolicy(),
+        maximum_extra_bytes=maximum_extra_bytes,
+        currently_reserved_bytes=0,
+        total_device_bytes=2**41,
+    )
+
+
 def test_engine_prepare_makes_memory_preflight_mandatory_and_engine_owned() -> None:
     binding = CollectiveBinding("world", None, 1)
     tracker = _Tracker()
@@ -629,6 +761,91 @@ def test_engine_prepare_makes_memory_preflight_mandatory_and_engine_owned() -> N
             currently_reserved_bytes=0,
             total_device_bytes=2**40,
         )
+
+
+def test_engine_rejects_schedule_model_identity_mismatch_before_schedule() -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture()
+    other = _dense_gpt_stub()
+    schedule.model = (other,)
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        _prepare_fixture(engine, plan, probe, schedule)
+
+    assert not schedule.p2p_started
+
+
+def test_engine_rejects_arbitrary_child_module_before_schedule() -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+
+    class Bad(torch.nn.Module):
+        pass
+
+    model.bad = Bad()
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        _prepare_fixture(engine, plan, probe, schedule)
+
+    assert not schedule.p2p_started
+
+
+def test_engine_recomputes_selected_tokens_from_fixed_masks() -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture()
+    forged_masks = tuple(tuple(True for _ in mask) for mask in plan.metadata.diagnostic_masks)
+    plan.metadata = replace(plan.metadata, diagnostic_masks=forged_masks)
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        _prepare_fixture(engine, plan, probe, schedule)
+
+    assert not schedule.p2p_started
+
+
+@pytest.mark.parametrize("mutation", ("unknown", "oversized"))
+def test_engine_rejects_changed_fixed_batch_fields_before_schedule(mutation: str) -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture()
+    if mutation == "unknown":
+        plan.microbatches[0].data["caller_field"] = torch.zeros(2, 8)
+    else:
+        plan.microbatches[0].data["tokens"] = torch.zeros(2, 9, dtype=torch.int64)
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        _prepare_fixture(engine, plan, probe, schedule)
+
+    assert not schedule.p2p_started
+
+
+def test_engine_binds_gated_fc1_width_and_actual_probe_scratch() -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture(
+        gated=True, scratch_capacity=1_000_000
+    )
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    assert transaction.memory_estimate is not None
+    expected_response = (16 + 48 + 16 + 128 + 16) * 2 * 4
+    assert transaction.memory_estimate.term("retained_response_rows") == expected_response
+    assert (
+        transaction.memory_estimate.term("accumulator_scratch")
+        == probe.maximum_accumulator_scratch_bytes
+        == 96_000_000
+    )
+
+
+def test_engine_revalidates_bound_plan_and_topology_before_schedule() -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture()
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    schedule.tp_rank = 1
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.run_pre()
+
+    assert not schedule.p2p_started
+
+
+def test_engine_rejects_96mb_actual_probe_scratch_under_10mb_cap() -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture(scratch_capacity=1_000_000)
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        _prepare_fixture(engine, plan, probe, schedule, maximum_extra_bytes=10_000_000)
+
+    assert not schedule.p2p_started
 
 
 def _memory_config(**overrides) -> ReplayMemoryConfig:

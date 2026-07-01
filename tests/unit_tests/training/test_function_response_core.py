@@ -51,6 +51,13 @@ def _probe(layers: int, *, owner: bool = True, expected_hook_calls: int = 0):
         reduction_binding=ReductionBinding.flat_world(None),
         scratch_element_capacity=2,
     )
+    probe.bind_preflight(
+        selected_row_capacity=max(expected_hook_calls, 1),
+        response_widths={family: 1 for family in RESPONSE_FAMILIES},
+        response_dtype=torch.float32,
+        attention_heads=1,
+        attention_key_length=2,
+    )
     return probe, modules
 
 
@@ -185,6 +192,13 @@ def test_selected_pre_rows_are_released_after_each_post_observation() -> None:
     probe = FunctionResponseProbe(
         (descriptor,), global_layers=1, device="cpu", expected_hook_calls=2
     )
+    probe.bind_preflight(
+        selected_row_capacity=2,
+        response_widths={family: 1 for family in RESPONSE_FAMILIES},
+        response_dtype=torch.float32,
+        attention_heads=1,
+        attention_key_length=1,
+    )
     mask = torch.tensor([[True], [False]])
     probe.set_masks(mask)
     probe._phase = "pre"
@@ -196,6 +210,61 @@ def test_selected_pre_rows_are_released_after_each_post_observation() -> None:
     probe._observe(descriptor, torch.tensor([[[3.0]], [[9.0]]]))
     assert probe.retained_pre_bytes == 4
     probe._observe(descriptor, torch.tensor([[[6.0]], [[9.0]]]))
+    assert probe.retained_pre_bytes == 0
+    probe._phase = None
+
+
+def test_extra_pre_hook_observation_rejects_before_cloning() -> None:
+    descriptors, _modules = _descriptors(1)
+    descriptor = descriptors[0]
+    probe = FunctionResponseProbe(
+        (descriptor,), global_layers=1, device="cpu", expected_hook_calls=1
+    )
+    probe.bind_preflight(
+        selected_row_capacity=1,
+        response_widths={family: 1 for family in RESPONSE_FAMILIES},
+        response_dtype=torch.float32,
+        attention_heads=1,
+        attention_key_length=1,
+    )
+    probe.set_masks(torch.tensor([[True]]))
+    probe._phase = "pre"
+    probe._observe(descriptor, torch.ones(1, 1, 1))
+    retained = probe.retained_pre_bytes
+
+    with pytest.raises(RuntimeError, match="preflight cardinality"):
+        probe._observe(descriptor, torch.ones(1, 1, 1))
+
+    assert probe.retained_pre_bytes == retained
+    assert len(probe._pre_rows[descriptor.key]) == 1
+    probe._phase = None
+
+
+@pytest.mark.parametrize(
+    ("activation", "message"),
+    ((torch.ones(1, 1, 2), "activation"), (torch.ones(1, 1, 1, dtype=torch.float64), "activation")),
+)
+def test_live_response_shape_and_dtype_must_match_preflight(
+    activation: torch.Tensor, message: str
+) -> None:
+    descriptors, _modules = _descriptors(1)
+    descriptor = descriptors[0]
+    probe = FunctionResponseProbe(
+        (descriptor,), global_layers=1, device="cpu", expected_hook_calls=1
+    )
+    probe.bind_preflight(
+        selected_row_capacity=1,
+        response_widths={family: 1 for family in RESPONSE_FAMILIES},
+        response_dtype=torch.float32,
+        attention_heads=1,
+        attention_key_length=1,
+    )
+    probe.set_masks(torch.tensor([[True]]))
+    probe._phase = "pre"
+
+    with pytest.raises(ValueError, match=message):
+        probe._observe(descriptor, activation)
+
     assert probe.retained_pre_bytes == 0
     probe._phase = None
 
