@@ -1702,7 +1702,8 @@ class DenseGPTStateSnapshot:
             _ExtraStateSnapshot(module, plan.walk(current))
             for module, current in pending_extra_states
         ]
-        plan.capture()
+        # ReplayStateGuard captures this plan only after overlap state has
+        # joined the same alias graph and byte cap.
 
     def restore(self) -> None:
         """Restore model state without performing verification."""
@@ -1812,7 +1813,7 @@ class IdentityStateSnapshot:
 
 
 class OverlapStateSnapshot:
-    """Snapshot explicitly named overlap handles and reject active work."""
+    """Snapshot quiescent overlap state and reject active work handles."""
 
     _ATTRIBUTES = (
         "param_gather_handle",
@@ -1825,17 +1826,22 @@ class OverlapStateSnapshot:
         self.owners = tuple(owners)
         self.attributes: list[_AttributeSnapshot] = []
 
-    def capture(self) -> None:
-        """Capture quiescent overlap state and reject active handles."""
+    def capture(self, plan: _ValueSnapshotPlan) -> None:
+        """Join quiescent overlap state to the shared guarded-state plan."""
 
         for owner in self.owners:
-            for name in self._ATTRIBUTES:
+            names = set(self._ATTRIBUTES)
+            try:
+                names.update(vars(owner))
+            except TypeError as error:
+                raise TypeError("overlap state owners require an inspectable __dict__") from error
+            for name in sorted(names):
                 snapshot: _ValueSnapshot | None = None
                 if hasattr(owner, name):
                     value = getattr(owner, name)
-                    if value is not None:
+                    if name in self._ATTRIBUTES and value is not None:
                         raise ValueError(f"Tier-1 replay requires quiescent overlap state: {name}")
-                    snapshot = _ValueSnapshot.capture(value)
+                    snapshot = plan.walk(value)
                 self.attributes.append(_AttributeSnapshot(owner, name, snapshot))
 
     def restore(self) -> None:
@@ -1849,6 +1855,11 @@ class OverlapStateSnapshot:
 
         if any(not attribute.verify() for attribute in self.attributes):
             raise RuntimeError("overlap-state restoration failed")
+
+    def release(self) -> None:
+        """Release retained overlap owners and value nodes."""
+
+        self.attributes.clear()
 
 
 class ReplayRestorationError(RuntimeError):
@@ -1897,14 +1908,16 @@ class ReplayStateGuard:
         try:
             self.model.capture()
             self.identity.capture()
-            self.overlap.capture()
+            assert self.model.snapshot_plan is not None
+            self.overlap.capture(self.model.snapshot_plan)
+            self.model.snapshot_plan.capture()
             self.rng = ReplayRngState.capture(
                 tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
             )
             self.prepared = True
         except BaseException:
             self.model.release()
-            self.overlap.attributes.clear()
+            self.overlap.release()
             self.rng = None
             raise
 
@@ -1949,6 +1962,7 @@ class ReplayStateGuard:
         ):
             self._attempt(name, operation, failures)
         self.model.release()
+        self.overlap.release()
         self.rng = None
         self.entered = False
         if failures:
@@ -2434,10 +2448,39 @@ def _identity_facts(value: Any) -> tuple[Any, ...]:
     )
 
 
-class _FactNormalizer:
-    """Create a deterministic, alias-aware snapshot of admitted configuration values."""
+_MODULE_GRAPH_REGISTRIES = frozenset(("_parameters", "_buffers", "_modules"))
+_MODULE_HOOK_MAPS = frozenset(
+    (
+        "_backward_pre_hooks",
+        "_backward_hooks",
+        "_forward_hooks",
+        "_forward_hooks_with_kwargs",
+        "_forward_hooks_always_called",
+        "_forward_pre_hooks",
+        "_forward_pre_hooks_with_kwargs",
+        "_state_dict_hooks",
+        "_state_dict_pre_hooks",
+        "_load_state_dict_pre_hooks",
+        "_load_state_dict_post_hooks",
+    )
+)
 
-    def __init__(self) -> None:
+
+def _is_module_runtime_binding(name: str) -> bool:
+    return (
+        name == "pg_collection"
+        or name.endswith("_group")
+        or "process_group" in name
+        or name == "binding"
+        or name.endswith("_binding")
+    )
+
+
+class _FactNormalizer:
+    """Create a deterministic, alias-aware snapshot of admitted execution values."""
+
+    def __init__(self, *, allow_tensors: bool = True) -> None:
+        self.allow_tensors = allow_tensors
         self.memo: dict[int, int] = {}
         self.active: set[int] = set()
 
@@ -2464,6 +2507,8 @@ class _FactNormalizer:
         if isinstance(value, (torch.dtype, torch.device, torch.layout)):
             return ("torch_value", type(value), str(value))
         if isinstance(value, torch.Tensor):
+            if not self.allow_tensors:
+                raise TypeError("mutable tensor execution attributes are not supported")
             return ("tensor", _snapshot_tensor_facts(value))
         if isinstance(value, functools.partial):
             return self._compound(
@@ -2513,9 +2558,8 @@ class _ModelGraphFacts:
 
     @classmethod
     def observe(cls, models: Sequence[torch.nn.Module]) -> "_ModelGraphFacts":
-        from megatron.core.transformer.spec_utils import ModuleSpec
-
-        normalizer = _FactNormalizer()
+        module_normalizer = _FactNormalizer(allow_tensors=False)
+        config_normalizer = _FactNormalizer()
         module_facts: list[tuple[Any, ...]] = []
         configs: dict[int, Any] = {}
         active: set[int] = set()
@@ -2542,20 +2586,29 @@ class _ModelGraphFacts:
                 config_binding = None if config is None else _identity_facts(config)
                 if config is not None:
                     configs.setdefault(id(config), config)
-                spec_attributes = tuple(
-                    (name, normalizer.freeze(value))
-                    for name, value in vars(module).items()
-                    if name in ("transformer_layer_spec", "submodules") or type(value) is ModuleSpec
-                )
+                module_state = []
+                for name, value in sorted(vars(module).items()):
+                    if name in _MODULE_GRAPH_REGISTRIES or name in _MODULE_HOOK_MAPS:
+                        continue
+                    if name == "config":
+                        fact = ("config_binding", config_binding)
+                    elif _is_module_runtime_binding(name):
+                        fact = (
+                            "runtime_binding",
+                            None if value is None else _identity_facts(value),
+                        )
+                    else:
+                        fact = module_normalizer.freeze(value)
+                    module_state.append((name, fact))
                 module_facts.append(
                     (
                         path,
                         _identity_facts(module),
+                        module.training,
                         children,
                         parameters,
                         buffers,
-                        config_binding,
-                        spec_attributes,
+                        tuple(module_state),
                     )
                 )
                 for name, child in module._modules.items():
@@ -2567,7 +2620,8 @@ class _ModelGraphFacts:
         for model_index, model in enumerate(models):
             walk(model, str(model_index))
         config_facts = tuple(
-            (_identity_facts(config), normalizer.freeze(config)) for config in configs.values()
+            (_identity_facts(config), config_normalizer.freeze(config))
+            for config in configs.values()
         )
         return cls(tuple(module_facts), config_facts)
 

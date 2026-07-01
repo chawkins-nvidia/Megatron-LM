@@ -481,6 +481,64 @@ def test_active_overlap_state_is_rejected_before_capture() -> None:
             pass
 
 
+def test_quiescent_none_overlap_handles_prepare_restore_and_verify() -> None:
+    overlap = SimpleNamespace(param_gather_handle=None)
+    guard = ReplayStateGuard(
+        (torch.nn.Identity(),), overlap_objects=(overlap,), tracker_getter=lambda: _Tracker()
+    )
+
+    guard.prepare()
+    with guard:
+        overlap.param_gather_handle = object()
+        overlap.grad_reduce_handle = object()
+
+    assert overlap.param_gather_handle is None
+    assert not hasattr(overlap, "grad_reduce_handle")
+
+
+def test_supported_immutable_and_tensor_overlap_state_shares_model_snapshot_plan() -> None:
+    model = torch.nn.Identity()
+    shared = torch.arange(1024, dtype=torch.float32)
+    model.shared_state = shared
+    overlap = SimpleNamespace(
+        param_gather_handle=None,
+        phase=("ready", torch.float32, torch.device("cpu")),
+        tensor_state=shared,
+    )
+    guard = ReplayStateGuard(
+        (model,),
+        overlap_objects=(overlap,),
+        tracker_getter=lambda: _Tracker(),
+        maximum_model_state_bytes=4096,
+    )
+
+    guard.prepare()
+
+    assert guard.model.tensor_bytes == 4096
+    assert guard.model.snapshot_plan is not None
+    assert len(guard.model.snapshot_plan.storages) == 1
+    with guard:
+        shared.add_(9)
+        overlap.phase = ("running", torch.float64, torch.device("cpu"))
+        overlap.tensor_state = shared.clone()
+
+    assert overlap.phase == ("ready", torch.float32, torch.device("cpu"))
+    assert overlap.tensor_state is shared
+    torch.testing.assert_close(shared, torch.arange(1024, dtype=torch.float32))
+
+
+def test_overlap_tensor_state_is_rejected_by_shared_snapshot_cap() -> None:
+    overlap = SimpleNamespace(param_gather_handle=None, tensor_state=torch.ones(1024))
+
+    with pytest.raises(ValueError, match="snapshot exceeds its declared byte cap"):
+        ReplayStateGuard(
+            (torch.nn.Identity(),),
+            overlap_objects=(overlap,),
+            tracker_getter=lambda: _Tracker(),
+            maximum_model_state_bytes=4000,
+        ).prepare()
+
+
 def test_undeclared_registered_buffer_is_rejected_before_mutation() -> None:
     model = _StatefulModel()
     tracker = _Tracker()
@@ -749,6 +807,18 @@ def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):
     torch.nn.Module.__init__(fc2)
     core_attention = DotProductAttention.__new__(DotProductAttention)
     torch.nn.Module.__init__(core_attention)
+    qkv.gather_output = False
+    qkv.skip_bias_add = False
+    qkv.sequence_parallel = False
+    qkv.allreduce_dgrad = False
+    projection.skip_bias_add = False
+    projection.sequence_parallel = False
+    fc1.gather_output = False
+    fc1.skip_bias_add = True
+    fc1.sequence_parallel = False
+    fc1.allreduce_dgrad = False
+    fc2.skip_bias_add = True
+    fc2.sequence_parallel = False
     attention.linear_qkv = qkv
     attention.linear_proj = projection
     attention.core_attention = core_attention
@@ -813,6 +883,22 @@ def _prepare_fixture(engine, plan, probe, schedule, *, maximum_extra_bytes: int 
         currently_reserved_bytes=0,
         total_device_bytes=2**41,
     )
+
+
+def _count_schedule_calls(schedule):
+    calls = []
+
+    def forward_backward(**kwargs):
+        calls.append(kwargs["num_microbatches"])
+        for _ in range(kwargs["num_microbatches"]):
+            kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"][0])
+
+    def forward_step(_data_iterator, _model):
+        return torch.zeros(1), lambda value: value
+
+    schedule.forward_backward_func = forward_backward
+    schedule.forward_step_func = forward_step
+    return calls
 
 
 def test_engine_prepare_makes_memory_preflight_mandatory_and_engine_owned() -> None:
@@ -991,6 +1077,116 @@ def test_engine_revalidates_bound_plan_and_topology_before_schedule() -> None:
     assert not schedule.p2p_started
 
 
+def test_exact_reviewer_pre_execution_attribute_drift_calls_no_schedule() -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    schedule_calls = _count_schedule_calls(schedule)
+    fc1 = model.decoder_layer.mlp.linear_fc1
+    fc1.skip_bias_add = True
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    fc1.skip_bias_add = False
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.run_pre()
+
+    assert schedule_calls == []
+    assert not schedule.p2p_started
+
+
+def test_exact_reviewer_post_attribute_and_mode_drift_calls_no_post_schedule() -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    schedule_calls = _count_schedule_calls(schedule)
+    fc1 = model.decoder_layer.mlp.linear_fc1
+    fc1.skip_bias_add = False
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    transaction.run_pre()
+    fc1.skip_bias_add = True
+    model.eval()
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.finish(update_succeeded=True)
+
+    assert schedule_calls == [plan.num_microbatches]
+    assert fc1.skip_bias_add
+    assert not model.training
+
+
+@pytest.mark.parametrize("phase", ("pre", "post"))
+@pytest.mark.parametrize(
+    ("module_path", "attribute"),
+    (
+        (("decoder_layer", "self_attention", "linear_qkv"), "gather_output"),
+        (("decoder_layer", "self_attention", "linear_qkv"), "sequence_parallel"),
+        (("decoder_layer", "self_attention", "linear_qkv"), "allreduce_dgrad"),
+        (("decoder_layer", "self_attention", "linear_proj"), "skip_bias_add"),
+        (("decoder_layer", "self_attention", "linear_proj"), "sequence_parallel"),
+        (("decoder_layer", "mlp", "linear_fc1"), "skip_bias_add"),
+    ),
+)
+def test_parallel_linear_flag_drift_is_rejected_at_both_final_gates(
+    phase: str, module_path: tuple[str, ...], attribute: str
+) -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    schedule_calls = _count_schedule_calls(schedule)
+    module = model
+    for name in module_path:
+        module = getattr(module, name)
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    if phase == "post":
+        transaction.run_pre()
+    setattr(module, attribute, not getattr(module, attribute))
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        if phase == "pre":
+            transaction.run_pre()
+        else:
+            transaction.finish(update_succeeded=True)
+
+    assert schedule_calls == ([] if phase == "pre" else [plan.num_microbatches])
+
+
+@pytest.mark.parametrize("phase", ("pre", "post"))
+def test_every_module_training_mode_is_rejected_at_both_final_gates(phase: str) -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    schedule_calls = _count_schedule_calls(schedule)
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    if phase == "post":
+        transaction.run_pre()
+    for module in model.modules():
+        module.training = not module.training
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        if phase == "pre":
+            transaction.run_pre()
+        else:
+            transaction.finish(update_succeeded=True)
+
+    assert schedule_calls == ([] if phase == "pre" else [plan.num_microbatches])
+
+
+@pytest.mark.parametrize(
+    "surface", ("runtime_binding", "unsupported_state", "mutable_tensor_state")
+)
+def test_unmodeled_module_state_drift_fails_closed_before_schedule(surface: str) -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    schedule_calls = _count_schedule_calls(schedule)
+    fc1 = model.decoder_layer.mlp.linear_fc1
+    if surface == "runtime_binding":
+        fc1.tp_group = object()
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    if surface == "runtime_binding":
+        fc1.tp_group = object()
+    else:
+        fc1.unmodeled_mutable_state = (
+            bytearray(b"drift") if surface == "unsupported_state" else (torch.ones(1),)
+        )
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.run_pre()
+
+    assert schedule_calls == []
+    assert not schedule.p2p_started
+
+
 def test_exact_reviewer_post_preflight_graph_schedule_config_and_batch_drift() -> None:
     engine, model, plan, probe, schedule = _dense_engine_fixture()
     transaction = _prepare_fixture(engine, plan, probe, schedule)
@@ -1037,18 +1233,7 @@ def test_parameter_buffer_and_module_spec_graph_drift_is_rejected(surface: str) 
 
 def test_execution_graph_is_revalidated_again_immediately_before_post_schedule() -> None:
     engine, model, plan, probe, schedule = _dense_engine_fixture()
-    schedule_calls = []
-
-    def forward_backward(**kwargs):
-        schedule_calls.append(kwargs["num_microbatches"])
-        for _ in range(kwargs["num_microbatches"]):
-            kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"][0])
-
-    def forward_step(_data_iterator, _model):
-        return torch.zeros(1), lambda value: value
-
-    schedule.forward_backward_func = forward_backward
-    schedule.forward_step_func = forward_step
+    schedule_calls = _count_schedule_calls(schedule)
     transaction = _prepare_fixture(engine, plan, probe, schedule)
     transaction.run_pre()
     model.config.sequence_parallel = not model.config.sequence_parallel
