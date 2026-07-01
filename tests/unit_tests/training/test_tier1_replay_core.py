@@ -21,7 +21,10 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    TransformerLayer,
+    TransformerLayerSubmodules,
+)
 from megatron.training.datasets.data_samplers import (
     MegatronPretrainingRandomSampler,
     MegatronPretrainingSampler,
@@ -642,7 +645,11 @@ def test_transformer_block_nullcontext_state_is_restored() -> None:
     model.decoder = torch.nn.Identity()
     model.decoder.offload_context = contextlib.nullcontext()
     original = model.decoder.offload_context
-    guard = ReplayStateGuard((model,), tracker_getter=lambda: _Tracker())
+    guard = ReplayStateGuard(
+        (model,),
+        tracker_getter=lambda: _Tracker(),
+        cuda_device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+    )
 
     guard.prepare()
     with guard:
@@ -663,6 +670,48 @@ def test_transformer_block_nullcontext_rejects_mutable_enter_result_with_path() 
         match=r"model\[0\]\.decoder\.offload_context requires an immutable enter_result",
     ):
         ReplayStateGuard((model,), tracker_getter=lambda: _Tracker()).prepare()
+
+
+def test_transformer_layer_submodules_config_is_exact_static_metadata() -> None:
+    model = _dense_gpt_stub()
+    layer = TransformerLayer.__new__(TransformerLayer)
+    torch.nn.Module.__init__(layer)
+    layer.submodules_config = TransformerLayerSubmodules()
+    model.layer = layer
+    guard = ReplayStateGuard(
+        (model,),
+        tracker_getter=lambda: _Tracker(),
+        cuda_device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+    )
+
+    guard.prepare()
+
+    assert layer.submodules_config is not None
+
+
+def test_non_transformer_layer_submodules_config_is_not_static() -> None:
+    model = torch.nn.Identity()
+    model.submodules_config = TransformerLayerSubmodules()
+
+    with pytest.raises(
+        TypeError,
+        match=r"model\[0\]\.submodules_config:.*TransformerLayerSubmodules",
+    ):
+        ReplayStateGuard((model,), tracker_getter=lambda: _Tracker()).prepare()
+
+
+def test_state_plan_reports_every_unsupported_model_attribute() -> None:
+    model = torch.nn.Identity()
+    model.first_bad = bytearray(b"first")
+    model.child = torch.nn.Identity()
+    model.child.second_bad = object()
+
+    with pytest.raises(TypeError) as caught:
+        ReplayStateGuard((model,), tracker_getter=lambda: _Tracker()).prepare()
+
+    message = str(caught.value)
+    assert "model[0].first_bad: builtins.bytearray" in message
+    assert "model[0].child.second_bad: builtins.object" in message
 
 
 def test_recursive_snapshot_clones_32_tensor_aliases_once_under_cap() -> None:

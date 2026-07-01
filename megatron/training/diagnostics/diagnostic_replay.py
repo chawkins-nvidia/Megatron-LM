@@ -1779,6 +1779,8 @@ class DenseGPTStateSnapshot:
     def capture(self) -> None:
         """Capture all explicitly admitted mutable model state."""
 
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
         self.modes = [
             (module, module.training) for model in self.models for module in model.modules()
         ]
@@ -1813,6 +1815,9 @@ class DenseGPTStateSnapshot:
                     name
                     for name in vars(module)
                     if name not in self._STATIC_ATTRIBUTES
+                    and not (
+                        name == "submodules_config" and type(module) is TransformerLayer
+                    )
                     and not name.endswith("_group")
                     and "process_group" not in name
                 )
@@ -1861,20 +1866,28 @@ class DenseGPTStateSnapshot:
             )
             for qualified, module, local_name, buffer in pending_buffers
         ]
+        unsupported: list[str] = []
         for module_path, module, name, current in pending_attributes:
-            value = (
-                None
-                if current is missing_attribute
-                else plan.walk(current, f"{module_path}.{name}")
-            )
+            try:
+                value = (
+                    None
+                    if current is missing_attribute
+                    else plan.walk(current, f"{module_path}.{name}")
+                )
+            except TypeError as error:
+                unsupported.append(str(error))
+                continue
             self.attributes.append(_AttributeSnapshot(module, name, value))
-        self.extra_states = [
-            _ExtraStateSnapshot(
-                module,
-                plan.walk(current, f"{module_path}.extra_state"),
-            )
-            for module_path, module, current in pending_extra_states
-        ]
+        for module_path, module, current in pending_extra_states:
+            try:
+                value = plan.walk(current, f"{module_path}.extra_state")
+            except TypeError as error:
+                unsupported.append(str(error))
+                continue
+            self.extra_states.append(_ExtraStateSnapshot(module, value))
+        if unsupported:
+            details = "\n".join(f"- {message}" for message in unsupported)
+            raise TypeError(f"unsupported model-state attributes:\n{details}")
         # ReplayStateGuard captures this plan only after overlap state has
         # joined the same alias graph and byte cap.
 
