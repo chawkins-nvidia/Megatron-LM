@@ -377,8 +377,16 @@ def test_status_only_retries_overflow_then_writes_one_exact_payload() -> None:
     assert args.diagnostic_successful_updates == 1
     assert args.diagnostic_event_id == 1
     rank = dist.get_rank() if dist.is_initialized() else 0
-    assert calls == []
-    assert tensorboard.values == {}
+    if rank == 0:
+        assert len(calls) == 1
+        payload, step = calls[0]
+        assert tuple(payload) == TIER0_KEYS
+        assert payload["diag/v2/status/valid"] == 0
+        assert step == 6
+        assert tuple(tensorboard.values) == TIER0_KEYS
+    else:
+        assert calls == []
+        assert tensorboard.values == {}
     assert heartbeat.sink_failure_count == (1 if rank == 0 else 0)
 
 

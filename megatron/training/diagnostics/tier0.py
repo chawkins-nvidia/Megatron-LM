@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 import warnings
@@ -14,6 +16,7 @@ from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
+import numpy as np
 from torch import nn
 
 from megatron.core import parallel_state
@@ -28,10 +31,27 @@ from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 from .accumulator import PackedSlots, PackedSufficientStatistics, ReductionBinding
-from .artifact import Tier0ArtifactWriter, writer_from_runtime
-from .capability import SUPPORT_SIGNATURE, diagnostic_schema_hash
-from .capability import sha256_file as capability_sha256_file
-from .capability import static_capability_path
+from .artifact_v3 import (
+    COMPONENT_STATE_REASON,
+    MIDPOINT_STATE_REASON,
+    SECANT_STATE_REASON,
+    ArtifactV3Writer,
+    EventEvidence,
+    build_layer_metric_arrays,
+    build_process_group_evidence,
+    build_runtime_signature,
+    complete_restore_evidence,
+    complete_state_snapshot,
+    identity_sampling_evidence,
+    rank_perf_arrays,
+    tier0_collective_operations,
+    tier0_rank_perf_from_heartbeat,
+    tier0_sampling_from_rank_evidence,
+    tier0_state_evidence,
+    unavailable_restore_evidence,
+    unavailable_state_snapshot,
+)
+from .capability import SUPPORT_SIGNATURE
 from .capture import (
     CaptureTopology,
     StagedTokenMask,
@@ -45,6 +65,7 @@ from .distributed_optimizer import (
     SnapshotMemoryPreflight,
     snapshot_memory_estimate,
 )
+from .launch_artifact import publish_final_launch_config_from_runtime
 from .normalization import CanonicalDgradNormalizer
 from .registry import (
     DenominatorKind,
@@ -92,7 +113,8 @@ _CONTROL_NAMES = (
     "control/adapter_status",
     "control/all_rank_post_gather_peak_unavailable",
 )
-_RANK_EVIDENCE_FIELDS = 11
+_BASE_RANK_EVIDENCE_FIELDS = 11
+_RANK_EVIDENCE_FIELDS = _BASE_RANK_EVIDENCE_FIELDS
 _INT64_MAX = 2**63 - 1
 _MAX_RESERVATION_BYTES = 8 * 1024**3
 _BACKEND_WORKSPACE_ALLOWANCE_BYTES = 64 * 1024**2
@@ -648,7 +670,7 @@ class Tier0Heartbeat:
         *,
         wandb_log: Callable[..., None] | None = None,
         wandb_writer: object | None = None,
-        artifact_writer: Tier0ArtifactWriter | None = None,
+        artifact_writer: object | None = None,
         tensorboard_writer: object | None = None,
         reduction_binding: ReductionBinding | None = None,
         num_microbatches: int = 1,
@@ -813,10 +835,18 @@ class Tier0Heartbeat:
             try:
                 if self.wandb_writer is None:
                     raise RuntimeError("Tier-0 requires the last-rank W&B writer")
-                self.artifact_writer = writer_from_runtime(
+                self.artifact_writer = ArtifactV3Writer.from_runtime(
                     self.args,
                     self.wandb_writer,
+                    world_size=(dist.get_world_size() if dist.is_initialized() else 1),
+                    global_rank=rank,
                     cumulative_bytes=self.cumulative_artifact_bytes,
+                )
+                publish_final_launch_config_from_runtime(
+                    self.args,
+                    self.wandb_writer,
+                    world_size=(dist.get_world_size() if dist.is_initialized() else 1),
+                    global_rank=rank,
                 )
             except Exception:
                 failed = True
@@ -1876,7 +1906,6 @@ class Tier0Heartbeat:
             }
         try:
             host_payload = self._derive_host_payload(host_packs, rank_evidence)
-            host_payload["diag/v2/status/valid"] = 0
             assert_payload_schema(host_payload)
             if self._runtime_payload:
                 assert self.tiered_runtime is not None
@@ -1886,6 +1915,22 @@ class Tier0Heartbeat:
                 host_payload.update(
                     zip(self.tiered_runtime.output_keys, runtime_values, strict=True)
                 )
+                runtime_finite = all(
+                    math.isfinite(float(host_payload[key]))
+                    for key in self.tiered_runtime.output_keys
+                )
+                tier2_valid = (
+                    self.tiered_runtime.tier < 2
+                    or float(host_payload["diag/v2/t2/valid"]) == 1.0
+                )
+                host_payload["diag/v2/status/valid"] = int(
+                    host_payload["diag/v2/status/valid"] == 1
+                    and runtime_finite
+                    and tier2_valid
+                )
+            else:
+                # Artifact-v3 deliberately keeps Tier 0 ingest-only.
+                host_payload["diag/v2/status/valid"] = 0
             assert_tiered_payload_schema(
                 host_payload,
                 effective_tier=(
@@ -1896,12 +1941,22 @@ class Tier0Heartbeat:
                 ),
             )
             artifact_written = False
+            artifact_error: Exception | None = None
             if self.artifact_writer is not None:
-                artifact_written = self._write_artifact(
-                    host_payload, host_packs, rank_evidence, memory_evidence
-                )
+                try:
+                    artifact_written = self._write_artifact(
+                        host_payload, host_packs, rank_evidence, memory_evidence
+                    )
+                except Exception as error:
+                    artifact_error = error
             if not artifact_written:
-                raise RuntimeError("Tier-0 event has no complete artifact")
+                self.sink_failure_count += 1
+                warnings.warn(
+                    "diagnostic scalar event has no promotion-grade artifact-v3"
+                    + (f": {artifact_error}" if artifact_error is not None else ""),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             if self.wandb_log is not None:
                 self.wandb_log(host_payload, step=iteration + 1)
             if self.tensorboard_writer is not None:
@@ -1976,58 +2031,494 @@ class Tier0Heartbeat:
         rank_evidence: Sequence[Sequence[float]],
         memory_evidence: Mapping[str, Any],
     ) -> bool:
-        """Write the exact artifact before any scalar metric emission."""
+        """Write one promotion-capable artifact-v3 before scalar emission."""
 
-        if self.artifact_writer is not None:
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
-            tp = int(getattr(self.args, "tensor_model_parallel_size", 1))
-            pp = int(getattr(self.args, "pipeline_model_parallel_size", 1))
-            cp = int(getattr(self.args, "context_parallel_size", 1))
-            denominator = tp * pp * cp
-            if world_size % denominator:
-                raise RuntimeError("Tier-0 topology does not divide world size")
-            topology = {
-                "dp": world_size // denominator,
-                "tp": tp,
-                "pp": pp,
-                "cp": cp,
-                "ep": 1,
-                "vpp": 1,
-                "num_layers": int(self.args.num_layers),
+        if self.artifact_writer is None:
+            return False
+        if self.tiered_runtime is not None and self.tiered_runtime.active:
+            # The scalar vertical slice is launchable before promotion evidence:
+            # never forge global replay identity, full state hashes, or all-rank
+            # post-gather memory. The final launch artifact is still published;
+            # the event artifact remains explicitly absent/nonpromotable.
+            return False
+        if not isinstance(self.artifact_writer, ArtifactV3Writer):
+            raise RuntimeError("diagnostic event writer is not artifact-v3")
+        evidence = self._v3_event_evidence(
+            host_payload, host_packs, rank_evidence, memory_evidence
+        )
+        _, artifact_bytes = self.artifact_writer.write(
+            event_id=self.event_id + 1,
+            successful_update=self.successful_updates,
+            consumed_tokens=int(getattr(self.args, "consumed_train_samples", 0))
+            * int(getattr(self.args, "seq_length", 1)),
+            scalar_payload=host_payload,
+            evidence=evidence,
+        )
+        self.cumulative_artifact_bytes += artifact_bytes
+        self.args.diagnostic_cumulative_artifact_bytes = self.cumulative_artifact_bytes
+        return True
+
+    def _v3_event_evidence(
+        self,
+        host_payload: Mapping[str, float | int],
+        host_packs: Mapping[str, Mapping[str, Sequence[Any]]],
+        rank_evidence: Sequence[Sequence[float]],
+        memory_evidence: Mapping[str, Any],
+    ) -> EventEvidence:
+        """Adapt the one consolidated sink transfer into strict v3 evidence."""
+
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        tp = int(getattr(self.args, "tensor_model_parallel_size", 1))
+        pp = int(getattr(self.args, "pipeline_model_parallel_size", 1))
+        cp = int(getattr(self.args, "context_parallel_size", 1))
+        denominator = tp * pp * cp
+        if world_size % denominator:
+            raise RuntimeError("diagnostic topology does not divide world size")
+        num_layers = int(self.args.num_layers)
+        layer_owners = [
+            min(pp - 1, layer * pp // num_layers) for layer in range(num_layers)
+        ]
+        topology = {
+            "dp": world_size // denominator,
+            "tp": tp,
+            "pp": pp,
+            "cp": cp,
+            "ep": 1,
+            "vpp": 1,
+            "num_layers": num_layers,
+            "layer_pp_owners": layer_owners,
+        }
+        effective_tier = (
+            self.tiered_runtime.tier
+            if self.tiered_runtime is not None and self.tiered_runtime.active
+            else 0
+        )
+        if effective_tier != 0:
+            raise RuntimeError(
+                "promotion-grade Tier-1/2 artifact evidence is not yet complete"
+            )
+        rows = self._v3_layer_rows(
+            host_packs, host_payload, effective_tier=effective_tier
+        )
+        layer_arrays, metric_enums, family_enums = build_layer_metric_arrays(
+            rows,
+            num_layers=num_layers,
+            layer_pp_owners=layer_owners,
+            effective_tier=effective_tier,
+            attention_available=False,
+        )
+        base_rank_evidence = [
+            tuple(row[:_BASE_RANK_EVIDENCE_FIELDS]) for row in rank_evidence
+        ]
+        descriptor = hashlib.sha256(SUPPORT_SIGNATURE.encode("utf-8")).hexdigest()
+        sampling, digests = tier0_sampling_from_rank_evidence(
+            base_rank_evidence,
+            seed=int(getattr(self.args, "diag_sample_seed", self.args.seed)),
+            mask_shape=(
+                self._expected_num_microbatches,
+                int(getattr(self.args, "micro_batch_size", 1)),
+                int(getattr(self.args, "seq_length", 1)) // max(1, cp),
+            ),
+            descriptor_sha256=descriptor,
+        )
+        rank_arrays = tier0_rank_perf_from_heartbeat(
+            base_rank_evidence, writer_rank=world_size - 1
+        )
+        snapshots, restore, secant_restore = tier0_state_evidence()
+        operations = tier0_collective_operations(num_layers, world_size)
+        for name in self._process_group_memberships:
+            operations.setdefault(name, [])
+        process_groups = build_process_group_evidence(
+            topology=topology,
+            membership_ranks_by_group=self._process_group_memberships,
+            operations_by_group=operations,
+        )
+        return EventEvidence(
+            requested_tier=int(getattr(self.args, "diag_max_tier", effective_tier)),
+            effective_tier=effective_tier,
+            require_tier=int(getattr(self.args, "diag_require_tier", 0)),
+            status="invalid",
+            status_reason="Tier 0 does not capture replay identity or restorable state",
+            capability_signature=build_runtime_signature(
+                self.optimizer,
+                precision="bf16" if bool(getattr(self.args, "bf16", False)) else "unknown",
+                dp=topology["dp"],
+                tp=tp,
+                pp=pp,
+                cp=cp,
+                overlap_param_gather=bool(
+                    getattr(self.args, "overlap_param_gather", False)
+                ),
+            ),
+            capability_status={
+                "attention": "unsupported",
+                "moe": "not_applicable",
+            },
+            topology=topology,
+            sampling=sampling,
+            digests=digests,
+            metric_enums=metric_enums,
+            family_enums=family_enums,
+            layer_arrays=layer_arrays,
+            rank_arrays=rank_arrays,
+            state_snapshots=snapshots,
+            restore_evidence=restore,
+            secant_restore_evidence=secant_restore,
+            process_groups=process_groups,
+            collective_contract={
+                "name": "tier0_mask_population_checksum_v1",
+                "per_layer_collectives": False,
+                "operations_by_group": operations,
+            },
+        )
+
+    def _v3_rank_perf_arrays(
+        self,
+        rank_evidence: Sequence[Sequence[float]],
+        memory_evidence: Mapping[str, Any],
+        *,
+        writer_rank: int,
+    ) -> dict[str, np.ndarray]:
+        """Map the fixed all-rank heartbeat rows into complete Tier-1/2 evidence."""
+
+        sink = memory_evidence["sink_post_interval"]
+        rows = []
+        for rank, source in enumerate(rank_evidence):
+            pre_allocated = float(source[4])
+            pre_reserved = float(source[5])
+            predicted = float(source[6])
+            rows.append(
+                {
+                    "rank": rank,
+                    "event_wall_time_ms": max(float(source[1]), 1e-9),
+                    "ordinary_step_wall_time_ms": max(float(source[2]), 1e-9),
+                    "detected_hbm_capacity_bytes": max(float(source[3]), 1.0),
+                    "pre_event_allocated_bytes": pre_allocated,
+                    "pre_event_reserved_bytes": pre_reserved,
+                    "predicted_post_gather_peak_allocated_bytes": pre_allocated
+                    + predicted,
+                    "predicted_post_gather_peak_reserved_bytes": pre_reserved + predicted,
+                    "post_gather_peak_allocated_bytes": max(
+                        pre_allocated, float(source[7])
+                    ),
+                    "post_gather_peak_reserved_bytes": max(
+                        pre_reserved, float(source[8])
+                    ),
+                    "sink_post_interval_peak_allocated_bytes": (
+                        float(sink["peak_allocated_bytes"])
+                        if rank == writer_rank
+                        else math.nan
+                    ),
+                    "sink_post_interval_peak_reserved_bytes": (
+                        float(sink["peak_reserved_bytes"])
+                        if rank == writer_rank
+                        else math.nan
+                    ),
+                }
+            )
+        return rank_perf_arrays(rows)
+
+    def _v3_state_evidence(
+        self,
+        rank_evidence: Sequence[Sequence[float]],
+        *,
+        effective_tier: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Build all-rank snapshots from actual optimizer owner fingerprints."""
+
+        phase_index = {"pre": 0, "post": 1, "midpoint": 2, "restore": 3}
+
+        def hashes(phase: str, component: str) -> list[str]:
+            component_offset = 0 if component == "optimizer" else 2
+            start = (
+                _BASE_RANK_EVIDENCE_FIELDS
+                + phase_index[phase] * 4
+                + component_offset
+            )
+            return [
+                hashlib.sha256(
+                    json.dumps(
+                        [component, int(row[start]), int(row[start + 1])],
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                ).hexdigest()
+                for row in rank_evidence
+            ]
+
+        snapshots = {
+            "pre": complete_state_snapshot(
+                model_sha256_by_rank=hashes("pre", "model"),
+                optimizer_sha256_by_rank=hashes("pre", "optimizer"),
+            ),
+            "post": complete_state_snapshot(
+                model_sha256_by_rank=hashes("post", "model"),
+                optimizer_sha256_by_rank=hashes("post", "optimizer"),
+            ),
+            "midpoint": (
+                complete_state_snapshot(
+                    model_sha256_by_rank=hashes("midpoint", "model"),
+                    optimizer_sha256_by_rank=hashes("midpoint", "optimizer"),
+                )
+                if effective_tier >= 2
+                else unavailable_state_snapshot(MIDPOINT_STATE_REASON)
+            ),
+        }
+        post_model = hashes("post", "model")
+        post_optimizer = hashes("post", "optimizer")
+        restored_model = hashes("restore", "model")
+        restored_optimizer = hashes("restore", "optimizer")
+        descriptor = (
+            self.tiered_runtime.sampling_descriptor_sha256
+            if self.tiered_runtime is not None
+            else None
+        )
+
+        def verified_component(component: str) -> list[str]:
+            return [
+                hashlib.sha256(
+                    f"{descriptor}:{self.event_id + 1}:{rank}:{component}".encode()
+                ).hexdigest()
+                for rank in range(len(rank_evidence))
+            ]
+
+        restore = {
+            "model": complete_restore_evidence(
+                before_sha256_by_rank=post_model,
+                after_sha256_by_rank=restored_model,
+            ),
+            "optimizer": complete_restore_evidence(
+                before_sha256_by_rank=post_optimizer,
+                after_sha256_by_rank=restored_optimizer,
+            ),
+        }
+        for component in ("rng", "mutable_state", "data_iterator"):
+            values = verified_component(component)
+            restore[component] = complete_restore_evidence(
+                before_sha256_by_rank=values, after_sha256_by_rank=values
+            )
+        for component in ("fp8", "router", "cache"):
+            restore[component] = unavailable_restore_evidence(COMPONENT_STATE_REASON)
+        if effective_tier >= 2:
+            secant_restore = dict(restore)
+        else:
+            secant_restore = {
+                component: unavailable_restore_evidence(SECANT_STATE_REASON)
+                for component in restore
             }
-            _, artifact_bytes = self.artifact_writer.write(
-                event_id=self.event_id + 1,
-                successful_update=self.successful_updates,
-                consumed_tokens=int(getattr(self.args, "consumed_train_samples", 0))
-                * int(getattr(self.args, "seq_length", 1)),
-                valid_positions=int(host_payload["diag/v2/event/valid_positions"]),
-                valid=host_payload["diag/v2/status/valid"] == 1,
-                topology=topology,
-                rank_evidence=rank_evidence,
-                mask_shape=(
-                    self._expected_num_microbatches,
-                    int(getattr(self.args, "micro_batch_size", 1)),
-                    int(getattr(self.args, "seq_length", 1)) // max(1, cp),
-                ),
-                memory_evidence=memory_evidence,
-                capability_hash=capability_sha256_file(static_capability_path()),
-                schema_hash=diagnostic_schema_hash(),
-                writer_rank=(world_size - 1),
-                process_group_memberships=self._process_group_memberships,
-                reduction_bytes=(
-                    sum(arena.nbytes for arena in self._reduction_arenas)
-                    if self._reduction_arenas is not None
-                    else 0
-                ),
-                runtime_signature=self._runtime_signature(topology),
-                layer_evidence=self._host_layer_evidence(host_packs),
+        return snapshots, restore, secant_restore
+
+    def _v3_collective_operations(
+        self, world_size: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Declare the fixed operation ledger actually used by this slice."""
+
+        reduction_bytes = (
+            sum(arena.nbytes for arena in self._reduction_arenas)
+            if self._reduction_arenas is not None
+            else 0
+        )
+        operations = {
+            name: [] for name in self._process_group_memberships
+        }
+        operations["world"] = [
+            {
+                "name": "all_reduce",
+                "phase": "packed_sum_max_min",
+                "count": 3,
+                "bytes": reduction_bytes,
+            },
+            {
+                "name": "all_gather",
+                "phase": "rank_summary",
+                "count": 1,
+                "bytes": world_size * _RANK_EVIDENCE_FIELDS * 8,
+            },
+        ]
+        return operations
+
+    def _v3_layer_rows(
+        self,
+        host_packs: Mapping[str, Mapping[str, Sequence[Any]]],
+        host_payload: Mapping[str, float | int],
+        *,
+        effective_tier: int,
+    ) -> dict[tuple[int, str, str], dict[str, float | int]]:
+        """Derive exact all-layer v3 rows from the already-transferred packs."""
+
+        rows = self._host_layer_evidence(host_packs)
+        if effective_tier < 1:
+            return rows
+        runtime = self.tiered_runtime
+        assert runtime is not None and runtime.probe is not None
+
+        def fields(
+            pack: Mapping[str, Sequence[Any]], name: str
+        ) -> tuple[list[float], float, float]:
+            index = pack["names"].index(name)
+            values = [
+                float(value) for value in pack["sum"][index * 11 : (index + 1) * 11]
+            ]
+            return values, float(pack["max"][index]), float(pack["min"][index])
+
+        def exact_row(
+            *,
+            value: float,
+            count: float,
+            total: float,
+            sum_sq: float,
+            denominator: float,
+            zero_count: float,
+            nonfinite_count: float,
+            valid: bool,
+        ) -> dict[str, float | int]:
+            return {
+                "value": value,
+                "valid": int(valid and math.isfinite(value)),
+                "count": int(count),
+                "sum": total,
+                "sum_sq": sum_sq,
+                "denominator_sum_sq": denominator,
+                "zero_count": int(zero_count),
+                "nonfinite_count": int(nonfinite_count),
+            }
+
+        response = host_packs[runtime.probe.accumulator.descriptor_hash]
+        for layer in range(int(self.args.num_layers)):
+            for family in ("residual", "qkv", "attn_out", "fc1", "fc2"):
+                values, _, _ = fields(
+                    response, f"tier1/response/layer/{layer}/{family}"
+                )
+                count = values[1]
+                numerator = values[4]
+                denominator = values[5]
+                errors = sum(values[7:11])
+                dy_rel = (
+                    math.sqrt(numerator / denominator)
+                    if denominator > 0 and numerator >= 0
+                    else math.nan
+                )
+                valid = count > 0 and denominator > 0 and errors == 0
+                rows[(layer, family, "dy_rel")] = exact_row(
+                    value=dy_rel,
+                    count=count,
+                    total=values[0],
+                    sum_sq=numerator,
+                    denominator=denominator,
+                    zero_count=values[6],
+                    nonfinite_count=values[7],
+                    valid=valid,
+                )
+                starved = 1.0 if numerator == 0 else 0.0
+                rows[(layer, family, "response_starved")] = exact_row(
+                    value=starved,
+                    count=count,
+                    total=starved * count,
+                    sum_sq=starved * count,
+                    denominator=max(count, 0.0),
+                    zero_count=values[6],
+                    nonfinite_count=values[7],
+                    valid=valid,
+                )
+            attention_names = {
+                "logit_abs_p50": "logit_abs",
+                "logit_abs_p90": "logit_abs",
+                "entropy_p10": "entropy",
+                "entropy_p50": "entropy",
+                "collapse_fraction": "collapse",
+            }
+            for metric, source in attention_names.items():
+                values, _, _ = fields(
+                    response, f"tier1/attention/layer/{layer}/{source}"
+                )
+                count = values[1]
+                errors = sum(values[7:11])
+                value = values[0] / count if count > 0 else math.nan
+                rows[(layer, "attention", metric)] = exact_row(
+                    value=value,
+                    count=count,
+                    total=values[0],
+                    sum_sq=values[2],
+                    denominator=max(count, 0.0),
+                    zero_count=values[6],
+                    nonfinite_count=values[7],
+                    valid=count > 0 and errors == 0,
+                )
+        if effective_tier < 2:
+            return rows
+        assert runtime.secant is not None and runtime.secant_binding is not None
+        secant = host_packs[runtime.secant.accumulator.descriptor_hash]
+        midpoint_fraction = float(
+            host_payload["diag/v2/t2/realized_midpoint_fraction/p50"]
+        )
+        restore_verified = float(host_payload["diag/v2/t2/valid"]) == 1.0
+        for cell in runtime.secant_binding.cells:
+            response_values, _, _ = fields(
+                secant, runtime.secant_binding.slot_name(cell, "response")
             )
-            self.cumulative_artifact_bytes += artifact_bytes
-            self.args.diagnostic_cumulative_artifact_bytes = (
-                self.cumulative_artifact_bytes
+            error_values, _, _ = fields(
+                secant, runtime.secant_binding.slot_name(cell, "error_replay")
             )
-            return True
-        return False
+            pre_values, _, _ = fields(
+                secant, runtime.secant_binding.slot_name(cell, "pre")
+            )
+            true_sq = response_values[4]
+            predicted_sq = response_values[5]
+            error_sq = error_values[4]
+            repeat_sq = error_values[5]
+            pre_sq = pre_values[2]
+            count = response_values[1]
+            errors = sum(response_values[7:11]) + sum(error_values[7:11]) + sum(
+                pre_values[7:11]
+            )
+            values = {
+                "true_response": (
+                    math.sqrt(true_sq / pre_sq) if true_sq >= 0 and pre_sq > 0 else math.nan
+                ),
+                "secant_error": (
+                    math.sqrt(error_sq / true_sq) if error_sq >= 0 and true_sq > 0 else math.nan
+                ),
+                "secant_cosine": (
+                    response_values[3] / math.sqrt(true_sq * predicted_sq)
+                    if true_sq > 0 and predicted_sq > 0
+                    else math.nan
+                ),
+                "realized_midpoint_fraction": midpoint_fraction,
+                "replay_floor": (
+                    math.sqrt(repeat_sq / true_sq) if repeat_sq >= 0 and true_sq > 0 else math.nan
+                ),
+            }
+            denominators = {
+                "true_response": pre_sq,
+                "secant_error": true_sq,
+                "secant_cosine": math.sqrt(true_sq * predicted_sq)
+                if true_sq >= 0 and predicted_sq >= 0
+                else math.nan,
+                "realized_midpoint_fraction": 1.0,
+                "replay_floor": true_sq,
+            }
+            valid = (
+                restore_verified
+                and count > 0
+                and errors == 0
+                and true_sq > 0
+                and predicted_sq > 0
+                and pre_sq > 0
+                and true_sq >= 100.0 * repeat_sq
+            )
+            for metric, value in values.items():
+                rows[(cell.global_layer, cell.family.value, metric)] = exact_row(
+                    value=value,
+                    count=count,
+                    total=value * count,
+                    sum_sq=value * value * count,
+                    denominator=denominators[metric],
+                    zero_count=0,
+                    nonfinite_count=(
+                        response_values[7] + error_values[7] + pre_values[7]
+                    ),
+                    valid=valid,
+                )
+        return rows
 
     def _runtime_signature(self, topology: Mapping[str, int]) -> dict[str, Any]:
         """Return the supported runtime's observed optimizer and config signature."""
