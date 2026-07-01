@@ -17,7 +17,7 @@ import os
 import random
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum, StrEnum
 from typing import Any, Protocol
@@ -1521,6 +1521,9 @@ class _ValueSnapshot:
         elif type(self.original) is set:
             self.original.clear()
             self.original.update(self.contents)
+        elif type(self.original) is nullcontext:
+            vars(self.original).clear()
+            self.original.enter_result = self.contents
         return self.original
 
     def verify(self, value: Any) -> bool:
@@ -1542,6 +1545,8 @@ class _ValueSnapshot:
             )
         if type(value) is set:
             return value == self.contents
+        if type(value) is nullcontext:
+            return set(vars(value)) == {"enter_result"} and value.enter_result is self.contents
         return value is self.original
 
 
@@ -1594,14 +1599,26 @@ class _ValueSnapshotPlan:
         self.tensor_nodes: list[_ValueSnapshot] = []
         self.tensor_bytes = 0
 
-    def walk(self, value: Any) -> _ValueSnapshot:
+    def walk(self, value: Any, path: str = "model_state") -> _ValueSnapshot:
         if _is_snapshot_leaf(value):
             return _ValueSnapshot(value, value)
         identity = id(value)
         if identity in self.active:
-            raise TypeError("cyclic mutable model-state values are not supported")
+            raise TypeError(f"cyclic mutable model-state value at {path} is not supported")
         if identity in self.memo:
             return self.memo[identity]
+        if type(value) is nullcontext:
+            if set(vars(value)) != {"enter_result"}:
+                raise TypeError(f"nullcontext model state at {path} has unexpected attributes")
+            if not _is_snapshot_leaf(value.enter_result):
+                raise TypeError(
+                    f"nullcontext model state at {path} requires an immutable enter_result; "
+                    f"got {type(value.enter_result).__module__}."
+                    f"{type(value.enter_result).__qualname__}"
+                )
+            node = _ValueSnapshot(value, value.enter_result)
+            self.memo[identity] = node
+            return node
         if isinstance(value, torch.Tensor):
             facts = _snapshot_tensor_facts(value)
             storage = value.untyped_storage()
@@ -1633,7 +1650,10 @@ class _ValueSnapshotPlan:
             self.tensor_nodes.append(node)
             return node
         if type(value) not in (list, tuple, dict, OrderedDict, set):
-            raise TypeError(f"unsupported mutable model-state value: {type(value).__qualname__}")
+            raise TypeError(
+                f"unsupported mutable model-state value at {path}: "
+                f"{type(value).__module__}.{type(value).__qualname__}"
+            )
         if type(value) in (dict, OrderedDict) and any(not _is_snapshot_key(key) for key in value):
             raise TypeError("mutable model-state mappings require immutable scalar keys")
         if type(value) is set and any(not _is_snapshot_key(item) for item in value):
@@ -1643,9 +1663,14 @@ class _ValueSnapshotPlan:
         self.active.add(identity)
         try:
             if type(value) in (list, tuple):
-                node.contents = tuple(self.walk(item) for item in value)
+                node.contents = tuple(
+                    self.walk(item, f"{path}[{index}]") for index, item in enumerate(value)
+                )
             elif type(value) in (dict, OrderedDict):
-                node.contents = tuple((key, self.walk(item)) for key, item in value.items())
+                node.contents = tuple(
+                    (key, self.walk(item, f"{path}[{key!r}]"))
+                    for key, item in value.items()
+                )
             else:
                 node.contents = frozenset(value)
         finally:
@@ -1761,11 +1786,14 @@ class DenseGPTStateSnapshot:
         registered: set[str] = set()
         seen: set[tuple[int, str]] = set()
         pending_buffers: list[tuple[str, torch.nn.Module, str, torch.Tensor]] = []
-        pending_attributes: list[tuple[torch.nn.Module, str, Any]] = []
-        pending_extra_states: list[tuple[torch.nn.Module, Any]] = []
+        pending_attributes: list[tuple[str, torch.nn.Module, str, Any]] = []
+        pending_extra_states: list[tuple[str, torch.nn.Module, Any]] = []
         missing_attribute = object()
         for model_index, model in enumerate(self.models):
             for module_name, module in model.named_modules():
+                module_path = f"model[{model_index}]"
+                if module_name:
+                    module_path = f"{module_path}.{module_name}"
                 self.module_maps.append((module, tuple(module._modules.items())))
                 self.buffer_maps.append((module, tuple(module._buffers)))
                 for local_name, buffer in module._buffers.items():
@@ -1794,13 +1822,19 @@ class DenseGPTStateSnapshot:
                     if identity not in seen:
                         seen.add(identity)
                         if hasattr(module, name):
-                            pending_attributes.append((module, name, getattr(module, name)))
+                            pending_attributes.append(
+                                (module_path, module, name, getattr(module, name))
+                            )
                         else:
-                            pending_attributes.append((module, name, missing_attribute))
+                            pending_attributes.append(
+                                (module_path, module, name, missing_attribute)
+                            )
                 if type(module).get_extra_state is not torch.nn.Module.get_extra_state:
                     if type(module).set_extra_state is torch.nn.Module.set_extra_state:
                         raise TypeError("model extra state has no verified restoration method")
-                    pending_extra_states.append((module, module.get_extra_state()))
+                    pending_extra_states.append(
+                        (module_path, module, module.get_extra_state())
+                    )
         missing = self.mutable_buffers - found
         if missing:
             raise ValueError(f"declared mutable model buffers were not found: {sorted(missing)}")
@@ -1818,15 +1852,28 @@ class DenseGPTStateSnapshot:
         plan = _ValueSnapshotPlan(self.maximum_tensor_bytes, self.alignment)
         self.snapshot_plan = plan
         self.buffers = [
-            (qualified, module, local_name, buffer, plan.walk(buffer))
+            (
+                qualified,
+                module,
+                local_name,
+                buffer,
+                plan.walk(buffer, f"buffer[{qualified}]"),
+            )
             for qualified, module, local_name, buffer in pending_buffers
         ]
-        for module, name, current in pending_attributes:
-            value = None if current is missing_attribute else plan.walk(current)
+        for module_path, module, name, current in pending_attributes:
+            value = (
+                None
+                if current is missing_attribute
+                else plan.walk(current, f"{module_path}.{name}")
+            )
             self.attributes.append(_AttributeSnapshot(module, name, value))
         self.extra_states = [
-            _ExtraStateSnapshot(module, plan.walk(current))
-            for module, current in pending_extra_states
+            _ExtraStateSnapshot(
+                module,
+                plan.walk(current, f"{module_path}.extra_state"),
+            )
+            for module_path, module, current in pending_extra_states
         ]
         # ReplayStateGuard captures this plan only after overlap state has
         # joined the same alias graph and byte cap.
@@ -1955,7 +2002,7 @@ class OverlapStateSnapshot:
     def capture(self, plan: _ValueSnapshotPlan) -> None:
         """Join quiescent overlap state to the shared guarded-state plan."""
 
-        for owner in self.owners:
+        for owner_index, owner in enumerate(self.owners):
             names = set(self._ATTRIBUTES)
             try:
                 names.update(vars(owner))
@@ -1967,7 +2014,7 @@ class OverlapStateSnapshot:
                     value = getattr(owner, name)
                     if name in self._ATTRIBUTES and value is not None:
                         raise ValueError(f"Tier-1 replay requires quiescent overlap state: {name}")
-                    snapshot = plan.walk(value)
+                    snapshot = plan.walk(value, f"overlap[{owner_index}].{name}")
                 self.attributes.append(_AttributeSnapshot(owner, name, snapshot))
 
     def restore(self) -> None:

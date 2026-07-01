@@ -637,6 +637,34 @@ def test_mutable_bytearray_cache_is_rejected_even_with_zero_snapshot_cap() -> No
     assert model.custom_cache == bytearray(b"abc")
 
 
+def test_transformer_block_nullcontext_state_is_restored() -> None:
+    model = _dense_gpt_stub()
+    model.decoder = torch.nn.Identity()
+    model.decoder.offload_context = contextlib.nullcontext()
+    original = model.decoder.offload_context
+    guard = ReplayStateGuard((model,), tracker_getter=lambda: _Tracker())
+
+    guard.prepare()
+    with guard:
+        original.enter_result = "changed"
+        original.replay_only = object()
+
+    assert model.decoder.offload_context is original
+    assert vars(original) == {"enter_result": None}
+
+
+def test_transformer_block_nullcontext_rejects_mutable_enter_result_with_path() -> None:
+    model = _dense_gpt_stub()
+    model.decoder = torch.nn.Identity()
+    model.decoder.offload_context = contextlib.nullcontext([])
+
+    with pytest.raises(
+        TypeError,
+        match=r"model\[0\]\.decoder\.offload_context requires an immutable enter_result",
+    ):
+        ReplayStateGuard((model,), tracker_getter=lambda: _Tracker()).prepare()
+
+
 def test_recursive_snapshot_clones_32_tensor_aliases_once_under_cap() -> None:
     model = _dense_gpt_stub()
     model.last_child = torch.nn.Identity()
