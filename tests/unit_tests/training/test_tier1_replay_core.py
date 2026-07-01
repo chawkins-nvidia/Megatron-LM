@@ -895,6 +895,8 @@ def test_pp2_noninterleaved_schedule_runs_multiple_microbatches_and_accumulation
         return output, lambda value: value
 
     def schedule(**kwargs):
+        assert type(kwargs["model"]) is list
+        assert kwargs["model"] == [model]
         for _ in range(kwargs["num_microbatches"]):
             output, reducer = kwargs["forward_step_func"](
                 kwargs["data_iterator"], kwargs["model"][0]

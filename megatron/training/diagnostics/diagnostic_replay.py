@@ -2607,7 +2607,10 @@ class NonInterleavedReplaySchedule:
         self.forward_backward_func(
             forward_step_func=replay_forward,
             data_iterator=iterator,
-            model=self.model,
+            # The canonical noninterleaved MCore schedule unwraps an exact
+            # single-item list; keep our retained binding immutable, but adapt
+            # to that public call contract here.
+            model=[self.model[0]],
             num_microbatches=plan.num_microbatches,
             seq_length=self.sequence_length,
             micro_batch_size=self.micro_batch_size,
