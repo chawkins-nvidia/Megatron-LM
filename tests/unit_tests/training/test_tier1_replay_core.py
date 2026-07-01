@@ -662,6 +662,7 @@ def test_transformer_block_nullcontext_state_is_restored() -> None:
 
 def test_exact_nullcontext_is_part_of_revalidated_execution_facts() -> None:
     engine, model, plan, probe, schedule = _dense_engine_fixture()
+    engine.cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
     model.decoder_layer.offload_context = contextlib.nullcontext()
     original = model.decoder_layer.offload_context
     schedule_calls = _count_schedule_calls(schedule)
@@ -732,7 +733,10 @@ def test_state_plan_reports_every_unsupported_model_attribute() -> None:
 def test_model_verification_reports_every_failed_attribute_path() -> None:
     model = _StatefulModel()
     guard = ReplayStateGuard(
-        (model,), mutable_buffer_names=("cache",), tracker_getter=lambda: _Tracker()
+        (model,),
+        mutable_buffer_names=("cache",),
+        tracker_getter=lambda: _Tracker(),
+        cuda_device=torch.cuda.current_device() if torch.cuda.is_available() else None,
     )
     guard.prepare()
     guard.model.restore()
@@ -1112,6 +1116,7 @@ def _count_schedule_calls(schedule):
 
 def test_engine_prepares_zero_local_selection_with_exact_event_capacity() -> None:
     engine, _model, _plan, probe, schedule = _dense_engine_fixture()
+    engine.cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
     recorded = (RecordedBatch.from_raw(_raw_batch()),)
     empty_plan = build_local_replay_plan(
         recorded,
