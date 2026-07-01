@@ -132,7 +132,9 @@ def test_capability_is_v3_tier2_and_consumes_the_complete_flattened_contract() -
         "9ca44a0a719e3a096cded95ab64d1cc6e5d3787ff4e8d47e37b069c1f8f684b6"
     )
     assert static["runtime_fields"] == list(CONSUMED_DIAGNOSTIC_CONFIG_FIELDS)
-    assert len(static["runtime_fields"]) == 48
+    assert len(static["runtime_fields"]) == 50
+    assert "diagnostic_layer_pattern" in static["runtime_fields"]
+    assert "diagnostic_include_special_layers" in static["runtime_fields"]
     assert sum(name.startswith("diag_") for name in static["runtime_fields"]) == 41
     assert payload["source_commit"] == verified_source_commit()
 

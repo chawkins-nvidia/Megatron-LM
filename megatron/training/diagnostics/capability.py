@@ -31,6 +31,8 @@ CONSUMED_DIAGNOSTIC_CONFIG_FIELDS = (
     "diagnostic_interval",
     "diagnostic_early_updates",
     "diagnostic_unsupported_policy",
+    "diagnostic_layer_pattern",
+    "diagnostic_include_special_layers",
     "diagnostic_max_extra_bytes",
     "diagnostic_dgrad_starvation_threshold",
     "diagnostic_update_starvation_threshold",
