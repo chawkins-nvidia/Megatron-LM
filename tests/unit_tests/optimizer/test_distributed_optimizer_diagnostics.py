@@ -561,14 +561,14 @@ def test_cross_lane_exact_hbm_adds_capture_scratch_and_optimizer_event_only() ->
     )
     combined_incremental_hbm = accumulator.maximum_scratch_bytes + estimate.total_bytes
 
-    assert accumulator.maximum_scratch_bytes == 1_572_864
+    assert accumulator.maximum_scratch_bytes == 100_663_296
     assert estimate.snapshot_bytes == 74
     assert estimate.post_fingerprint_bytes == 32
     assert estimate.finish_scratch_bytes == 360
     assert estimate.total_bytes == estimate.snapshot_bytes + estimate.finish_scratch_bytes == 434
-    assert combined_incremental_hbm == 1_573_298
+    assert combined_incremental_hbm == 100_663_730
     assert persistent_pack_baseline == 384
-    assert combined_incremental_hbm + persistent_pack_baseline == 1_573_682
+    assert combined_incremental_hbm + persistent_pack_baseline == 100_664_114
 
 
 def test_iterator_exposes_existing_cross_parameter_and_padding_ranges() -> None:

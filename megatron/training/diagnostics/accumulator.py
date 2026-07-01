@@ -25,7 +25,9 @@ _SUM_FIELDS = (
     "observation_error",
 )
 _SUM_FIELD_COUNT = len(_SUM_FIELDS)
-_DEFAULT_SCRATCH_ELEMENT_CAPACITY = 16 * 1024
+DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY = 1024 * 1024
+"""Default fixed moment-workspace capacity (1,048,576 logical elements)."""
+
 _MAX_SCRATCH_BYTES_PER_ELEMENT = 96
 
 
@@ -238,7 +240,7 @@ class PackedSufficientStatistics:
         descriptor_hash: str,
         reduction_binding: ReductionBinding,
         schema_identity: str = SCHEMA_PREFIX.rstrip("/"),
-        scratch_element_capacity: int = _DEFAULT_SCRATCH_ELEMENT_CAPACITY,
+        scratch_element_capacity: int = DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY,
     ) -> None:
         """Allocate neutral packed buffers in a stable slot order.
 
@@ -345,7 +347,7 @@ class PackedSufficientStatistics:
 
     @staticmethod
     def scratch_bytes_for_capacity(
-        scratch_element_capacity: int = _DEFAULT_SCRATCH_ELEMENT_CAPACITY,
+        scratch_element_capacity: int = DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY,
     ) -> int:
         """Compute the exact HBM-preflight scratch ceiling without allocating it.
 

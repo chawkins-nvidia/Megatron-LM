@@ -12,6 +12,7 @@ _EXPORT_MODULES = {
     "Bf16DistributedOptimizerDiagnosticAdapter": "distributed_optimizer",
     "CanonicalDgradNormalizer": "normalization",
     "CaptureTopology": "capture",
+    "DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY": "accumulator",
     "DeviceMemoryState": "distributed_optimizer",
     "DerivedStatistic": "accumulator",
     "DenominatorKind": "registry",

@@ -18,7 +18,12 @@ import torch.distributed as dist
 from megatron.core.diagnostics import diagnostic_attention_observer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
-from .accumulator import PackedSlots, PackedSufficientStatistics, ReductionBinding
+from .accumulator import (
+    DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY,
+    PackedSlots,
+    PackedSufficientStatistics,
+    ReductionBinding,
+)
 from .registry import (
     DenominatorKind,
     MaskKind,
@@ -365,7 +370,7 @@ class FunctionResponseProbe:
         attention_required: bool = True,
         retain_secant_endpoints: bool = False,
         reduction_binding: ReductionBinding | None = None,
-        scratch_element_capacity: int = 16 * 1024,
+        scratch_element_capacity: int = DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY,
     ) -> None:
         if expected_hook_calls < 0 or scratch_element_capacity <= 0:
             raise ValueError("response hook counts and scratch capacity must be valid")

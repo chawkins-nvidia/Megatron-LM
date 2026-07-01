@@ -8,7 +8,10 @@ import pytest
 import torch
 
 from megatron.core.diagnostics import observe_diagnostic_attention
-from megatron.training.diagnostics.accumulator import ReductionBinding
+from megatron.training.diagnostics.accumulator import (
+    DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY,
+    ReductionBinding,
+)
 from megatron.training.diagnostics.function_response import (
     RESPONSE_FAMILIES,
     TIER1_KEYS,
@@ -454,3 +457,20 @@ def test_descriptor_hash_is_global_and_independent_of_local_ownership() -> None:
 def test_canonical_accumulator_scratch_bound_is_used() -> None:
     probe, _modules = _probe(2)
     assert probe.maximum_accumulator_scratch_bytes == 2 * 96
+
+
+def test_function_response_default_uses_shared_96_mib_moment_bound() -> None:
+    descriptors, _modules = _descriptors(1)
+    probe = FunctionResponseProbe(
+        descriptors,
+        global_layers=1,
+        device="cpu",
+        expected_hook_calls=0,
+        reduction_binding=ReductionBinding.flat_world(None),
+    )
+
+    assert (
+        probe.accumulator.statistics.scratch_element_capacity
+        == DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY
+    )
+    assert probe.maximum_accumulator_scratch_bytes == 96 * 1024**2

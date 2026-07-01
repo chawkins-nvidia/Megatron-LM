@@ -37,6 +37,7 @@ from megatron.training.diagnostics.tier0 import (
 from megatron.training.global_vars import wandb_writer_rank
 
 from megatron.training.diagnostics.accumulator import (  # isort: skip
+    DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY,
     PackedSufficientStatistics,
     ReductionBinding,
 )
@@ -580,7 +581,7 @@ def _independent_tier0_reservation_ledger(
         ),
         "optimizer_adapter_event_status": 8,
         "retained_optimizer_capability_flags": 15 * 8,
-        "capture_workspace": 16 * 1024 * 96,
+        "capture_workspace": DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY * 96,
         "capture_runtime_status": 8,
         "capture_runtime_error": 8,
         "capture_mask_finite": mask_elements,
@@ -627,8 +628,8 @@ def test_pure_startup_reservation_is_bounded_at_world_size_1024() -> None:
     assert requested == repeated
     assert requested >= independently_required
     assert requested == independently_required
-    assert requested > 600_000_000
-    assert requested < 700_000_000
+    assert requested > 700_000_000
+    assert requested < 800_000_000
 
 
 def test_minimal_startup_reservation_covers_independent_named_storage() -> None:

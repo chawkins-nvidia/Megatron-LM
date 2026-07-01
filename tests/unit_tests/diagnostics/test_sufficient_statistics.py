@@ -8,7 +8,11 @@ import torch
 import torch.distributed as dist
 
 import megatron.training.diagnostics.accumulator as accumulator_module
-from megatron.training.diagnostics.accumulator import PackedSufficientStatistics, ReductionBinding
+from megatron.training.diagnostics.accumulator import (
+    DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY,
+    PackedSufficientStatistics,
+    ReductionBinding,
+)
 from megatron.training.diagnostics.schema import Tier0Reason
 
 
@@ -329,6 +333,40 @@ def test_tensor_moment_scratch_is_bounded_independently_of_observation_size(nume
         assert accumulator.peak_scratch_bytes == accumulator.maximum_scratch_bytes
     reference = values.float().square().mean(dtype=torch.float64).sqrt()
     torch.testing.assert_close(accumulator.rms("bounded").value, reference)
+
+
+def test_default_moment_workspace_is_96_mib_and_chunk_equivalent() -> None:
+    assert DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY == 1_048_576
+    assert PackedSufficientStatistics.scratch_bytes_for_capacity() == 96 * 1024**2
+
+    values = torch.linspace(-3.0, 5.0, 4097, dtype=torch.bfloat16)
+    mask = (torch.arange(values.numel()) % 3 != 0).to(dtype=torch.float32)
+    before = torch.linspace(-1.0, 2.0, values.numel(), dtype=torch.bfloat16)
+    after = before + torch.tensor(0.125, dtype=torch.bfloat16)
+
+    def accumulate(capacity: int) -> PackedSufficientStatistics:
+        accumulator = PackedSufficientStatistics(
+            ("moments", "update"),
+            "cpu",
+            descriptor_hash=f"chunk-equivalence-{capacity}",
+            reduction_binding=ReductionBinding.flat_world(None),
+            scratch_element_capacity=capacity,
+        )
+        workspace = torch.empty(accumulator.maximum_scratch_bytes, dtype=torch.uint8)
+        accumulator.bind_workspace(workspace)
+        accumulator.add_masked_tensor("moments", values, mask=mask)
+        accumulator.add_update("update", before, after)
+        return accumulator.finalize_local_()
+
+    chunked = accumulate(257)
+    default = accumulate(DEFAULT_MOMENT_SCRATCH_ELEMENT_CAPACITY)
+    torch.testing.assert_close(chunked.sum_pack, default.sum_pack, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(chunked.max_pack, default.max_pack, rtol=0, atol=0)
+    torch.testing.assert_close(chunked.min_pack, default.min_pack, rtol=0, atol=0)
+    torch.testing.assert_close(chunked.rms("moments").value, default.rms("moments").value)
+    torch.testing.assert_close(
+        chunked.relative_rms("update").value, default.relative_rms("update").value
+    )
 
 
 def test_update_scratch_bound_covers_chunked_delta_without_full_size_temporary() -> None:
