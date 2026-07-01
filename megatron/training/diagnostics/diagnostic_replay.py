@@ -2996,6 +2996,14 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
+    allowed_child_types: tuple[type, ...] = ()
+    try:
+        from transformer_engine.pytorch import RMSNorm as TransformerEngineRMSNorm
+
+        allowed_child_types = (TransformerEngineRMSNorm,)
+    except (AttributeError, ImportError):
+        pass
+
     allowed_prefixes = (
         "megatron.core.models.common.",
         "megatron.core.models.gpt.",
@@ -3076,9 +3084,12 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
         if hasattr(model, "transformer_layer_spec"):
             validate_spec_value(model.transformer_layer_spec)
         for module in model.modules():
-            if not type(module).__module__.startswith(allowed_prefixes):
+            if type(module) not in allowed_child_types and not type(module).__module__.startswith(
+                allowed_prefixes
+            ):
                 raise TypeError(
-                    f"Tier-1 replay rejects unsupported child module {type(module).__qualname__}"
+                    "Tier-1 replay rejects unsupported child module "
+                    f"{type(module).__module__}.{type(module).__qualname__}"
                 )
             if type(module) is TransformerLayer:
                 if getattr(module, "is_moe_layer", False):

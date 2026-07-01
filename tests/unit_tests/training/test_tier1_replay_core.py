@@ -867,6 +867,19 @@ def test_dense_gpt_spec_accepts_complete_local_rmsnorm_spec() -> None:
     _validate_dense_gpt_models((model,))
 
 
+def test_dense_gpt_children_accept_transformer_engine_final_rmsnorm() -> None:
+    from megatron.core.extensions.transformer_engine import HAVE_TE, TENorm
+
+    if not HAVE_TE:
+        pytest.skip("Transformer Engine is not installed")
+
+    model = _dense_gpt_stub()
+    model.config.normalization = "RMSNorm"
+    model.final_layernorm = TENorm(config=model.config, hidden_size=model.config.hidden_size)
+
+    _validate_dense_gpt_models((model,))
+
+
 def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):
     model = _dense_gpt_stub()
     model.config.gated_linear_unit = gated
