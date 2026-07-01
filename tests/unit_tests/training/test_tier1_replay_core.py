@@ -1429,7 +1429,7 @@ def test_qkv_response_width_covers_gqa_tp_and_output_gate(
 
 
 def test_engine_binds_and_observes_real_r4_gqa_qkv_layout() -> None:
-    engine, model, _plan, probe, schedule = _dense_engine_fixture()
+    engine, model, _fixture_plan, probe, schedule = _dense_engine_fixture()
     model.config.hidden_size = 1024
     model.config.ffn_hidden_size = 4096
     model.config.num_attention_heads = 8
@@ -1474,9 +1474,10 @@ def test_engine_rejects_module_projection_width_drift_before_schedule() -> None:
     engine, model, plan, probe, schedule = _dense_engine_fixture()
     model.decoder_layer.self_attention.linear_qkv.output_size_per_partition -= 1
 
-    with pytest.raises(ReplayPreflightError, match="qkv module width disagrees"):
+    with pytest.raises(ReplayPreflightError, match="failed collectively") as caught:
         _prepare_fixture(engine, plan, probe, schedule)
 
+    assert "qkv module width disagrees" in str(caught.value.__cause__)
     assert not schedule.p2p_started
 
 
