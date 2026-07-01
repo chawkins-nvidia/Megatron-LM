@@ -288,6 +288,43 @@ def test_successful_adapter_mutations_are_idempotent_and_phase_bound() -> None:
     )
 
 
+def test_post_transform_commit_failure_is_terminal_and_retry_cannot_install(monkeypatch) -> None:
+    optimizer, parameters = _fake_optimizer()
+    adapter, _ = _adapter(optimizer, parameters, finish_chunk_elements=2)
+    assert adapter.begin_event() is not None
+    _apply_step_and_materialize(adapter, optimizer, amount=0.5)
+    expected_post = tuple(shard.model_shard.clone() for shard in adapter.iter_owner_shards())
+    original_transform = adapter._transform_pre_to_delta
+    transform_calls = 0
+
+    def fail_after_transform(snapshot, shards, scratch):
+        nonlocal transform_calls
+        transform_calls += 1
+        original_transform(snapshot, shards, scratch)
+        raise RuntimeError("injected post-transform failure")
+
+    monkeypatch.setattr(adapter, "_transform_pre_to_delta", fail_after_transform)
+    assert adapter.commit_secant_delta(update_successful=True) is None
+    assert transform_calls == 1
+    assert adapter.local_status.item() == DistributedOptimizerEventStatus.SECANT_DELTA_FAILED
+    assert not adapter.secant_delta_ready
+    assert adapter.secant_delta_buffer is None
+    failed_delta_bytes = adapter._snapshot.master_before.view(torch.uint8).clone()
+
+    assert adapter.commit_secant_delta(update_successful=True) is None
+    assert transform_calls == 1
+    assert adapter.local_status.item() == DistributedOptimizerEventStatus.SECANT_DELTA_FAILED
+    assert torch.equal(adapter._snapshot.master_before.view(torch.uint8), failed_delta_bytes)
+
+    adapter.install_secant_midpoint()
+    assert adapter.local_status.item() == DistributedOptimizerEventStatus.SECANT_DELTA_FAILED
+    assert torch.equal(adapter._snapshot.master_before.view(torch.uint8), failed_delta_bytes)
+    assert all(
+        torch.equal(shard.model_shard, expected)
+        for shard, expected in zip(adapter.iter_owner_shards(), expected_post)
+    )
+
+
 def test_invalid_adapter_ordering_rejects_before_weight_mutation() -> None:
     optimizer, parameters = _fake_optimizer()
     adapter, _ = _adapter(optimizer, parameters)
@@ -305,7 +342,7 @@ def test_invalid_adapter_ordering_rejects_before_weight_mutation() -> None:
 
 def test_authoritative_secant_estimate_composes_with_adapter_without_double_counting() -> None:
     optimizer, parameters = _fake_optimizer()
-    adapter, _ = _adapter(optimizer, parameters, finish_chunk_elements=2)
+    adapter, _ = _adapter(optimizer, parameters, finish_chunk_elements=2, max_extra_bytes=2_000_000)
     adapter_estimate = adapter.estimate_snapshot_memory()
     estimate = SecantMemoryEstimate.calculate(
         SecantMemoryInputs(

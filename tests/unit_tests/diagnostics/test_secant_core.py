@@ -437,7 +437,11 @@ def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(dp, tp
     assert estimate.bf16_pre_bytes == 16_128
     assert estimate.packed_statistics_bytes == 28_928
     assert estimate.reduction_arena_bytes == estimate.packed_statistics_bytes
-    assert estimate.chunk_workspace_bytes == estimate.bounded_accumulation_workspace_bytes
+    assert estimate.chunk_workspace_bytes == max(
+        estimate.bounded_accumulation_workspace_bytes,
+        estimate.owner_hash_restore_workspace_bytes,
+        estimate.quantile_sink_workspace_bytes,
+    )
     assert estimate.owner_hash_restore_workspace_bytes > 0
     assert estimate.quantile_sink_workspace_bytes > 0
     assert estimate.retained_bytes == (
@@ -455,6 +459,109 @@ def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(dp, tp
     assert estimate.peak_bytes == (
         estimate.retained_bytes + estimate.allocator_headroom_bytes + estimate.driver_headroom_bytes
     )
+
+
+def test_memory_estimate_covers_independent_100_cell_derived_and_quantile_live_graph() -> None:
+    row = torch.tensor(
+        (4.0, 4.0, 0.04, 4.0, 1.0, 1.0e-6, 10.0, 0.0, 0.0, 1.0, 4.0), dtype=torch.float64
+    )
+    source_pack = row.repeat(100, 1)
+    metrics = []
+    for cell in source_pack:
+        statistics = SecantSufficientStatisticsView(
+            true_sq=cell[0],
+            predicted_sq=cell[1],
+            error_sq=cell[2],
+            true_predicted_dot=cell[3],
+            pre_sq=cell[4],
+            repeat_error_sq=cell[5],
+            count=cell[6],
+            nonfinite=cell[7],
+            contract_error=cell[8],
+        )
+        metrics.append(
+            derive_secant_cell(
+                statistics,
+                midpoint_displacement_sq=cell[9],
+                full_displacement_sq=cell[10],
+                restore_verified=True,
+            )
+        )
+
+    derived_fields = tuple(
+        getattr(metric, field)
+        for metric in metrics
+        for field in (
+            "true_response",
+            "secant_error",
+            "secant_cosine",
+            "realized_midpoint_fraction",
+            "replay_floor",
+            "valid",
+            "status",
+        )
+    )
+    derived_storages = {
+        (tensor.untyped_storage().data_ptr(), tensor.untyped_storage().nbytes())
+        for tensor in derived_fields
+    }
+    assert len(derived_storages) == 700
+    assert sum(size for _, size in derived_storages) == 4_900
+
+    cell_stack = torch.stack(tuple(metric.true_response for metric in metrics))
+    sorted_values, sort_indices = torch.sort(cell_stack)
+    cell_bool = torch.stack(tuple(metric.valid for metric in metrics))
+    outputs = derive_tier2_outputs(metrics)
+    live_tensors = (
+        *derived_fields,
+        cell_stack,
+        sorted_values,
+        sort_indices,
+        cell_bool,
+        *outputs.values(),
+    )
+    live_storages = {
+        (tensor.untyped_storage().data_ptr(), tensor.untyped_storage().nbytes())
+        for tensor in live_tensors
+    }
+    review_minimum_live_bytes = sum(size for _, size in live_storages)
+    assert review_minimum_live_bytes == 7_536
+
+    estimate = SecantMemoryEstimate.calculate(
+        SecantMemoryInputs(
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            context_parallel_size=1,
+            loaded_owner_elements_by_rank=(0,),
+            tied_alias_elements_by_rank=(0,),
+            replay_payload_bytes=0,
+            replay_mask_bytes=0,
+            replay_state_bytes=0,
+            replay_cap_bytes=0,
+            registry_slots=300,
+            chunk_elements=1,
+            alignment_bytes=256,
+            allocator_headroom_fraction=0.0,
+            driver_headroom_fraction=0.0,
+        ),
+        optimizer_layout=SecantOptimizerLayout(),
+    )
+    declared_alignment_and_scalar_workspace = (
+        estimate.derived_metric_storage_bytes
+        + estimate.quantile_cell_workspace_bytes
+        + estimate.tier2_output_storage_bytes
+        + estimate.quantile_scalar_workspace_bytes
+        - review_minimum_live_bytes
+    )
+    assert estimate.quantile_sink_workspace_bytes == (
+        review_minimum_live_bytes
+        + declared_alignment_and_scalar_workspace
+        + estimate.sort_backend_workspace_bytes
+    )
+    assert estimate.quantile_sink_workspace_bytes > 2_828
+    assert estimate.allocator_headroom_bytes == 0
+    assert estimate.driver_headroom_bytes == 0
 
 
 def test_memory_estimator_rejects_cap_and_unsupported_layout_fail_closed() -> None:

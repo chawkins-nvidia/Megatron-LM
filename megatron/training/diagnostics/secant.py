@@ -34,6 +34,13 @@ _OWNER_FINISH_BYTES_PER_ELEMENT = 2 + 4 * 4 + 2 * 8 + 2
 _OWNER_FINISH_SCALAR_BYTES = 104
 _MAX_REPRESENTABLE_BYTES = (1 << 63) - 1
 _TIER2_OUTPUT_SCALAR_COUNT = 17
+_TIER2_QUANTILE_COUNT = 3
+_TIER2_METRIC_COUNT = 5
+# Admission reserves a conservative backend sort ceiling: four full value/index
+# pairs per cell plus a fixed 1 MiB launch/scan allowance. This remains explicit
+# even when allocator and driver headroom are configured to zero.
+_SORT_BACKEND_FIXED_WORKSPACE_BYTES = 1 << 20
+_SORT_BACKEND_WORKSPACE_BYTES_PER_CELL = 64
 
 TIER2_OUTPUT_KEYS: tuple[str, ...] = (
     "diag/v2/t2/true_response/p10",
@@ -971,6 +978,11 @@ class SecantMemoryEstimate:
     reduction_arena_bytes: int
     bounded_accumulation_workspace_bytes: int
     owner_hash_restore_workspace_bytes: int
+    derived_metric_storage_bytes: int
+    quantile_cell_workspace_bytes: int
+    tier2_output_storage_bytes: int
+    quantile_scalar_workspace_bytes: int
+    sort_backend_workspace_bytes: int
     quantile_sink_workspace_bytes: int
     chunk_workspace_bytes: int
     retained_bytes: int
@@ -1102,8 +1114,27 @@ class SecantMemoryEstimate:
             chunk * _OWNER_FINISH_BYTES_PER_ELEMENT + _OWNER_FINISH_SCALAR_BYTES
         )
         cell_count = inputs.registry_slots // len(_SECANT_SLOT_SUFFIXES)
-        quantile_sink_workspace = align(
-            cell_count * (3 * 8 + 1) + (_TIER2_OUTPUT_SCALAR_COUNT + 24) * 8
+        derived_metric_storage = cell_count * (_TIER2_METRIC_COUNT * align(8) + align(1) + align(8))
+        quantile_cell_workspace = (
+            align(cell_count * 8)
+            + align(cell_count * 8)
+            + align(cell_count * 8)
+            + align(cell_count)
+        )
+        tier2_output_storage = _TIER2_METRIC_COUNT * align(_TIER2_QUANTILE_COUNT * 8) + (
+            _TIER2_OUTPUT_SCALAR_COUNT - _TIER2_METRIC_COUNT * _TIER2_QUANTILE_COUNT
+        ) * align(8)
+        quantile_scalar_workspace = 24 * align(8)
+        sort_backend_workspace = align(
+            _SORT_BACKEND_FIXED_WORKSPACE_BYTES
+            + _SORT_BACKEND_WORKSPACE_BYTES_PER_CELL * cell_count
+        )
+        quantile_sink_workspace = (
+            derived_metric_storage
+            + quantile_cell_workspace
+            + tier2_output_storage
+            + quantile_scalar_workspace
+            + sort_backend_workspace
         )
         workspace = max(secant_math_workspace, owner_finish_workspace, quantile_sink_workspace)
         retained = (
@@ -1149,6 +1180,11 @@ class SecantMemoryEstimate:
             reduction_arena_bytes=reduction_arena,
             bounded_accumulation_workspace_bytes=secant_math_workspace,
             owner_hash_restore_workspace_bytes=owner_finish_workspace,
+            derived_metric_storage_bytes=derived_metric_storage,
+            quantile_cell_workspace_bytes=quantile_cell_workspace,
+            tier2_output_storage_bytes=tier2_output_storage,
+            quantile_scalar_workspace_bytes=quantile_scalar_workspace,
+            sort_backend_workspace_bytes=sort_backend_workspace,
             quantile_sink_workspace_bytes=quantile_sink_workspace,
             chunk_workspace_bytes=workspace,
             retained_bytes=retained,

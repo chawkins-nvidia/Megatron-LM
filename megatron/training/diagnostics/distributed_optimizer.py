@@ -79,9 +79,11 @@ class DistributedOptimizerEventStatus(IntEnum):
 
 class _SecantAdapterPhase(IntEnum):
     ARMED = 0
-    DELTA_COMMITTED = 1
-    MIDPOINT_INSTALLED = 2
-    RESTORED = 3
+    DELTA_COMMITTING = 1
+    DELTA_COMMITTED = 2
+    MIDPOINT_INSTALLED = 3
+    RESTORED = 4
+    FAILED = 5
 
 
 class SnapshotMemoryReason(IntEnum):
@@ -234,7 +236,11 @@ class _SnapshotState:
 
     @property
     def delta_ready(self) -> bool:
-        return self.phase >= _SecantAdapterPhase.DELTA_COMMITTED
+        return self.phase in (
+            _SecantAdapterPhase.DELTA_COMMITTED,
+            _SecantAdapterPhase.MIDPOINT_INSTALLED,
+            _SecantAdapterPhase.RESTORED,
+        )
 
     @property
     def midpoint_installed(self) -> bool:
@@ -898,8 +904,14 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         if snapshot is None:
             self._set_status(DistributedOptimizerEventStatus.SECANT_DELTA_NOT_ARMED)
             return None
-        if snapshot.phase >= _SecantAdapterPhase.DELTA_COMMITTED:
+        if snapshot.phase in (
+            _SecantAdapterPhase.DELTA_COMMITTED,
+            _SecantAdapterPhase.MIDPOINT_INSTALLED,
+            _SecantAdapterPhase.RESTORED,
+        ):
             return snapshot.commit_measurement
+        if snapshot.phase in (_SecantAdapterPhase.DELTA_COMMITTING, _SecantAdapterPhase.FAILED):
+            return None
         if snapshot.phase != _SecantAdapterPhase.ARMED:
             self._set_status(DistributedOptimizerEventStatus.SECANT_INVALID_PHASE)
             return None
@@ -919,6 +931,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
 
             scratch = self._allocate_finish_scratch(snapshot.master_before.device)
             try:
+                snapshot.phase = _SecantAdapterPhase.DELTA_COMMITTING
                 self._verify_materialization(current_shards, scratch)
                 torch.eq(
                     self._status,
@@ -957,15 +970,19 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
                         current_shards[index].model_shard.detach().view(-1)
                     )
                 self._transform_pre_to_delta(snapshot, current_shards, scratch)
-                snapshot.phase = _SecantAdapterPhase.DELTA_COMMITTED
                 measurement = self._measurement_with_peak(snapshot, snapshot.master_before.device)
-                if measurement is not None:
-                    snapshot.measurement = measurement
-                snapshot.commit_measurement = measurement
-                return measurement
+                if measurement is None:
+                    snapshot.phase = _SecantAdapterPhase.FAILED
+                    return None
             finally:
                 self._clear_finish_scratch(scratch)
+            snapshot.measurement = measurement
+            snapshot.commit_measurement = measurement
+            snapshot.phase = _SecantAdapterPhase.DELTA_COMMITTED
+            return measurement
         except Exception:
+            if snapshot.phase == _SecantAdapterPhase.DELTA_COMMITTING:
+                snapshot.phase = _SecantAdapterPhase.FAILED
             self._set_status(DistributedOptimizerEventStatus.SECANT_DELTA_FAILED)
             return None
 
@@ -981,7 +998,9 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         if snapshot is None:
             self._set_status(DistributedOptimizerEventStatus.SECANT_MIDPOINT_UNAVAILABLE)
             return self._status
-        if snapshot.phase >= _SecantAdapterPhase.MIDPOINT_INSTALLED:
+        if snapshot.phase in (_SecantAdapterPhase.DELTA_COMMITTING, _SecantAdapterPhase.FAILED):
+            return self._status
+        if snapshot.phase in (_SecantAdapterPhase.MIDPOINT_INSTALLED, _SecantAdapterPhase.RESTORED):
             return self._status
         if snapshot.phase != _SecantAdapterPhase.DELTA_COMMITTED:
             self._set_status(DistributedOptimizerEventStatus.SECANT_INVALID_PHASE)
@@ -1026,6 +1045,8 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         snapshot = self._snapshot
         if snapshot is None:
             self._set_status(DistributedOptimizerEventStatus.SECANT_MIDPOINT_UNAVAILABLE)
+            return self._status
+        if snapshot.phase in (_SecantAdapterPhase.DELTA_COMMITTING, _SecantAdapterPhase.FAILED):
             return self._status
         if snapshot.phase == _SecantAdapterPhase.RESTORED:
             return self._status
