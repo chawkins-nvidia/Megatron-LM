@@ -27,7 +27,9 @@ from .registry import (
 )
 
 _SECANT_SLOT_SUFFIXES = ("response", "error_replay", "pre")
-_PACKED_BYTES_PER_SLOT = 11 * 8 + 2 * 4
+_PACKED_SUM_BYTES_PER_SLOT = 11 * 8
+_PACKED_MAX_BYTES_PER_SLOT = 4
+_PACKED_MIN_BYTES_PER_SLOT = 4
 _CANONICAL_SCRATCH_BYTES_PER_ELEMENT = 96
 _SECANT_INPUT_AND_MATH_BYTES_PER_ELEMENT = 16 * 4
 _OWNER_FINISH_BYTES_PER_ELEMENT = 2 + 4 * 4 + 2 * 8 + 2
@@ -1103,8 +1105,17 @@ class SecantMemoryEstimate:
         replay_cap_reserve = max(
             0, align(inputs.replay_cap_bytes) - replay_payload - replay_mask - replay_state
         )
-        packs = align(inputs.registry_slots * _PACKED_BYTES_PER_SLOT)
-        reduction_arena = align(inputs.registry_slots * _PACKED_BYTES_PER_SLOT)
+        # PackedSufficientStatistics and reduce_many_ each own three simultaneous
+        # allocations. Apply alignment to the real SUM, MAX, and MIN tensors rather
+        # than to their aggregate logical bytes.
+        persistent_sum_pack = align(inputs.registry_slots * _PACKED_SUM_BYTES_PER_SLOT)
+        persistent_max_pack = align(inputs.registry_slots * _PACKED_MAX_BYTES_PER_SLOT)
+        persistent_min_pack = align(inputs.registry_slots * _PACKED_MIN_BYTES_PER_SLOT)
+        packs = persistent_sum_pack + persistent_max_pack + persistent_min_pack
+        reduction_sum_arena = align(inputs.registry_slots * _PACKED_SUM_BYTES_PER_SLOT)
+        reduction_max_arena = align(inputs.registry_slots * _PACKED_MAX_BYTES_PER_SLOT)
+        reduction_min_arena = align(inputs.registry_slots * _PACKED_MIN_BYTES_PER_SLOT)
+        reduction_arena = reduction_sum_arena + reduction_max_arena + reduction_min_arena
         chunk = min(unique, inputs.chunk_elements)
         secant_math_workspace = align(
             chunk
@@ -1136,7 +1147,12 @@ class SecantMemoryEstimate:
             + quantile_scalar_workspace
             + sort_backend_workspace
         )
-        workspace = max(secant_math_workspace, owner_finish_workspace, quantile_sink_workspace)
+        # The reduction arena is released before derivation and quantile/sink work.
+        # Keep the phase maximum explicit so each simultaneously-live graph stands
+        # on its own rather than relying on slack from a non-live phase.
+        workspace = max(
+            reduction_arena, secant_math_workspace, owner_finish_workspace, quantile_sink_workspace
+        )
         retained = (
             fp32
             + bf16
@@ -1146,7 +1162,6 @@ class SecantMemoryEstimate:
             + replay_state
             + replay_cap_reserve
             + packs
-            + reduction_arena
             + workspace
         )
         if retained > _MAX_REPRESENTABLE_BYTES:

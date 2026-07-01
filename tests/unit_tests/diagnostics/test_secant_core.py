@@ -435,9 +435,10 @@ def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(dp, tp
     assert estimate.unique_owner_elements == 8_000
     assert estimate.fp32_pre_or_delta_bytes == 32_000
     assert estimate.bf16_pre_bytes == 16_128
-    assert estimate.packed_statistics_bytes == 28_928
+    assert estimate.packed_statistics_bytes == 29_184
     assert estimate.reduction_arena_bytes == estimate.packed_statistics_bytes
     assert estimate.chunk_workspace_bytes == max(
+        estimate.reduction_arena_bytes,
         estimate.bounded_accumulation_workspace_bytes,
         estimate.owner_hash_restore_workspace_bytes,
         estimate.quantile_sink_workspace_bytes,
@@ -453,12 +454,89 @@ def test_world_1024_memory_bound_uses_max_loaded_shard_and_tied_ownership(dp, tp
         + estimate.replay_state_bytes
         + estimate.replay_cap_reserve_bytes
         + estimate.packed_statistics_bytes
-        + estimate.reduction_arena_bytes
         + estimate.chunk_workspace_bytes
     )
     assert estimate.peak_bytes == (
         estimate.retained_bytes + estimate.allocator_headroom_bytes + estimate.driver_headroom_bytes
     )
+
+
+@pytest.mark.parametrize(
+    ("alignment", "cell_count", "expected_pack_bytes", "expected_peak_bytes"),
+    (
+        (256, 1, 1_024, 1_060_864),
+        (256, 100, 29_184, 1_274_880),
+        (256, 4_252_361_473_883_687, 1_224_680_104_478_502_144, 9_223_372_036_854_775_040),
+        (512, 1, 1_536, 1_072_640),
+        (512, 100, 29_696, 1_463_296),
+        (512, 2_328_546_335_989_322, 670_621_344_764_925_440, 9_223_372_036_854_772_224),
+    ),
+)
+def test_zero_headroom_memory_estimate_aligns_each_pack_allocation_and_composes_live_phases(
+    alignment, cell_count, expected_pack_bytes, expected_peak_bytes
+) -> None:
+    inputs = SecantMemoryInputs(
+        data_parallel_size=1,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        context_parallel_size=1,
+        loaded_owner_elements_by_rank=(0,),
+        tied_alias_elements_by_rank=(0,),
+        replay_payload_bytes=0,
+        replay_mask_bytes=0,
+        replay_state_bytes=0,
+        replay_cap_bytes=0,
+        registry_slots=3 * cell_count,
+        chunk_elements=1,
+        alignment_bytes=alignment,
+        allocator_headroom_fraction=0.0,
+        driver_headroom_fraction=0.0,
+    )
+
+    estimate = SecantMemoryEstimate.calculate(inputs, optimizer_layout=SecantOptimizerLayout())
+
+    slots = 3 * cell_count
+
+    def align(value: int) -> int:
+        return (value + alignment - 1) // alignment * alignment
+
+    independently_aligned_pack = align(88 * slots) + align(4 * slots) + align(4 * slots)
+    assert independently_aligned_pack == expected_pack_bytes
+    assert estimate.packed_statistics_bytes == independently_aligned_pack
+    assert estimate.reduction_arena_bytes == independently_aligned_pack
+    if alignment == 512 and cell_count == 1:
+        assert estimate.packed_statistics_bytes == 1_536
+        assert estimate.packed_statistics_bytes + estimate.reduction_arena_bytes == 3_072
+
+    phase_workspace = max(
+        estimate.reduction_arena_bytes,
+        estimate.bounded_accumulation_workspace_bytes,
+        estimate.owner_hash_restore_workspace_bytes,
+        estimate.quantile_sink_workspace_bytes,
+    )
+    persistent = (
+        estimate.fp32_pre_or_delta_bytes
+        + estimate.bf16_pre_bytes
+        + estimate.post_fingerprint_bytes
+        + estimate.replay_payload_bytes
+        + estimate.replay_mask_bytes
+        + estimate.replay_state_bytes
+        + estimate.replay_cap_reserve_bytes
+        + estimate.packed_statistics_bytes
+    )
+    assert estimate.chunk_workspace_bytes == phase_workspace
+    assert estimate.retained_bytes == persistent + phase_workspace
+    assert estimate.allocator_headroom_bytes == 0
+    assert estimate.driver_headroom_bytes == 0
+    assert estimate.peak_bytes == expected_peak_bytes
+
+    maximum_cells = {256: 4_252_361_473_883_687, 512: 2_328_546_335_989_322}[alignment]
+    if cell_count == maximum_cells:
+        with pytest.raises(SecantMemoryEstimateError):
+            SecantMemoryEstimate.calculate(
+                SecantMemoryInputs(**{**inputs.__dict__, "registry_slots": 3 * (cell_count + 1)}),
+                optimizer_layout=SecantOptimizerLayout(),
+            )
 
 
 def test_memory_estimate_covers_independent_100_cell_derived_and_quantile_live_graph() -> None:
