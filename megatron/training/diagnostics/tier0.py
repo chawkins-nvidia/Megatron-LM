@@ -2625,6 +2625,9 @@ class Tier0Heartbeat:
             )
 
         valid_positions = 0
+        invalid_capture_slots: list[str] = []
+        invalid_update_slots: list[str] = []
+        failed_controls: list[str] = []
         event_valid = bool(
             self.capability.supported and capture is not None and update is not None
         )
@@ -2632,14 +2635,29 @@ class Tier0Heartbeat:
             token_values, _, _ = fields(capture, "event/valid_tokens")
             valid_positions = int(token_values[0])
             runtime_values, runtime_maximum, _ = fields(capture, "event/runtime_status")
-            event_valid &= runtime_maximum == 0 and all(
+            runtime_valid = runtime_maximum == 0 and all(
                 value == 0 for value in runtime_values[7:11]
             )
+            event_valid &= runtime_valid
+            if not runtime_valid:
+                invalid_capture_slots.append(
+                    "event/runtime_status"
+                    f"(max={runtime_maximum:g},errors={runtime_values[7:11]})"
+                )
             for name in capture["names"]:
                 values, _, _ = fields(capture, name)
                 if not name.startswith("event/"):
-                    event_valid &= slot_valid(values)
+                    valid_slot = slot_valid(values)
+                    event_valid &= valid_slot
+                    if not valid_slot:
+                        invalid_capture_slots.append(
+                            f"{name}(count={values[1]:g},errors={values[7:11]})"
+                        )
             event_valid &= valid_positions > 0
+            if valid_positions <= 0:
+                invalid_capture_slots.append(
+                    f"event/valid_tokens(count={token_values[1]:g},sum={token_values[0]:g})"
+                )
         if update is not None:
             tied_output = any(
                 isinstance(_unwrap_module(chunk), GPTModel)
@@ -2650,9 +2668,15 @@ class Tier0Heartbeat:
             )
             for name in update["names"]:
                 values, _, _ = fields(update, name)
-                event_valid &= all(value == 0 for value in values[7:11])
-                if not (tied_output and name == "update/output"):
-                    event_valid &= values[1] > 0
+                errors_valid = all(value == 0 for value in values[7:11])
+                contributors_valid = (
+                    tied_output and name == "update/output" or values[1] > 0
+                )
+                event_valid &= errors_valid and contributors_valid
+                if not errors_valid or not contributors_valid:
+                    invalid_update_slots.append(
+                        f"{name}(count={values[1]:g},errors={values[7:11]})"
+                    )
         for name in (
             "control/unsupported",
             "control/preflight_failure",
@@ -2661,6 +2685,26 @@ class Tier0Heartbeat:
         ):
             _, maximum, _ = fields(control, name)
             event_valid &= maximum == 0
+            if maximum != 0:
+                failed_controls.append(f"{name}={maximum:g}")
+
+        if not event_valid:
+
+            def bounded(values: Sequence[str]) -> str:
+                limit = 16
+                visible = ",".join(values[:limit]) or "none"
+                if len(values) > limit:
+                    visible += f",...(+{len(values) - limit})"
+                return visible
+
+            warnings.warn(
+                "Tier-0 packed validation failed: "
+                f"capture=[{bounded(invalid_capture_slots)}]; "
+                f"update=[{bounded(invalid_update_slots)}]; "
+                f"controls=[{bounded(failed_controls)}]",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         loss_scale = float(getattr(self.args, "loss_scale", 1.0) or 1.0)
         dgrad_divisor = (loss_scale * valid_positions) ** 2
