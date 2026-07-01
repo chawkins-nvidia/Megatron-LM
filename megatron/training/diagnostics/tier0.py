@@ -873,6 +873,15 @@ class Tier0Heartbeat:
         local_sequence = bounds["sequence_length"] // max(1, bounds["cp"])
         owner_elements = 0
         calculation_failed = not bounds_valid or not max_extra_valid
+        rejection_reasons = []
+        if not bounds_valid:
+            rejection_reasons.append("invalid_runtime_bounds")
+        if not max_extra_valid:
+            rejection_reasons.append("invalid_max_extra_bytes")
+        if not self.capability.supported:
+            rejection_reasons.append(
+                "capability=" + ",".join(self.capability.reasons)
+            )
         distributed_optimizer = _distributed_optimizer(self.optimizer)
         if self.capability.supported and distributed_optimizer is not None:
             try:
@@ -880,8 +889,11 @@ class Tier0Heartbeat:
                     shard.main_shard.numel()
                     for shard in distributed_optimizer.iter_model_main_param_shards()
                 )
-            except Exception:
+            except Exception as error:
                 calculation_failed = True
+                rejection_reasons.append(
+                    f"optimizer_shards={type(error).__name__}:{error}"
+                )
         try:
             requested = tier0_reservation_bytes(
                 num_layers=bounds["layers"],
@@ -891,9 +903,12 @@ class Tier0Heartbeat:
                 owner_elements=owner_elements,
                 world_size=bounds["world_size"],
             )
-        except Exception:
+        except Exception as error:
             requested = _INT64_MAX
             calculation_failed = True
+            rejection_reasons.append(
+                f"reservation_calculation={type(error).__name__}:{error}"
+            )
 
         overflow = (
             requested > _INT64_MAX
@@ -914,12 +929,19 @@ class Tier0Heartbeat:
                 allocated = torch.cuda.memory_allocated(self.device)
                 reusable = max(0, reserved - allocated)
                 driver_need = max(0, requested - reusable)
+                if driver_need > free_bytes:
+                    rejection_reasons.append("insufficient_free_hbm")
+                if reserved + driver_need > int(total_bytes * 0.90):
+                    rejection_reasons.append("total_hbm_fraction")
                 locally_accepted = locally_accepted and driver_need <= free_bytes
                 locally_accepted = locally_accepted and (
                     reserved + driver_need <= int(total_bytes * 0.90)
                 )
-            except Exception:
+            except Exception as error:
                 locally_accepted = False
+                rejection_reasons.append(
+                    f"allocator_query={type(error).__name__}:{error}"
+                )
 
         control = torch.tensor(
             [
@@ -966,7 +988,8 @@ class Tier0Heartbeat:
                 status,
                 "Tier-0 startup reservation rejected globally before event allocation "
                 f"(status={status.name.lower()}, requested={requested}, "
-                f"max_extra={max_extra_bytes}, hard_max={_MAX_RESERVATION_BYTES})",
+                f"max_extra={max_extra_bytes}, hard_max={_MAX_RESERVATION_BYTES}, "
+                f"local_reasons={','.join(rejection_reasons) or 'global_peer'})",
             )
         return Tier0Reservation(requested, max_extra_bytes, True)
 

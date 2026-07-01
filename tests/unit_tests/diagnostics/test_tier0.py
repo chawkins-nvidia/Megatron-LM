@@ -687,6 +687,7 @@ def test_joint_advertised_boundary_fits_and_one_past_rejects_before_p2p() -> Non
     with pytest.raises(Tier0ReservationError) as raised:
         Tier0Heartbeat(args, [nn.Linear(2, 2)], object(), num_microbatches=64)
     assert raised.value.status == Tier0ReservationStatus.OVERFLOW
+    assert "invalid_runtime_bounds" in str(raised.value)
 
 
 def test_allocator_reserved_growth_uses_the_pre_event_baseline() -> None:
