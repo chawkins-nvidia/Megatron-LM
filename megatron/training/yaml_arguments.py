@@ -399,7 +399,14 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     # Some launch stacks render historically top-level model flags under ``megatron.*``
     # while this YAML path builds TransformerConfig from ``megatron.language_model``.
     # Preserve the explicit top-level value when the language-model namespace omitted it.
-    for name in ("qk_layernorm", "qk_l2_norm", "qk_clip", "qk_clip_alpha", "qk_clip_threshold"):
+    for name in (
+        "calculate_per_token_loss",
+        "qk_layernorm",
+        "qk_l2_norm",
+        "qk_clip",
+        "qk_clip_alpha",
+        "qk_clip_threshold",
+    ):
         if not hasattr(args, name) and hasattr(root_args, name):
             setattr(args, name, getattr(root_args, name))
     # Translate args to core transformer configuration
