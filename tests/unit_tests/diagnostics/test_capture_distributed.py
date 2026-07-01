@@ -35,6 +35,7 @@ from megatron.training.diagnostics.capture import (
 )
 from megatron.training.diagnostics.normalization import CanonicalDgradNormalizer
 from megatron.training.diagnostics.schema import Tier0Status
+from megatron.training.diagnostics.tier0 import Tier0Heartbeat
 from tests.unit_tests.diagnostics.test_capture import _FakeModel, _FakeTransformerLayer
 
 
@@ -152,10 +153,11 @@ def test_fixed_shape_pp_mask_sideband_preserves_order_without_broadcast(
 
 
 @pytest.mark.distributed
+@pytest.mark.parametrize("capture_armed", (False, True), ids=("sealed", "armed"))
 def test_real_noninterleaved_pp2_schedule_matches_sideband_through_cooldown(
-    gloo_world: None, monkeypatch: pytest.MonkeyPatch
+    gloo_world: None, monkeypatch: pytest.MonkeyPatch, capture_armed: bool
 ) -> None:
-    """Run the production PP2 warmup/1F1B/cooldown loop for four microbatches."""
+    """Run PP2 with no replay sideband after seal and matched ordinary sidebands."""
 
     rank = dist.get_rank()
     singleton_groups = [dist.new_group([owner]) for owner in range(2)]
@@ -163,30 +165,55 @@ def test_real_noninterleaved_pp2_schedule_matches_sideband_through_cooldown(
     events: list[tuple[str, int]] = []
 
     class Heartbeat:
-        armed = True
+        def __init__(self) -> None:
+            self.capture = SimpleNamespace(armed=capture_armed)
+            self.args = SimpleNamespace(micro_batch_size=1, seq_length=1)
+            self._attempt_due = True
+            self.capability = SimpleNamespace(supported=True)
+            self._sideband_payloads = {index: torch.empty(1) for index in range(4)}
+            self._sideband_validity = {
+                index: torch.empty((), dtype=torch.bool) for index in range(4)
+            }
+            self._received_sidebands: set[int] = set()
+
+        @property
+        def armed(self) -> bool:
+            return self.capture.armed
 
         def begin_microbatch(self, microbatch_id: int) -> None:
-            events.append(("begin", microbatch_id))
+            if self.armed:
+                events.append(("begin", microbatch_id))
 
         def end_microbatch(self, microbatch_id: int) -> None:
-            events.append(("end", microbatch_id))
+            if self.armed:
+                events.append(("end", microbatch_id))
 
         def register_local_loss_mask(self, microbatch_id: int, _mask) -> None:
+            if not self.armed:
+                return
             events.append(("register", microbatch_id))
             if rank == 0:
-                dist.send(
-                    torch.tensor([float(microbatch_id)]), dst=1, tag=100 + microbatch_id
-                )
+                dist.send(torch.tensor([float(microbatch_id)]), dst=1)
 
-        def receive_mask_sideband(self, microbatch_id: int) -> None:
-            if rank == 1:
-                payload = torch.empty(1)
-                dist.recv(payload, src=0, tag=100 + microbatch_id)
-                assert payload[0] == microbatch_id
-                events.append(("receive", microbatch_id))
+        receive_mask_sideband = Tier0Heartbeat.receive_mask_sideband
+        forward_mask_sideband = Tier0Heartbeat.forward_mask_sideband
 
-        def forward_mask_sideband(self, microbatch_id: int) -> None:
-            events.append(("forward", microbatch_id))
+    monkeypatch.setattr(
+        parallel_state,
+        "is_pipeline_first_stage",
+        lambda ignore_virtual=True: rank == 0,
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual=True: rank == 1,
+    )
+    monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_prev_rank", lambda: 0)
+    monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_next_rank", lambda: 1)
+    monkeypatch.setattr(parallel_state, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        parallel_state, "get_pipeline_model_parallel_group", lambda: dist.group.WORLD
+    )
 
     heartbeat = Heartbeat()
 
@@ -326,11 +353,13 @@ def test_real_noninterleaved_pp2_schedule_matches_sideband_through_cooldown(
         pg_collection=groups,
     )
 
-    assert [value for name, value in events if name == "begin"] == list(range(4))
-    assert [value for name, value in events if name == "end"] == list(range(4))
-    assert [value for name, value in events if name == "register"] == list(range(4))
-    if rank == 1:
-        assert [value for name, value in events if name == "receive"] == list(range(4))
+    expected = list(range(4)) if capture_armed else []
+    assert [value for name, value in events if name == "begin"] == expected
+    assert [value for name, value in events if name == "end"] == expected
+    assert [value for name, value in events if name == "register"] == expected
+    assert heartbeat._received_sidebands == (
+        set(range(4)) if capture_armed and rank == 1 else set()
+    )
     assert communicator.forward_send + communicator.forward_recv == 4
     assert communicator.backward_send + communicator.backward_recv == 4
     dist.barrier()

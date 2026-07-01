@@ -1438,6 +1438,8 @@ class Tier0Heartbeat:
         if (
             not self._attempt_due
             or not self.capability.supported
+            or self.capture is None
+            or not self.capture.armed
             or parallel_state.is_pipeline_first_stage(ignore_virtual=True)
         ):
             return
@@ -1458,6 +1460,8 @@ class Tier0Heartbeat:
         if (
             not self._attempt_due
             or not self.capability.supported
+            or self.capture is None
+            or not self.capture.armed
             or parallel_state.is_pipeline_first_stage(ignore_virtual=True)
             or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
         ):
