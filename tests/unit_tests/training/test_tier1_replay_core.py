@@ -2,6 +2,7 @@
 
 import contextlib
 import math
+import os
 import random
 from dataclasses import replace
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ from megatron.training.diagnostics.diagnostic_replay import (
     FixedPlanCodec,
     NonInterleavedReplaySchedule,
     PopulationCollectiveWorkspace,
+    ProductionFatalAbort,
     ReadinessConsensus,
     RecordedBatch,
     ReplayBatchRecorder,
@@ -480,6 +482,22 @@ def test_every_restore_stage_fault_still_attempts_later_restorations(stage: str)
         assert model.training
         assert model.cache.item() == 2
         assert model.input_tensor.item() == 4
+
+
+def test_production_fatal_abort_reports_nested_error_before_exit(monkeypatch, capsys) -> None:
+    exit_codes = []
+    monkeypatch.setattr(os, "_exit", exit_codes.append)
+    error = BaseExceptionGroup(
+        "replay failure", (RuntimeError("schedule detail"), ValueError("restore detail"))
+    )
+
+    ProductionFatalAbort()(error)
+
+    captured = capsys.readouterr()
+    assert "Tier-1 fatal abort after committed replay work" in captured.err
+    assert "schedule detail" in captured.err
+    assert "restore detail" in captured.err
+    assert exit_codes == [86]
 
 
 def test_nested_state_guards_restore_their_independent_capture_points() -> None:

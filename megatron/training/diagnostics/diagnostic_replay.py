@@ -15,6 +15,8 @@ import hashlib
 import math
 import os
 import random
+import sys
+import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
@@ -3196,6 +3198,12 @@ class ProductionFatalAbort:
         self.exit_code = exit_code
 
     def __call__(self, error: BaseException) -> None:
+        try:
+            print("Tier-1 fatal abort after committed replay work:", file=sys.stderr, flush=True)
+            traceback.print_exception(error, file=sys.stderr)
+            sys.stderr.flush()
+        except BaseException:
+            pass
         if dist.is_available() and dist.is_initialized():
             try:
                 dist.destroy_process_group()
