@@ -113,6 +113,7 @@ def test_log4firstlast_r4_schema_is_exact_unpooled_and_layer_suffixed() -> None:
                     item
                     for family in ("qkv", "attn_out", "fc1", "fc2")
                     for item in (
+                        f"activation/{family}/rms",
                         f"activation/{family}/max_abs",
                         f"dgrad/{family}/rms",
                         f"update/{family}/relative_rms",
@@ -134,9 +135,9 @@ def test_log4firstlast_r4_schema_is_exact_unpooled_and_layer_suffixed() -> None:
         "diag/v2/perf/latency_ms_max_rank",
     }
 
-    assert len(t0) == 71
+    assert len(t0) == 83
     assert set(t0) == expected_t0
-    assert len(keys) == len(set(keys)) == 157
+    assert len(keys) == len(set(keys)) == 169
     assert_payload_schema(
         dict.fromkeys(t0), num_layers=12, layer_pattern="log4firstlast"
     )

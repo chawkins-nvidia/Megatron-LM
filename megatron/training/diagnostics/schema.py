@@ -132,6 +132,7 @@ def layerwise_tier0_metric_keys(
         for family in _LAYERWISE_CAPTURE_FAMILIES:
             keys.extend(
                 (
+                    f"{TIER0_PREFIX}activation/{family}/rms/{suffix}",
                     f"{TIER0_PREFIX}activation/{family}/max_abs/{suffix}",
                     f"{TIER0_PREFIX}dgrad/{family}/rms/{suffix}",
                     f"{TIER0_PREFIX}update/{family}/relative_rms/{suffix}",

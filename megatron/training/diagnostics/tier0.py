@@ -1783,6 +1783,9 @@ class Tier0Heartbeat:
                 activation_name = f"activation/{family.value}/{suffix}"
                 maximum = capture.maximum(activation_name).value
                 minimum = capture.minimum(activation_name).value
+                payload[f"diag/v2/t0/activation/{family.value}/rms/{suffix}"] = (
+                    capture.rms(activation_name).value
+                )
                 payload[f"diag/v2/t0/activation/{family.value}/max_abs/{suffix}"] = (
                     torch.maximum(maximum.abs(), minimum.abs())
                 )
@@ -2886,6 +2889,9 @@ class Tier0Heartbeat:
                 for family in ("qkv", "attn_out", "fc1", "fc2"):
                     activation_values, maximum, minimum = fields(
                         capture, f"activation/{family}/{suffix}"
+                    )
+                    payload[f"diag/v2/t0/activation/{family}/rms/{suffix}"] = (
+                        capture_rms(f"activation/{family}/{suffix}")
                     )
                     payload[f"diag/v2/t0/activation/{family}/max_abs/{suffix}"] = (
                         max(abs(maximum), abs(minimum))

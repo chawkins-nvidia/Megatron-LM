@@ -56,6 +56,8 @@ from megatron.training.diagnostics.schema import (  # isort: skip
     TIER0_KEYS,
     TIER0_METADATA_KEYS,
     TIER0_METRIC_KEYS,
+    layerwise_tier0_metric_keys,
+    tier0_keys_for_pattern,
 )
 
 
@@ -986,6 +988,145 @@ def test_cpu_post_transfer_derivation_retains_exact_75_key_contract() -> None:
         if key not in unavailable
     )
     assert all(payload[key] != payload[key] for key in unavailable)
+
+
+def test_layerwise_device_derivation_emits_each_activation_family_rms() -> None:
+    selected = (0, 3, 11)
+    families = ("qkv", "attn_out", "fc1", "fc2")
+    expected = {
+        f"activation/{family}/layer_{layer}": float(10 * family_index + layer + 1)
+        for family_index, family in enumerate(families, start=1)
+        for layer in selected
+    }
+
+    class Capture:
+        def rms(self, name: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                value=torch.tensor(expected.get(name, 1.0), dtype=torch.float64)
+            )
+
+        def maximum(self, _name: str) -> SimpleNamespace:
+            return SimpleNamespace(value=torch.tensor(2.0, dtype=torch.float64))
+
+        def minimum(self, _name: str) -> SimpleNamespace:
+            return SimpleNamespace(value=torch.tensor(-2.0, dtype=torch.float64))
+
+    class Updates:
+        def relative_rms(self, _name: str) -> SimpleNamespace:
+            return SimpleNamespace(value=torch.tensor(1.0, dtype=torch.float64))
+
+        def norm_retention(self, _name: str) -> SimpleNamespace:
+            return SimpleNamespace(value=torch.tensor(1.0, dtype=torch.float64))
+
+    heartbeat = Tier0Heartbeat.__new__(Tier0Heartbeat)
+    heartbeat.args = SimpleNamespace(num_layers=12)
+    heartbeat.model = ()
+    heartbeat.selected_global_layers = selected
+    heartbeat.update_accumulator = Updates()
+    payload: dict[str, torch.Tensor] = {}
+
+    heartbeat._derive_layerwise_metrics(
+        payload, SimpleNamespace(accumulator=Capture())
+    )
+
+    assert set(payload) == set(layerwise_tier0_metric_keys(selected, num_layers=12))
+    for name, value in expected.items():
+        observation, family, suffix = name.split("/")
+        key = f"diag/v2/t0/{observation}/{family}/rms/{suffix}"
+        assert payload[key] == value
+
+
+def test_layerwise_cpu_derivation_emits_each_activation_family_rms() -> None:
+    selected = (0, 3, 11)
+    families = ("qkv", "attn_out", "fc1", "fc2")
+    binding = ReductionBinding.flat_world(
+        None, reducer=lambda *_args, **_kwargs: None
+    )
+    capture_names = (
+        "event/valid_tokens",
+        "event/runtime_status",
+        *(
+            f"{observation}/{family}/layer_{layer}"
+            for layer in range(12)
+            for observation in ("activation", "dgrad")
+            for family in ("residual", *families)
+        ),
+    )
+    update_names = (
+        *(
+            f"update/{family}/layer_{layer}"
+            for layer in range(12)
+            for family in (*families, "norm")
+        ),
+        "update/embedding",
+        "update/output",
+    )
+    heartbeat = Tier0Heartbeat.__new__(Tier0Heartbeat)
+    heartbeat.capture_accumulator = PackedSufficientStatistics(
+        capture_names, "cpu", descriptor_hash="capture", reduction_binding=binding
+    )
+    heartbeat.update_accumulator = PackedSufficientStatistics(
+        update_names, "cpu", descriptor_hash="update", reduction_binding=binding
+    )
+    heartbeat.control_accumulator = PackedSufficientStatistics(
+        tier0_module._CONTROL_NAMES,
+        "cpu",
+        descriptor_hash="control",
+        reduction_binding=binding,
+    )
+    heartbeat.capability = SimpleNamespace(supported=True)
+    heartbeat.args = SimpleNamespace(num_layers=12, loss_scale=1.0)
+    heartbeat.model = ()
+    heartbeat.successful_updates = 1
+    heartbeat.layerwise_scalars = True
+    heartbeat.selected_global_layers = selected
+    heartbeat.tier0_keys = tier0_keys_for_pattern(
+        num_layers=12, layer_pattern="log4firstlast"
+    )
+    expected = {
+        f"activation/{family}/layer_{layer}": float(10 * family_index + layer + 1)
+        for family_index, family in enumerate(families, start=1)
+        for layer in selected
+    }
+
+    def pack(
+        accumulator: PackedSufficientStatistics, *, control: bool = False
+    ) -> dict[str, tuple[object, ...]]:
+        sums: list[float] = []
+        maxima: list[float] = []
+        minima: list[float] = []
+        for name in accumulator.slot_names:
+            value = expected.get(name, 2.0)
+            moments = [1.0, 1.0, value**2, 0.0, 4.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            maximum = 0.0 if control or name == "event/runtime_status" else value
+            minimum = 0.0 if control or name == "event/runtime_status" else -value
+            if name == "event/valid_tokens":
+                moments[0] = 5.0
+            sums.extend(moments)
+            maxima.append(maximum)
+            minima.append(minimum)
+        return {
+            "names": accumulator.slot_names,
+            "sum": tuple(sums),
+            "max": tuple(maxima),
+            "min": tuple(minima),
+        }
+
+    host_packs = {
+        "capture": pack(heartbeat.capture_accumulator),
+        "update": pack(heartbeat.update_accumulator),
+        "control": pack(heartbeat.control_accumulator, control=True),
+    }
+    payload = heartbeat._derive_host_payload(
+        host_packs, [[0, 1, 1, 1024, 0, 0, 0, 0, 0, 3, 5]]
+    )
+
+    assert tuple(payload) == heartbeat.tier0_keys
+    assert len(payload) == 83
+    for name, value in expected.items():
+        observation, family, suffix = name.split("/")
+        key = f"diag/v2/t0/{observation}/{family}/rms/{suffix}"
+        assert payload[key] == value
 
 
 def test_event_artifact_is_truthful_invalid_and_logs_once() -> None:
