@@ -2555,6 +2555,10 @@ class NonInterleavedReplaySchedule:
     ) -> None:
         if virtual_pipeline_size not in (None, 1) or len(model) != 1:
             raise ValueError("Tier-1 replay does not support interleaved/virtual pipeline")
+        if pg_collection is not None:
+            raise ValueError(
+                "Tier-1 replay requires canonical schedule-owned process groups"
+            )
         self.forward_backward_func = forward_backward_func
         self.forward_step_func = forward_step_func
         self.model = tuple(model)

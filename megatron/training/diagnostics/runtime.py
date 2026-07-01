@@ -312,7 +312,6 @@ class TieredDiagnosticRuntime:
                     self.args, "virtual_pipeline_model_parallel_size", None
                 ),
                 decoder_sequence_length=getattr(self.args, "decoder_seq_length", None),
-                pg_collection=getattr(self.models[0], "pg_collection", None),
             )
             engine = Tier1ReplayEngine(
                 self.models,

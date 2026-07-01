@@ -961,6 +961,21 @@ def test_interleaved_schedule_is_rejected() -> None:
         )
 
 
+def test_replay_schedule_rejects_partial_caller_owned_process_groups() -> None:
+    with pytest.raises(ValueError, match="schedule-owned process groups"):
+        NonInterleavedReplaySchedule(
+            forward_backward_func=lambda **kwargs: None,
+            forward_step_func=lambda *args: None,
+            model=(torch.nn.Identity(),),
+            sequence_length=8,
+            micro_batch_size=1,
+            probe_device="cpu",
+            tensor_parallel_rank=0,
+            tensor_parallel_size=1,
+            pg_collection=object(),
+        )
+
+
 def _dense_gpt_stub() -> GPTModel:
     model = GPTModel.__new__(GPTModel)
     torch.nn.Module.__init__(model)
