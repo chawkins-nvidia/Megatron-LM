@@ -14,7 +14,6 @@ import torch
 import torch.distributed as dist
 
 import megatron.training.diagnostics.distributed_optimizer as adapter_module
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer, Range
 from megatron.core.optimizer.optimizer import ChainedOptimizer
@@ -44,6 +43,10 @@ from megatron.training.diagnostics.registry import (
     ProcessGroupIdentity,
     ReductionKind,
     StatisticKind,
+)
+
+from megatron.core.distributed.distributed_data_parallel_config import (  # isort: skip
+    DistributedDataParallelConfig,
 )
 
 
@@ -90,7 +93,9 @@ def _fake_optimizer(
     optimizer.gbuf_idx_to_model_idx_map = {0: 0}
 
     parameters = tuple(
-        torch.nn.Parameter(torch.arange(1, size + 1, dtype=torch.float32).to(torch.bfloat16))
+        torch.nn.Parameter(
+            torch.arange(1, size + 1, dtype=torch.float32).to(torch.bfloat16)
+        )
         for size in parameter_sizes
     )
     bucket_data = torch.full((32,), -99.0, dtype=torch.bfloat16)
@@ -121,12 +126,18 @@ def _fake_optimizer(
     optimizer.shard_fp32_groups = []
     optimizer.shard_fp32_from_float16_groups = [main_shards]
     optimizer.gbuf_ranges = [{dtype_key: [{"param_map": param_map}]}]
-    optimizer.model_param_gbuf_map = {parameter: (0, dtype_key, 0) for parameter in parameters}
-    optimizer.buffers = [SimpleNamespace(buckets=[SimpleNamespace(param_data=bucket_data)])]
+    optimizer.model_param_gbuf_map = {
+        parameter: (0, dtype_key, 0) for parameter in parameters
+    }
+    optimizer.buffers = [
+        SimpleNamespace(buckets=[SimpleNamespace(param_data=bucket_data)])
+    ]
     return optimizer, parameters
 
 
-def _real_buffer_optimizer() -> tuple[DistributedOptimizer, tuple[torch.nn.Parameter, ...]]:
+def _real_buffer_optimizer() -> tuple[
+    DistributedOptimizer, tuple[torch.nn.Parameter, ...]
+]:
     """Build the closest CPU-practical real param-buffer owner fixture.
 
     The actual ``_ParamAndGradBuffer`` layout, bucket padding, parameter remapping,
@@ -147,18 +158,24 @@ def _real_buffer_optimizer() -> tuple[DistributedOptimizer, tuple[torch.nn.Param
     pg_collection = SimpleNamespace(dp_cp=dp_group, tp=_TensorParallelGroup(0))
     parameter_groups = (
         tuple(
-            torch.nn.Parameter(torch.arange(size, dtype=torch.float32).to(torch.bfloat16))
+            torch.nn.Parameter(
+                torch.arange(size, dtype=torch.float32).to(torch.bfloat16)
+            )
             for size in (17, 13, 9)
         ),
         tuple(
-            torch.nn.Parameter(torch.arange(size, dtype=torch.float32).to(torch.bfloat16))
+            torch.nn.Parameter(
+                torch.arange(size, dtype=torch.float32).to(torch.bfloat16)
+            )
             for size in (15, 7)
         ),
     )
     buffers = []
     with (
         mock.patch("torch.cuda.current_device", return_value="cpu"),
-        mock.patch("megatron.core.distributed.param_and_grad_buffer.log_on_each_pipeline_stage"),
+        mock.patch(
+            "megatron.core.distributed.param_and_grad_buffer.log_on_each_pipeline_stage"
+        ),
     ):
         for buffer_index, parameters in enumerate(parameter_groups):
             layout = DistributedOptimizer._compute_per_buffer_param_layout(
@@ -213,7 +230,9 @@ def _real_buffer_optimizer() -> tuple[DistributedOptimizer, tuple[torch.nn.Param
     main_groups = []
     for parameters in parameter_groups:
         owned = [
-            parameter for parameter in parameters if parameter in optimizer.model_param_gbuf_map
+            parameter
+            for parameter in parameters
+            if parameter in optimizer.model_param_gbuf_map
         ]
         owned_groups.append(owned)
         model_shards = []
@@ -249,7 +268,9 @@ def _registry(
                 logical_name=logical_name,
                 family=family,
                 global_layer=(
-                    index if family not in (MetricFamily.EMBEDDING, MetricFamily.OUTPUT) else None
+                    index
+                    if family not in (MetricFamily.EMBEDDING, MetricFamily.OUTPUT)
+                    else None
                 ),
                 partition_axes=(PartitionAxis.OPTIMIZER_SHARD,),
                 replication_axes=(),
@@ -262,7 +283,9 @@ def _registry(
                 process_group_identity=ProcessGroupIdentity.WORLD,
                 reduction_kind=ReductionKind.PACKED_SUM_MAX_MIN,
                 tied_owner_identity=(
-                    "embedding.first_pipeline_stage" if family == MetricFamily.EMBEDDING else None
+                    "embedding.first_pipeline_stage"
+                    if family == MetricFamily.EMBEDDING
+                    else None
                 ),
                 packed_slots=PackedSlots.for_index(index),
             )
@@ -409,9 +432,14 @@ def test_cross_lane_normalization_changes_only_the_capture_slot() -> None:
     registry, _ = _cross_lane_registry(parameters)
     accumulator = registry.new_accumulator("cpu")
     registry.add_masked_tensor(
-        accumulator, "dgrad/residual/layer_0", torch.tensor([4.0, 8.0]), mask=torch.ones(2)
+        accumulator,
+        "dgrad/residual/layer_0",
+        torch.tensor([4.0, 8.0]),
+        mask=torch.ones(2),
     )
-    registry.add_applied_update_moments(accumulator, "update/fc1/0", **_applied_update_moments())
+    registry.add_applied_update_moments(
+        accumulator, "update/fc1/0", **_applied_update_moments()
+    )
     accumulator.finalize_local_()
 
     update_slots = accumulator.slots("update/fc1/0")
@@ -427,17 +455,24 @@ def test_cross_lane_normalization_changes_only_the_capture_slot() -> None:
         torch.sqrt(torch.tensor(40.0, dtype=torch.float64)) / 4.0,
     )
     torch.testing.assert_close(
-        accumulator.norm_retention("update/fc1/0").value, torch.tensor(0.5, dtype=torch.float64)
+        accumulator.norm_retention("update/fc1/0").value,
+        torch.tensor(0.5, dtype=torch.float64),
     )
     torch.testing.assert_close(
         accumulator.sum_pack[update_slots.sum : update_slots.observation_error + 1],
         update_sum_before,
     )
-    torch.testing.assert_close(accumulator.max_pack[update_slots.maximum], update_max_before)
-    torch.testing.assert_close(accumulator.min_pack[update_slots.minimum], update_min_before)
+    torch.testing.assert_close(
+        accumulator.max_pack[update_slots.maximum], update_max_before
+    )
+    torch.testing.assert_close(
+        accumulator.min_pack[update_slots.minimum], update_min_before
+    )
 
 
-def test_cross_lane_capture_missing_and_optimizer_invalid_status_share_one_reduction() -> None:
+def test_cross_lane_capture_missing_and_optimizer_invalid_status_share_one_reduction() -> (
+    None
+):
     collective_calls = []
 
     def identity_reducer(tensor, *, op, group):
@@ -446,7 +481,11 @@ def test_cross_lane_capture_missing_and_optimizer_invalid_status_share_one_reduc
     optimizer, parameters = _fake_optimizer()
     registry, names = _cross_lane_registry(parameters, reducer=identity_reducer)
     adapter = Bf16DistributedOptimizerDiagnosticAdapter(
-        optimizer, registry, names, diagnostic_max_extra_bytes=1_000_000, finish_chunk_elements=2
+        optimizer,
+        registry,
+        names,
+        diagnostic_max_extra_bytes=1_000_000,
+        finish_chunk_elements=2,
     )
     accumulator = registry.new_accumulator("cpu")
     registry.mark_observation_error(accumulator, "dgrad/residual/layer_0")
@@ -467,7 +506,10 @@ def test_cross_lane_capture_missing_and_optimizer_invalid_status_share_one_reduc
     assert accumulator.max_pack[event_slots.maximum] == int(
         DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH
     )
-    assert adapter.local_status.item() == DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH
+    assert (
+        adapter.local_status.item()
+        == DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH
+    )
     for parameter in parameters:
         update_slots = accumulator.slots(names[parameter])
         assert accumulator.sum_pack[update_slots.mask_error] > 0
@@ -493,7 +535,9 @@ def test_cross_lane_nonowners_keep_every_slot_neutral_and_the_same_layout() -> N
         torch.tensor([DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH]),
     )
     accumulator.finalize_local_()
-    nonowner_registry.apply_normalizations_(accumulator, global_valid_tokens=torch.tensor(2.0))
+    nonowner_registry.apply_normalizations_(
+        accumulator, global_valid_tokens=torch.tensor(2.0)
+    )
 
     assert nonowner_registry.slot_names == owner_registry.slot_names
     assert nonowner_registry.descriptor_hash == owner_registry.descriptor_hash
@@ -511,14 +555,20 @@ def test_cross_lane_exact_hbm_adds_capture_scratch_and_optimizer_event_only() ->
     accumulator = registry.new_accumulator("cpu")
     estimate = adapter.estimate_snapshot_memory()
     persistent_pack_baseline = (
-        accumulator.sum_pack.nbytes + accumulator.max_pack.nbytes + accumulator.min_pack.nbytes
+        accumulator.sum_pack.nbytes
+        + accumulator.max_pack.nbytes
+        + accumulator.min_pack.nbytes
     )
     combined_incremental_hbm = accumulator.maximum_scratch_bytes + estimate.total_bytes
 
     assert accumulator.maximum_scratch_bytes == 1_572_864
     assert estimate.snapshot_bytes == 42
     assert estimate.finish_scratch_bytes == 304
-    assert estimate.total_bytes == estimate.snapshot_bytes + estimate.finish_scratch_bytes == 346
+    assert (
+        estimate.total_bytes
+        == estimate.snapshot_bytes + estimate.finish_scratch_bytes
+        == 346
+    )
     assert combined_incremental_hbm == 1_573_210
     assert persistent_pack_baseline == 384
     assert combined_incremental_hbm + persistent_pack_baseline == 1_573_594
@@ -575,7 +625,9 @@ def test_iterator_distinguishes_tp_replicated_owner_from_nonowner() -> None:
     assert all(not shard.logical_owner for shard in nonowner_shards)
 
 
-def test_real_param_buffers_cover_multiple_buffers_buckets_boundaries_and_padding() -> None:
+def test_real_param_buffers_cover_multiple_buffers_buckets_boundaries_and_padding() -> (
+    None
+):
     optimizer, parameters = _real_buffer_optimizer()
     shards = tuple(optimizer.iter_model_main_param_shards())
 
@@ -622,7 +674,9 @@ def test_one_child_chain_is_accepted_and_multiple_children_fail_closed() -> None
             DistributedOptimizerDiagnosticReason.NOT_BF16,
         ),
         (
-            lambda optimizer, parameters: setattr(optimizer.ddp_config, "use_megatron_fsdp", True),
+            lambda optimizer, parameters: setattr(
+                optimizer.ddp_config, "use_megatron_fsdp", True
+            ),
             DistributedOptimizerDiagnosticReason.FSDP,
         ),
         (
@@ -632,11 +686,15 @@ def test_one_child_chain_is_accepted_and_multiple_children_fail_closed() -> None
             DistributedOptimizerDiagnosticReason.PRECISION_AWARE,
         ),
         (
-            lambda optimizer, parameters: setattr(optimizer.config, "fp8_recipe", "delayed"),
+            lambda optimizer, parameters: setattr(
+                optimizer.config, "fp8_recipe", "delayed"
+            ),
             DistributedOptimizerDiagnosticReason.FP8,
         ),
         (
-            lambda optimizer, parameters: setattr(optimizer.ddp_config, "fp4_param_gather", True),
+            lambda optimizer, parameters: setattr(
+                optimizer.ddp_config, "fp4_param_gather", True
+            ),
             DistributedOptimizerDiagnosticReason.FP4,
         ),
         (
@@ -650,7 +708,9 @@ def test_one_child_chain_is_accepted_and_multiple_children_fail_closed() -> None
             DistributedOptimizerDiagnosticReason.LAYERWISE,
         ),
         (
-            lambda optimizer, parameters: setattr(optimizer.config, "optimizer_cpu_offload", True),
+            lambda optimizer, parameters: setattr(
+                optimizer.config, "optimizer_cpu_offload", True
+            ),
             DistributedOptimizerDiagnosticReason.CPU_OFFLOAD,
         ),
         (
@@ -660,9 +720,9 @@ def test_one_child_chain_is_accepted_and_multiple_children_fail_closed() -> None
             DistributedOptimizerDiagnosticReason.OVERLAP_PARAM_GATHER,
         ),
         (
-            lambda optimizer, parameters: optimizer.shard_fp32_from_float16_groups[0].__setitem__(
-                0, parameters[0].detach().to(torch.bfloat16)
-            ),
+            lambda optimizer, parameters: optimizer.shard_fp32_from_float16_groups[
+                0
+            ].__setitem__(0, parameters[0].detach().to(torch.bfloat16)),
             DistributedOptimizerDiagnosticReason.NON_FP32_MAIN,
         ),
     ),
@@ -678,7 +738,9 @@ def test_every_unsupported_first_backend_capability_has_a_stable_reason(
     assert not report.supported
     assert reason in report.reasons
     registry, names = _registry({parameters[0]: ("update/fc1/0", MetricFamily.FC1)})
-    with pytest.raises(DistributedOptimizerDiagnosticUnsupportedError, match=reason.name):
+    with pytest.raises(
+        DistributedOptimizerDiagnosticUnsupportedError, match=reason.name
+    ):
         Bf16DistributedOptimizerDiagnosticAdapter(
             optimizer, registry, names, diagnostic_max_extra_bytes=1_000_000
         )
@@ -696,14 +758,20 @@ def test_only_startup_negotiation_contains_an_accepted_host_synchronization() ->
         inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter.finish_event),
         inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._begin_event),
         inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._finish_event),
-        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._verify_materialization),
-        inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._accumulate_update_moments),
+        inspect.getsource(
+            Bf16DistributedOptimizerDiagnosticAdapter._verify_materialization
+        ),
+        inspect.getsource(
+            Bf16DistributedOptimizerDiagnosticAdapter._accumulate_update_moments
+        ),
         inspect.getsource(Bf16DistributedOptimizerDiagnosticAdapter._chunk_moments),
         inspect.getsource(PackedSufficientStatistics.add_applied_update_moments),
     )
     prohibited = (".item(", ".cpu(", ".tolist(", ".numpy(")
 
-    assert not any(operation in source for source in event_sources for operation in prohibited)
+    assert not any(
+        operation in source for source in event_sources for operation in prohibited
+    )
 
 
 def test_overlapping_local_owner_shards_become_typed_constructor_status() -> None:
@@ -722,7 +790,8 @@ def test_overlapping_local_owner_shards_become_typed_constructor_status() -> Non
     )
 
     assert (
-        adapter.local_status.item() == DistributedOptimizerEventStatus.CONSTRUCTOR_OWNERSHIP_FAILED
+        adapter.local_status.item()
+        == DistributedOptimizerEventStatus.CONSTRUCTOR_OWNERSHIP_FAILED
     )
     assert adapter.begin_event() is None
     assert not adapter.armed
@@ -754,7 +823,10 @@ def test_constructor_iterator_and_binding_failures_are_typed_local_status() -> N
         {binding_parameters[0]: ("update/fc1/0", MetricFamily.FC1)}
     )
     binding_adapter = Bf16DistributedOptimizerDiagnosticAdapter(
-        binding_optimizer, binding_registry, binding_names, diagnostic_max_extra_bytes=1_000_000
+        binding_optimizer,
+        binding_registry,
+        binding_names,
+        diagnostic_max_extra_bytes=1_000_000,
     )
     assert (
         binding_adapter.local_status.item()
@@ -770,7 +842,10 @@ def test_begin_and_finish_identity_failures_release_without_raising() -> None:
         original_main.detach().clone()
     )
     assert adapter.begin_event() is None
-    assert adapter.local_status.item() == DistributedOptimizerEventStatus.BEGIN_IDENTITY_CHANGED
+    assert (
+        adapter.local_status.item()
+        == DistributedOptimizerEventStatus.BEGIN_IDENTITY_CHANGED
+    )
     assert not adapter.armed
 
     finish_optimizer, finish_parameters = _fake_optimizer()
@@ -780,7 +855,9 @@ def test_begin_and_finish_identity_failures_release_without_raising() -> None:
         finish_optimizer.shard_fp32_from_float16_groups[0][0].detach().clone()
     )
     assert (
-        finish_adapter.finish_event(finish_registry.new_accumulator("cpu"), update_successful=True)
+        finish_adapter.finish_event(
+            finish_registry.new_accumulator("cpu"), update_successful=True
+        )
         is None
     )
     assert (
@@ -801,24 +878,37 @@ def test_accumulation_failure_is_typed_and_releases_snapshot() -> None:
     )
 
     assert (
-        adapter.finish_event(unrelated_registry.new_accumulator("cpu"), update_successful=True)
+        adapter.finish_event(
+            unrelated_registry.new_accumulator("cpu"), update_successful=True
+        )
         is None
     )
-    assert adapter.local_status.item() == DistributedOptimizerEventStatus.ACCUMULATION_FAILED
+    assert (
+        adapter.local_status.item()
+        == DistributedOptimizerEventStatus.ACCUMULATION_FAILED
+    )
     assert not adapter.armed
 
 
-def test_adamw_decoupled_weight_decay_accumulates_actual_master_and_applied_updates() -> None:
+def test_adamw_decoupled_weight_decay_accumulates_actual_master_and_applied_updates() -> (
+    None
+):
     optimizer, parameters = _fake_optimizer(parameter_sizes=(5, 6))
     adapter, registry = _adapter(optimizer, parameters)
     accumulator = registry.new_accumulator("cpu")
     shards = adapter.iter_owner_shards()
     master_before = torch.cat([shard.main_shard.detach().clone() for shard in shards])
-    applied_before = torch.cat([shard.model_shard.detach().float().clone() for shard in shards])
+    applied_before = torch.cat(
+        [shard.model_shard.detach().float().clone() for shard in shards]
+    )
     adapter.begin_event()
 
     adamw = torch.optim.AdamW(
-        [shard.main_shard for shard in shards], lr=0.1, betas=(0.0, 0.0), eps=1.0, weight_decay=0.2
+        [shard.main_shard for shard in shards],
+        lr=0.1,
+        betas=(0.0, 0.0),
+        eps=1.0,
+        weight_decay=0.2,
     )
     for shard in shards:
         shard.main_shard.grad = torch.full_like(shard.main_shard, 0.5)
@@ -855,7 +945,9 @@ def test_adamw_decoupled_weight_decay_accumulates_actual_master_and_applied_upda
     expected_retention = torch.sqrt(
         applied_delta.square().sum() / master_delta.square().sum()
     ).double()
-    pooled_registry, pooled_names = _registry({parameters[0]: ("update/fc1/all", MetricFamily.FC1)})
+    pooled_registry, pooled_names = _registry(
+        {parameters[0]: ("update/fc1/all", MetricFamily.FC1)}
+    )
     pooled = pooled_registry.new_accumulator("cpu")
     pooled_registry.add_applied_update(
         pooled,
@@ -866,7 +958,9 @@ def test_adamw_decoupled_weight_decay_accumulates_actual_master_and_applied_upda
         applied_after,
     )
     pooled.finalize_local_()
-    torch.testing.assert_close(pooled.norm_retention("update/fc1/all").value, expected_retention)
+    torch.testing.assert_close(
+        pooled.norm_retention("update/fc1/all").value, expected_retention
+    )
 
 
 def test_bf16_cast_to_zero_records_nonzero_master_and_zero_applied_delta() -> None:
@@ -911,7 +1005,9 @@ def test_tied_copy_and_tp_nonowner_emit_neutral_statistics_while_untied_weights_
 
     untied_optimizer, untied_parameters = _fake_optimizer()
     untied_adapter, untied_registry = _adapter(
-        untied_optimizer, untied_parameters, families=(MetricFamily.EMBEDDING, MetricFamily.OUTPUT)
+        untied_optimizer,
+        untied_parameters,
+        families=(MetricFamily.EMBEDDING, MetricFamily.OUTPUT),
     )
     untied_accumulator = untied_registry.new_accumulator("cpu")
     untied_adapter.begin_event()
@@ -945,11 +1041,15 @@ def test_finish_requires_explicit_success_and_early_finish_is_typed() -> None:
     with pytest.raises(TypeError, match="update_successful"):
         adapter.finish_event(accumulator)
     assert adapter.finish_event(accumulator, update_successful=True) is None
-    assert adapter.local_status.item() == DistributedOptimizerEventStatus.FINISH_NOT_ARMED
+    assert (
+        adapter.local_status.item() == DistributedOptimizerEventStatus.FINISH_NOT_ARMED
+    )
 
 
 @pytest.mark.parametrize("corruption", ("stale", "corrupt"))
-def test_stale_or_corrupt_materialization_invalidates_all_update_metrics(corruption: str) -> None:
+def test_stale_or_corrupt_materialization_invalidates_all_update_metrics(
+    corruption: str,
+) -> None:
     optimizer, parameters = _fake_optimizer()
     adapter, registry = _adapter(optimizer, parameters, finish_chunk_elements=2)
     accumulator = registry.new_accumulator("cpu")
@@ -966,13 +1066,18 @@ def test_stale_or_corrupt_materialization_invalidates_all_update_metrics(corrupt
 
     assert measurement is not None
     assert not adapter.armed
-    assert adapter.local_status.item() == DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH
+    assert (
+        adapter.local_status.item()
+        == DistributedOptimizerEventStatus.MATERIALIZATION_MISMATCH
+    )
     for logical_name in accumulator.slot_names:
         assert not accumulator.norm_retention(logical_name).valid
         assert torch.isnan(accumulator.norm_retention(logical_name).value)
 
 
-def test_normal_main_to_param_copy_materializes_and_accumulates_in_bounded_chunks() -> None:
+def test_normal_main_to_param_copy_materializes_and_accumulates_in_bounded_chunks() -> (
+    None
+):
     optimizer, parameters = _real_buffer_optimizer()
     adapter, registry = _adapter(
         optimizer, parameters, finish_chunk_elements=3, max_extra_bytes=1_000_000
@@ -1015,14 +1120,23 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
 
     rereview_cap, _ = _adapter(optimizer, parameters, max_extra_bytes=240)
     assert not rereview_cap.preflight_snapshot_memory().accepted
-    assert rereview_cap.preflight_snapshot_memory().reason == SnapshotMemoryReason.MAX_EXTRA_BYTES
+    assert (
+        rereview_cap.preflight_snapshot_memory().reason
+        == SnapshotMemoryReason.MAX_EXTRA_BYTES
+    )
     exact, _ = _adapter(optimizer, parameters, max_extra_bytes=346)
     assert exact.preflight_snapshot_memory().accepted
     capped, _ = _adapter(optimizer, parameters, max_extra_bytes=345)
-    assert capped.preflight_snapshot_memory().reason == SnapshotMemoryReason.MAX_EXTRA_BYTES
+    assert (
+        capped.preflight_snapshot_memory().reason
+        == SnapshotMemoryReason.MAX_EXTRA_BYTES
+    )
     assert capped.begin_event() is None
     assert capped.last_memory_reason == SnapshotMemoryReason.MAX_EXTRA_BYTES
-    assert capped.local_status.item() == DistributedOptimizerEventStatus.BEGIN_PREFLIGHT_REJECTED
+    assert (
+        capped.local_status.item()
+        == DistributedOptimizerEventStatus.BEGIN_PREFLIGHT_REJECTED
+    )
     assert not capped.armed
 
     fraction, _ = _adapter(
@@ -1031,7 +1145,8 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
         memory_state_provider=lambda device: DeviceMemoryState(700, 700, 500, 1000),
     )
     assert (
-        fraction.preflight_snapshot_memory().reason == SnapshotMemoryReason.DEVICE_MEMORY_FRACTION
+        fraction.preflight_snapshot_memory().reason
+        == SnapshotMemoryReason.DEVICE_MEMORY_FRACTION
     )
 
     headroom, _ = _adapter(
@@ -1039,14 +1154,20 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
         parameters,
         memory_state_provider=lambda device: DeviceMemoryState(100, 100, 345, 1000),
     )
-    assert headroom.preflight_snapshot_memory().reason == SnapshotMemoryReason.DEVICE_HEADROOM
+    assert (
+        headroom.preflight_snapshot_memory().reason
+        == SnapshotMemoryReason.DEVICE_HEADROOM
+    )
 
     def fail_memory_query(device):
         raise RuntimeError("injected memory query failure")
 
-    query_failure, _ = _adapter(optimizer, parameters, memory_state_provider=fail_memory_query)
+    query_failure, _ = _adapter(
+        optimizer, parameters, memory_state_provider=fail_memory_query
+    )
     assert (
-        query_failure.preflight_snapshot_memory().reason == SnapshotMemoryReason.ALLOCATION_FAILED
+        query_failure.preflight_snapshot_memory().reason
+        == SnapshotMemoryReason.ALLOCATION_FAILED
     )
     assert query_failure.begin_event() is None
     assert (
@@ -1055,7 +1176,9 @@ def test_exact_memory_estimation_measurement_and_preflight_rejections() -> None:
     )
 
 
-def test_preflight_uses_exact_reusable_driver_and_projected_reserved_boundaries() -> None:
+def test_preflight_uses_exact_reusable_driver_and_projected_reserved_boundaries() -> (
+    None
+):
     optimizer, parameters = _fake_optimizer()
     accepted, _ = _adapter(
         optimizer,
@@ -1087,7 +1210,9 @@ def test_preflight_uses_exact_reusable_driver_and_projected_reserved_boundaries(
         max_extra_bytes=446,
         memory_state_provider=lambda device: DeviceMemoryState(640, 840, 300, 1200),
     )
-    projected = projected_over_90_percent.preflight_snapshot_memory(additional_bytes=100)
+    projected = projected_over_90_percent.preflight_snapshot_memory(
+        additional_bytes=100
+    )
     assert projected.driver_need_bytes == 246
     assert projected.projected_reserved_bytes == 1086
     assert projected.reason == SnapshotMemoryReason.DEVICE_MEMORY_FRACTION
@@ -1097,7 +1222,10 @@ def test_preflight_uses_exact_reusable_driver_and_projected_reserved_boundaries(
     ("failure_dtype", "expected_status"),
     (
         (torch.float32, DistributedOptimizerEventStatus.BEGIN_FIRST_ALLOCATION_FAILED),
-        (torch.bfloat16, DistributedOptimizerEventStatus.BEGIN_SECOND_ALLOCATION_FAILED),
+        (
+            torch.bfloat16,
+            DistributedOptimizerEventStatus.BEGIN_SECOND_ALLOCATION_FAILED,
+        ),
     ),
 )
 def test_partial_snapshot_allocation_failures_release_every_tensor(
@@ -1147,7 +1275,9 @@ def test_finish_scratch_allocation_failure_releases_snapshot(
     assert not adapter.armed
 
 
-def test_allocator_peak_is_tracked_through_finish(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_allocator_peak_is_tracked_through_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     optimizer, parameters = _fake_optimizer()
     adapter, registry = _adapter(optimizer, parameters)
     allocated = iter((100, 142, 340, 330))
@@ -1204,7 +1334,10 @@ def test_finish_allocator_query_failure_is_typed_and_releases_all_event_tensors(
     gc.collect()
 
     assert allocator_calls == 3
-    assert adapter.local_status.item() == DistributedOptimizerEventStatus.ALLOCATOR_QUERY_FAILED
+    assert (
+        adapter.local_status.item()
+        == DistributedOptimizerEventStatus.ALLOCATOR_QUERY_FAILED
+    )
     assert not adapter.armed
     assert scratch_storage_refs and scratch_storage_refs[0]() is None
     assert all(reference() is None for reference in snapshot_refs)
@@ -1240,7 +1373,10 @@ def test_begin_allocator_query_failures_are_typed_and_release_partial_snapshots(
     gc.collect()
 
     assert allocator_calls == failure_call
-    assert adapter.local_status.item() == DistributedOptimizerEventStatus.ALLOCATOR_QUERY_FAILED
+    assert (
+        adapter.local_status.item()
+        == DistributedOptimizerEventStatus.ALLOCATOR_QUERY_FAILED
+    )
     assert not adapter.armed
     assert all(reference() is None for reference in snapshot_refs)
 
@@ -1250,7 +1386,9 @@ def test_preflight_estimate_covers_independently_enumerated_peak_live_storages(
     monkeypatch: pytest.MonkeyPatch, finish_chunk_elements: int
 ) -> None:
     optimizer, parameters = _fake_optimizer()
-    adapter, registry = _adapter(optimizer, parameters, finish_chunk_elements=finish_chunk_elements)
+    adapter, registry = _adapter(
+        optimizer, parameters, finish_chunk_elements=finish_chunk_elements
+    )
     accumulator = registry.new_accumulator("cpu")
     estimate = adapter.estimate_snapshot_memory()
     scratch_box = []
@@ -1337,7 +1475,9 @@ def test_real_gloo_capability_negotiation_fails_every_rank_on_one_rank_mismatch(
     ),
 )
 def test_real_two_rank_one_rank_runtime_failure_reaches_one_fixed_consensus_and_releases(
-    distributed_world: None, failure: str, expected_status: DistributedOptimizerEventStatus
+    distributed_world: None,
+    failure: str,
+    expected_status: DistributedOptimizerEventStatus,
 ) -> None:
     assert dist.get_world_size() == 2
     group = dist.new_group(backend="gloo")
@@ -1354,11 +1494,17 @@ def test_real_two_rank_one_rank_runtime_failure_reaches_one_fixed_consensus_and_
     if failure == "binding":
         bindings = {
             parameters[0]: ("update/fc1/0", MetricFamily.FC1),
-            **({parameters[1]: ("update/fc1/1", MetricFamily.FC1)} if rank == 0 else {}),
+            **(
+                {parameters[1]: ("update/fc1/1", MetricFamily.FC1)} if rank == 0 else {}
+            ),
         }
         registry, names = _registry(bindings)
         adapter = Bf16DistributedOptimizerDiagnosticAdapter(
-            optimizer, registry, names, diagnostic_max_extra_bytes=1_000_000, process_group=group
+            optimizer,
+            registry,
+            names,
+            diagnostic_max_extra_bytes=1_000_000,
+            process_group=group,
         )
     else:
         selected = {
@@ -1367,7 +1513,11 @@ def test_real_two_rank_one_rank_runtime_failure_reaches_one_fixed_consensus_and_
         }
         registry, names = _registry(selected)
         adapter = Bf16DistributedOptimizerDiagnosticAdapter(
-            optimizer, registry, names, diagnostic_max_extra_bytes=1_000_000, process_group=group
+            optimizer,
+            registry,
+            names,
+            diagnostic_max_extra_bytes=1_000_000,
+            process_group=group,
         )
 
     accumulator = registry.new_accumulator("cpu")
@@ -1432,7 +1582,9 @@ def test_real_gloo_owner_updates_pool_sufficient_statistics_before_ratios(
 ) -> None:
     group = dist.new_group(backend="gloo")
     parameter = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
-    base_registry, names = _registry({parameter: ("update/fc1/pooled", MetricFamily.FC1)})
+    base_registry, names = _registry(
+        {parameter: ("update/fc1/pooled", MetricFamily.FC1)}
+    )
     registry = MetricRegistry(
         base_registry.descriptors, reduction_binding=ReductionBinding.flat_world(group)
     )
@@ -1448,7 +1600,12 @@ def test_real_gloo_owner_updates_pool_sufficient_statistics_before_ratios(
         applied_before = torch.ones(3, dtype=torch.bfloat16)
         applied_after = torch.tensor([1.0, 4.0, 4.0], dtype=torch.bfloat16)
     registry.add_applied_update(
-        accumulator, names[parameter], master_before, master_after, applied_before, applied_after
+        accumulator,
+        names[parameter],
+        master_before,
+        master_after,
+        applied_before,
+        applied_after,
     )
 
     accumulator.reduce_()

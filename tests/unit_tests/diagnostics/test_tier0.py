@@ -545,63 +545,44 @@ def test_zero_extra_bytes_rejects_before_event_allocation() -> None:
         Tier0Heartbeat(args, [nn.Linear(2, 2)], object())
 
 
-def test_pure_startup_reservation_is_bounded_at_world_size_1024() -> None:
-    requested = tier0_reservation_bytes(
-        num_layers=96,
-        num_microbatches=16,
-        micro_batch_size=4,
-        local_sequence_length=4096,
-        owner_elements=100_000_000,
-        world_size=1024,
-    )
-    repeated = tier0_reservation_bytes(
-        num_layers=96,
-        num_microbatches=16,
-        micro_batch_size=4,
-        local_sequence_length=4096,
-        owner_elements=100_000_000,
-        world_size=1024,
-    )
-    assert requested == repeated
-    assert requested > 600_000_000
-    assert requested < 700_000_000
-
-
-def test_joint_advertised_boundary_fits_and_one_past_rejects_before_p2p() -> None:
-    static = load_static_capability()
-    bounds = static["config_bounds"]
-    requested = tier0_reservation_bytes(
-        num_layers=bounds["num_layers"]["maximum"],
-        num_microbatches=bounds["num_microbatches"]["maximum"],
-        micro_batch_size=bounds["micro_batch_size"]["maximum"],
-        local_sequence_length=bounds["sequence_length"]["maximum"],
-        owner_elements=0,
-        world_size=static["topology_bounds"]["world_size"]["maximum"],
-    )
-    capture_slots = 2 + 10 * 512
-    update_slots = 5 * 512 + 2
+def _independent_tier0_reservation_ledger(
+    *,
+    num_layers: int,
+    num_microbatches: int,
+    micro_batch_size: int,
+    local_sequence_length: int,
+    owner_elements: int,
+    world_size: int,
+) -> tuple[dict[str, int], dict[str, int]]:
+    capture_slots = 2 + 10 * num_layers
+    update_slots = 5 * num_layers + 2
     control_slots = 6
     pack_bytes = (capture_slots + update_slots + control_slots) * 96
-    mask_elements = 8 * 32_768
+    mask_elements = micro_batch_size * local_sequence_length
+    optimizer_chunk_elements = min(owner_elements, 65_536)
     named_allocations = {
         "accumulator_packs": pack_bytes,
         "reduction_arenas": pack_bytes,
-        "received_sidebands": 64 * (mask_elements + 1) * 4,
-        "local_sidebands": 64 * (mask_elements + 1) * 4,
-        "received_sideband_validity": 64,
-        "local_sideband_validity": 64,
-        "optimizer_snapshot_and_scratch": 104,
-        "capture_workspace": 1_572_864,
+        "received_sidebands": num_microbatches * (mask_elements + 1) * 4,
+        "local_sidebands": num_microbatches * (mask_elements + 1) * 4,
+        "received_sideband_validity": num_microbatches,
+        "local_sideband_validity": num_microbatches,
+        "optimizer_snapshot_and_scratch": (
+            owner_elements * 6 + optimizer_chunk_elements * 28 + 104
+        ),
+        "optimizer_adapter_event_status": 8,
+        "retained_optimizer_capability_flags": 15 * 8,
+        "capture_workspace": 16 * 1024 * 96,
         "capture_runtime_status": 8,
         "capture_runtime_error": 8,
         "capture_mask_finite": mask_elements,
         "capture_mask_nonnegative": mask_elements,
         "capture_mask_scalar": 1,
         "capture_valid_token_count": 8,
-        "global_rank_evidence": 1024 * 11 * 8,
+        "global_rank_evidence": world_size * 11 * 8,
         "local_rank_evidence": 11 * 8,
         "sink_staging": (
-            1024 * 11 + 13 * (capture_slots + update_slots + control_slots)
+            world_size * 11 + 13 * (capture_slots + update_slots + control_slots)
         )
         * 8,
         "mask_comparison": mask_elements,
@@ -610,12 +591,84 @@ def test_joint_advertised_boundary_fits_and_one_past_rejects_before_p2p() -> Non
         "mask_checksum_work": mask_elements * 4,
         "control_scalar": 8,
         "startup_allocation_status": 8,
-        "artifact_setup_status": 8,
     }
+    explicit_margins = {
+        "allocator_alignment": 512 * (2 * num_microbatches + 64),
+        "backend_workspace": 64 * 1024**2,
+    }
+    return named_allocations, explicit_margins
+
+
+def test_pure_startup_reservation_is_bounded_at_world_size_1024() -> None:
+    config = {
+        "num_layers": 96,
+        "num_microbatches": 16,
+        "micro_batch_size": 4,
+        "local_sequence_length": 4096,
+        "owner_elements": 100_000_000,
+        "world_size": 1024,
+    }
+    requested = tier0_reservation_bytes(**config)
+    repeated = tier0_reservation_bytes(**config)
+    named_allocations, explicit_margins = _independent_tier0_reservation_ledger(
+        **config
+    )
+    independently_required = sum(named_allocations.values()) + sum(
+        explicit_margins.values()
+    )
+    assert requested == repeated
+    assert requested >= independently_required
+    assert requested == independently_required
+    assert requested > 600_000_000
+    assert requested < 700_000_000
+
+
+def test_minimal_startup_reservation_covers_independent_named_storage() -> None:
+    config = {
+        "num_layers": 1,
+        "num_microbatches": 1,
+        "micro_batch_size": 1,
+        "local_sequence_length": 1,
+        "owner_elements": 0,
+        "world_size": 1,
+    }
+    requested = tier0_reservation_bytes(**config)
+    named_allocations, explicit_margins = _independent_tier0_reservation_ledger(
+        **config
+    )
+    independently_required = sum(named_allocations.values()) + sum(
+        explicit_margins.values()
+    )
+    assert requested >= independently_required
+    assert requested == independently_required
+
+
+def test_joint_advertised_boundary_fits_and_one_past_rejects_before_p2p() -> None:
+    static = load_static_capability()
+    bounds = static["config_bounds"]
+    config = {
+        "num_layers": bounds["num_layers"]["maximum"],
+        "num_microbatches": bounds["num_microbatches"]["maximum"],
+        "micro_batch_size": bounds["micro_batch_size"]["maximum"],
+        "local_sequence_length": bounds["sequence_length"]["maximum"],
+        "owner_elements": 0,
+        "world_size": static["topology_bounds"]["world_size"]["maximum"],
+    }
+    requested = tier0_reservation_bytes(**config)
+    named_allocations, explicit_margins = _independent_tier0_reservation_ledger(
+        **config
+    )
     named_minimum = sum(named_allocations.values())
-    explicit_margin = 512 * (2 * 64 + 64) + 64 * 1024**2
-    assert named_minimum >= 141_115_114
-    assert requested == named_minimum + explicit_margin
+    independently_required = named_minimum + sum(explicit_margins.values())
+    assert named_allocations["optimizer_adapter_event_status"] == 8
+    assert named_allocations["retained_optimizer_capability_flags"] == 15 * 8 == 120
+    assert named_minimum == 141_131_642
+    assert explicit_margins == {
+        "allocator_alignment": 98_304,
+        "backend_workspace": 67_108_864,
+    }
+    assert requested >= independently_required
+    assert requested == independently_required == 208_338_810
     assert requested <= bounds["maximum_reservation_bytes"] < 2**63
 
     args = _status_only_args()

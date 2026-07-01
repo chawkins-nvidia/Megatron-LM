@@ -212,6 +212,8 @@ def tier0_reservation_bytes(
     one_sideband_set_bytes = num_microbatches * (mask_elements + 1) * 4
     one_sideband_validity_set_bytes = num_microbatches
     optimizer_bytes = snapshot_memory_estimate(owner_elements).total_bytes
+    optimizer_event_status_bytes = 8
+    optimizer_capability_flags_bytes = 15 * 8
     capture_scratch = PackedSufficientStatistics.scratch_bytes_for_capacity()
     capture_session_bytes = 2 * mask_elements + 8 + 8 + 1 + 8
     global_rank_evidence_bytes = world_size * _RANK_EVIDENCE_FIELDS * 8
@@ -222,7 +224,7 @@ def tier0_reservation_bytes(
     ) * 8
     mask_comparison_bytes = mask_elements + 1
     checksum_control_bytes = 2 * mask_elements * 4 + 8
-    startup_status_bytes = 2 * 8
+    startup_allocation_status_bytes = 8
     allocator_alignment_bytes = 512 * (2 * num_microbatches + 64)
     return (
         pack_bytes
@@ -232,6 +234,8 @@ def tier0_reservation_bytes(
         + one_sideband_validity_set_bytes
         + one_sideband_validity_set_bytes
         + optimizer_bytes
+        + optimizer_event_status_bytes
+        + optimizer_capability_flags_bytes
         + capture_scratch
         + capture_session_bytes
         + global_rank_evidence_bytes
@@ -239,7 +243,7 @@ def tier0_reservation_bytes(
         + sink_staging_bytes
         + mask_comparison_bytes
         + checksum_control_bytes
-        + startup_status_bytes
+        + startup_allocation_status_bytes
         + allocator_alignment_bytes
         + _BACKEND_WORKSPACE_ALLOWANCE_BYTES
     )
