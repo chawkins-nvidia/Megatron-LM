@@ -20,6 +20,7 @@ from megatron.core.enums import ModelType
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
@@ -56,6 +57,7 @@ from megatron.training.diagnostics.diagnostic_replay import (
     StableSampleDataset,
     Tier1ReplayEngine,
     TokenId,
+    _ModelGraphFacts,
     _ReplayPlanFacts,
     _validate_dense_gpt_models,
     _systematic_positions,
@@ -1112,6 +1114,57 @@ def _count_schedule_calls(schedule):
     schedule.forward_backward_func = forward_backward
     schedule.forward_step_func = forward_step
     return calls
+
+
+def test_execution_facts_bind_diagnostic_heartbeat_identity_not_mutable_internals() -> None:
+    from megatron.training.diagnostics.tier0 import Tier0Heartbeat
+
+    _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
+    heartbeat = object.__new__(Tier0Heartbeat)
+    heartbeat.device_state = torch.ones(1)
+    model.config.diagnostic_heartbeat = heartbeat
+
+    facts = _ModelGraphFacts.observe((model,))
+    heartbeat.device_state.add_(1)
+
+    assert _ModelGraphFacts.observe((model,)) == facts
+    model.config.diagnostic_heartbeat = object.__new__(Tier0Heartbeat)
+    assert _ModelGraphFacts.observe((model,)) != facts
+
+    model.config.diagnostic_heartbeat = True
+    with pytest.raises(TypeError, match="requires the exact Tier0Heartbeat"):
+        _ModelGraphFacts.observe((model,))
+
+
+def test_execution_facts_report_every_unsupported_module_tensor_path() -> None:
+    _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
+    model.decoder_layer.first_runtime_tensor = torch.ones(1)
+    model.decoder_layer.mlp.second_runtime_tensor = torch.ones(1)
+
+    with pytest.raises(TypeError) as caught:
+        _ModelGraphFacts.observe((model,))
+
+    message = str(caught.value)
+    assert "model[0].decoder_layer.first_runtime_tensor" in message
+    assert "model[0].decoder_layer.mlp.second_runtime_tensor" in message
+
+
+def test_execution_facts_admit_only_exact_transformer_block_pipeline_input() -> None:
+    model = _dense_gpt_stub()
+    block = TransformerBlock.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.input_tensor = torch.ones(2, 3)
+    model.decoder = block
+
+    facts = _ModelGraphFacts.observe((model,))
+    block.input_tensor = block.input_tensor.clone()
+    assert _ModelGraphFacts.observe((model,)) != facts
+
+    block.other_runtime_tensor = torch.ones(1)
+    with pytest.raises(
+        TypeError, match=r"model\[0\]\.decoder\.other_runtime_tensor"
+    ):
+        _ModelGraphFacts.observe((model,))
 
 
 def test_engine_prepares_zero_local_selection_with_exact_event_capacity() -> None:

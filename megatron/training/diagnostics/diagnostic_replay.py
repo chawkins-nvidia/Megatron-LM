@@ -2739,8 +2739,11 @@ def _is_module_runtime_binding(name: str) -> bool:
 class _FactNormalizer:
     """Create a deterministic, alias-aware snapshot of admitted execution values."""
 
-    def __init__(self, *, allow_tensors: bool = True) -> None:
+    def __init__(
+        self, *, allow_tensors: bool = True, runtime_bindings: Sequence[Any] = ()
+    ) -> None:
         self.allow_tensors = allow_tensors
+        self.runtime_bindings = {id(value): value for value in runtime_bindings}
         self.memo: dict[int, int] = {}
         self.active: set[int] = set()
 
@@ -2755,36 +2758,53 @@ class _FactNormalizer:
         self.active.add(identity)
         try:
             contents = build()
+        except BaseException:
+            for key, index in tuple(self.memo.items()):
+                if index >= slot:
+                    del self.memo[key]
+            raise
         finally:
             self.active.remove(identity)
         return ("object", slot, identity, type(value), contents)
 
-    def freeze(self, value: Any) -> Any:
+    def freeze(self, value: Any, path: str = "execution") -> Any:
+        runtime_binding = self.runtime_bindings.get(id(value))
+        if runtime_binding is value:
+            return ("runtime_binding", *_identity_facts(value))
         if value is None or type(value) in (bool, int, float, complex, str, bytes):
             return ("scalar", type(value), value)
         if isinstance(value, Enum):
-            return ("enum", type(value), value.name, self.freeze(value.value))
+            return ("enum", type(value), value.name, self.freeze(value.value, f"{path}.value"))
         if isinstance(value, (torch.dtype, torch.device, torch.layout)):
             return ("torch_value", type(value), str(value))
         if isinstance(value, torch.Tensor):
             if not self.allow_tensors:
-                raise TypeError("mutable tensor execution attributes are not supported")
+                raise TypeError(
+                    f"mutable tensor execution attributes are not supported at {path}"
+                )
             return ("tensor", _snapshot_tensor_facts(value))
         if type(value) is nullcontext:
             if set(vars(value)) != {"enter_result"}:
-                raise TypeError("nullcontext execution state has unexpected attributes")
+                raise TypeError(
+                    f"nullcontext execution state at {path} has unexpected attributes"
+                )
             if not _is_snapshot_leaf(value.enter_result):
-                raise TypeError("nullcontext execution state requires an immutable enter_result")
+                raise TypeError(
+                    f"nullcontext execution state at {path} requires an immutable enter_result"
+                )
             return self._compound(
-                value, lambda: (("enter_result", self.freeze(value.enter_result)),)
+                value,
+                lambda: (
+                    ("enter_result", self.freeze(value.enter_result, f"{path}.enter_result")),
+                ),
             )
         if isinstance(value, functools.partial):
             return self._compound(
                 value,
                 lambda: (
-                    self.freeze(value.func),
-                    self.freeze(value.args),
-                    self.freeze(value.keywords),
+                    self.freeze(value.func, f"{path}.func"),
+                    self.freeze(value.args, f"{path}.args"),
+                    self.freeze(value.keywords, f"{path}.keywords"),
                 ),
             )
         if is_dataclass(value) and not isinstance(value, type):
@@ -2793,30 +2813,57 @@ class _FactNormalizer:
                 value,
                 lambda: (
                     tuple(
-                        (item.name, self.freeze(getattr(value, item.name)))
+                        (
+                            item.name,
+                            self.freeze(getattr(value, item.name), f"{path}.{item.name}"),
+                        )
                         for item in fields(value)
                     ),
                     tuple(
-                        (name, self.freeze(item))
+                        (name, self.freeze(item, f"{path}.{name}"))
                         for name, item in vars(value).items()
                         if name not in names
                     ),
                 ),
             )
         if type(value) in (tuple, list):
-            return self._compound(value, lambda: tuple(self.freeze(item) for item in value))
+            return self._compound(
+                value,
+                lambda: tuple(
+                    self.freeze(item, f"{path}[{index}]")
+                    for index, item in enumerate(value)
+                ),
+            )
         if type(value) in (dict, OrderedDict):
             return self._compound(
                 value,
-                lambda: tuple((self.freeze(key), self.freeze(item)) for key, item in value.items()),
+                lambda: tuple(
+                    (
+                        self.freeze(key, f"{path}.key[{index}]"),
+                        self.freeze(item, f"{path}.value[{index}]"),
+                    )
+                    for index, (key, item) in enumerate(value.items())
+                ),
             )
         if type(value) in (set, frozenset):
             return self._compound(
-                value, lambda: tuple(sorted((self.freeze(item) for item in value), key=repr))
+                value,
+                lambda: tuple(
+                    sorted(
+                        (
+                            self.freeze(item, f"{path}.set_item[{index}]")
+                            for index, item in enumerate(value)
+                        ),
+                        key=repr,
+                    )
+                ),
             )
         if isinstance(value, type) or callable(value):
             return ("callable", *_identity_facts(value))
-        raise TypeError(f"unsupported execution configuration value: {type(value).__qualname__}")
+        raise TypeError(
+            f"unsupported execution configuration value at {path}: "
+            f"{type(value).__module__}.{type(value).__qualname__}"
+        )
 
 
 @dataclass(frozen=True)
@@ -2830,11 +2877,16 @@ class _ModelGraphFacts:
         models: Sequence[torch.nn.Module],
         probe_hook_deltas: Mapping[tuple[int, str], tuple[Any, ...]] | None = None,
     ) -> "_ModelGraphFacts":
+        from megatron.core.transformer.transformer_block import TransformerBlock
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        from .tier0 import Tier0Heartbeat
+
         module_normalizer = _FactNormalizer(allow_tensors=False)
-        config_normalizer = _FactNormalizer()
         module_facts: list[tuple[Any, ...]] = []
         configs: dict[int, Any] = {}
         active: set[int] = set()
+        unsupported: list[str] = []
         hook_deltas = {} if probe_hook_deltas is None else probe_hook_deltas
 
         def hook_map_facts(module: torch.nn.Module) -> tuple[tuple[Any, ...], ...]:
@@ -2899,13 +2951,29 @@ class _ModelGraphFacts:
                         continue
                     if name == "config":
                         fact = ("config_binding", config_binding)
+                    elif name == "input_tensor" and type(module) is TransformerBlock:
+                        if value is None:
+                            fact = ("pipeline_runtime_tensor", None)
+                        elif isinstance(value, torch.Tensor):
+                            fact = ("pipeline_runtime_tensor", _snapshot_tensor_facts(value))
+                        else:
+                            unsupported.append(
+                                f"TransformerBlock pipeline input at {path}.{name} must be "
+                                f"tensor-or-None; got {type(value).__module__}."
+                                f"{type(value).__qualname__}"
+                            )
+                            continue
                     elif _is_module_runtime_binding(name):
                         fact = (
                             "runtime_binding",
                             None if value is None else _identity_facts(value),
                         )
                     else:
-                        fact = module_normalizer.freeze(value)
+                        try:
+                            fact = module_normalizer.freeze(value, f"{path}.{name}")
+                        except TypeError as error:
+                            unsupported.append(str(error))
+                            continue
                     module_state.append((name, fact))
                 module_facts.append(
                     (
@@ -2926,12 +2994,32 @@ class _ModelGraphFacts:
                 active.remove(identity)
 
         for model_index, model in enumerate(models):
-            walk(model, str(model_index))
-        config_facts = tuple(
-            (_identity_facts(config), config_normalizer.freeze(config))
-            for config in configs.values()
-        )
-        return cls(tuple(module_facts), config_facts)
+            walk(model, f"model[{model_index}]")
+        runtime_bindings = []
+        for index, config in enumerate(configs.values()):
+            heartbeat = getattr(config, "diagnostic_heartbeat", None)
+            if heartbeat is None:
+                continue
+            if type(config) is not TransformerConfig or type(heartbeat) is not Tier0Heartbeat:
+                unsupported.append(
+                    f"config[{index}].diagnostic_heartbeat requires the exact Tier0Heartbeat; "
+                    f"got {type(heartbeat).__module__}.{type(heartbeat).__qualname__}"
+                )
+                continue
+            runtime_bindings.append(heartbeat)
+        config_normalizer = _FactNormalizer(runtime_bindings=runtime_bindings)
+        config_facts = []
+        for index, config in enumerate(configs.values()):
+            try:
+                fact = config_normalizer.freeze(config, f"config[{index}]")
+            except TypeError as error:
+                unsupported.append(str(error))
+                continue
+            config_facts.append((_identity_facts(config), fact))
+        if unsupported:
+            details = "\n".join(f"- {message}" for message in unsupported)
+            raise TypeError(f"unsupported execution module state:\n{details}")
+        return cls(tuple(module_facts), tuple(config_facts))
 
 
 @dataclass(frozen=True)
