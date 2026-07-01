@@ -1704,6 +1704,27 @@ def test_memory_model_counts_every_padded_replay_microbatch() -> None:
     assert padded.term("host_replay_inputs") == 4 * one.term("host_replay_inputs")
 
 
+def test_memory_model_bounds_dp_distributed_schedule_without_rejecting_it() -> None:
+    config = _memory_config(
+        sequence_length=128,
+        hidden_size=256,
+        ffn_hidden_size=1024,
+        global_batch_size=16,
+        selected_tokens=16,
+        micro_batch_size=2,
+        replay_microbatches=4,
+    )
+    estimate = estimate_replay_memory(config)
+    full_batch = 2 * 128 * (8 + 8 + 8 + 4 + 1) + 2 * 2 * 8
+
+    assert estimate.term("host_replay_inputs") == 8 * full_batch
+
+    observed = estimate_replay_memory(
+        replace(config, observed_host_replay_bytes=4 * full_batch)
+    )
+    assert observed.term("host_replay_inputs") == 4 * full_batch
+
+
 def test_memory_model_scales_all_topology_dimensions_without_dp_cp_duplication() -> None:
     base = estimate_replay_memory(_memory_config())
     longer = estimate_replay_memory(_memory_config(sequence_length=2048))

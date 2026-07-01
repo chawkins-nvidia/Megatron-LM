@@ -2380,18 +2380,20 @@ def estimate_replay_memory(config: ReplayMemoryConfig) -> ReplayMemoryEstimate:
     ):
         raise ValueError("CP-local sequence length must support sequence parallelism")
     # Every selected row and selected sample may land on one DP/CP rank.  DP
-    # and CP therefore do not divide the maximum-rank bound.
+    # and CP therefore do not divide the maximum-rank modeled bound.  The
+    # actual DP-max schedule may be shorter when selection is distributed;
+    # plan construction and consensus, not this topology-only model, prove
+    # that no selected samples were discarded.
     local_samples = min(config.global_batch_size, config.selected_tokens)
     minimum_microbatches = _ceil_div(local_samples, config.micro_batch_size) if local_samples else 0
-    if config.replay_microbatches < minimum_microbatches:
-        raise ValueError("replay microbatch count cannot discard selected samples")
+    modeled_replay_microbatches = max(config.replay_microbatches, minimum_microbatches)
     # tokens, labels, position_ids, loss_mask, diagnostic mask, and two identity vectors.
     full_batch = _checked_product(
         config.micro_batch_size, config.sequence_length, 8 + 8 + 8 + 4 + 1
     )
     full_batch = _checked_sum(full_batch, _checked_product(config.micro_batch_size, 2, 8))
     modeled_host_inputs = (
-        _checked_product(config.replay_microbatches, full_batch) if config.tp_source else 0
+        _checked_product(modeled_replay_microbatches, full_batch) if config.tp_source else 0
     )
     host_inputs = (
         modeled_host_inputs
