@@ -3008,6 +3008,8 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
     def validate_spec_value(value: Any) -> None:
         if value is None or type(value) in (bool, int, float, str, bytes):
             return
+        if isinstance(value, Enum):
+            return
         if type(value) in (tuple, list):
             for item in value:
                 validate_spec_value(item)

@@ -16,6 +16,7 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.enums import ModelType
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -52,6 +53,7 @@ from megatron.training.diagnostics.diagnostic_replay import (
     Tier1ReplayEngine,
     TokenId,
     _ReplayPlanFacts,
+    _validate_dense_gpt_models,
     _systematic_positions,
     broadcast_replay_plan,
     build_distributed_source_plan,
@@ -838,6 +840,23 @@ def _dense_gpt_stub() -> GPTModel:
     model.model_type = ModelType.encoder_or_decoder
     model.mtp_process = False
     return model
+
+
+def test_dense_gpt_spec_accepts_canonical_enum_values() -> None:
+    model = _dense_gpt_stub()
+    model.transformer_layer_spec = ModuleSpec(
+        module=TransformerLayer,
+        params={"self_attn_mask_type": AttnMaskType.causal},
+    )
+
+    _validate_dense_gpt_models((model,))
+
+    model.transformer_layer_spec = ModuleSpec(
+        module=TransformerLayer,
+        params={"unknown_mutable": set()},
+    )
+    with pytest.raises(TypeError, match="unsupported value set"):
+        _validate_dense_gpt_models((model,))
 
 
 def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):
