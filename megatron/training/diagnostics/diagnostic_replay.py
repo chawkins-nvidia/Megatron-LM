@@ -10,11 +10,11 @@ changing Tier-0 registry, accumulator, cadence, or artifact ownership.
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import math
 import os
 import random
-import sys
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
@@ -300,6 +300,10 @@ class ReplayPreflightError(RuntimeError):
     """Raised by a globally settled failure before schedule/P2P entry."""
 
 
+class ReplaySnapshotAllocationError(ReplayPreflightError):
+    """Raised when an admitted state snapshot cannot allocate its retained storage."""
+
+
 class ReadinessConsensus:
     """Own a status scalar allocated before any replay-risky phase."""
 
@@ -466,6 +470,7 @@ class ReplayPlan:
     microbatches: list[ReplayMicrobatch]
     source_rank: bool
     _filler: RecordedSample | None = field(default=None, repr=False)
+    _source_population: tuple[tuple[SampleId, tuple[int, ...]], ...] = field(default=(), repr=False)
 
     @property
     def num_microbatches(self) -> int:
@@ -494,6 +499,7 @@ class ReplayPlan:
 
         self.microbatches.clear()
         self._filler = None
+        self._source_population = ()
         self.metadata = ReplayPlanMetadata(
             self.metadata.micro_batch_size, self.metadata.sequence_length, 0, 0, (), (), ()
         )
@@ -505,7 +511,21 @@ class _ReplayPlanFacts:
     selected_tokens: int
     microbatches: int
     host_tensor_bytes: int
-    tensor_bindings: tuple[tuple[int, str, int, tuple[int, ...], torch.dtype, int], ...]
+    source_population: tuple[tuple[SampleId, tuple[int, ...]], ...]
+    tensor_bindings: tuple[
+        tuple[int, str, int, tuple[int, ...], tuple[int, ...], int, torch.dtype, int, str], ...
+    ]
+
+    @staticmethod
+    def _tensor_digest(value: torch.Tensor) -> str:
+        contiguous = value.detach().contiguous()
+        byte_view = contiguous.view(torch.uint8).reshape(-1).numpy()
+        digest = hashlib.sha256()
+        payload = memoryview(byte_view).cast("B")
+        chunk_bytes = 1 << 20
+        for start in range(0, len(payload), chunk_bytes):
+            digest.update(payload[start : start + chunk_bytes])
+        return digest.hexdigest()
 
     @classmethod
     def observe(cls, plan: ReplayPlan) -> "_ReplayPlanFacts":
@@ -532,6 +552,29 @@ class _ReplayPlanFacts:
             or len(set(metadata.selected_tokens)) != actual_selected
         ):
             raise ValueError("replay plan selected-token identities are inconsistent")
+        expected_sample_count = _checked_product(
+            metadata.num_microbatches, metadata.micro_batch_size
+        )
+        if len(metadata.ordered_sample_ids) != expected_sample_count:
+            raise ValueError("replay plan stable sample identities have the wrong size")
+        derived_tokens = tuple(
+            sorted(
+                TokenId(
+                    metadata.ordered_sample_ids[
+                        batch_index * metadata.micro_batch_size
+                        + flat_index // metadata.sequence_length
+                    ],
+                    flat_index % metadata.sequence_length,
+                )
+                for batch_index, mask in enumerate(metadata.diagnostic_masks)
+                for flat_index, selected in enumerate(mask)
+                if selected
+            )
+        )
+        if len(set(derived_tokens)) != len(derived_tokens):
+            raise ValueError("replay plan selects the same stable token more than once")
+        if tuple(sorted(metadata.selected_tokens)) != derived_tokens:
+            raise ValueError("replay plan selected tokens do not match stable mask positions")
         expected_fields = {
             **dict(_MODEL_FIELDS),
             DIAGNOSTIC_MASK_FIELD: torch.bool,
@@ -542,6 +585,27 @@ class _ReplayPlanFacts:
             raise ValueError("TP source replay plan has the wrong microbatch count")
         if not plan.source_rank and plan.microbatches:
             raise ValueError("non-source replay plans cannot retain source microbatches")
+        if not plan.source_rank and plan._source_population:
+            raise ValueError("non-source replay plans cannot retain source population state")
+        population = dict(plan._source_population)
+        if plan.source_rank:
+            if not population or len(population) != len(plan._source_population):
+                raise ValueError("source replay plan lacks unique recorded population provenance")
+            for sample_id, columns in plan._source_population:
+                if (
+                    len(columns) != len(set(columns))
+                    or tuple(sorted(columns)) != columns
+                    or any(not 0 <= column < metadata.sequence_length for column in columns)
+                ):
+                    raise ValueError("source replay population has invalid true-mask positions")
+            if any(
+                token.sample not in population
+                or token.sequence_column not in population[token.sample]
+                for token in metadata.selected_tokens
+            ):
+                raise ValueError(
+                    "replay selection does not exist in the recorded source population"
+                )
         bindings = []
         total_bytes = 0
         for batch_index, batch in enumerate(plan.microbatches):
@@ -549,6 +613,27 @@ class _ReplayPlanFacts:
                 raise ValueError("replay microbatch fields changed after fixed-field admission")
             if len(batch.sample_ids) != metadata.micro_batch_size:
                 raise ValueError("replay microbatch sample identities have the wrong size")
+            sample_start = batch_index * metadata.micro_batch_size
+            sample_end = sample_start + metadata.micro_batch_size
+            expected_ids = metadata.ordered_sample_ids[sample_start:sample_end]
+            if batch.sample_ids != expected_ids:
+                raise ValueError("source replay stable sample identities changed")
+            if any(sample_id not in population for sample_id in batch.sample_ids):
+                raise ValueError("source replay batch contains an unrecorded stable sample ID")
+            actual_ids = tuple(
+                SampleId(
+                    int(batch.data[SAMPLE_EPOCH_FIELD][lane]),
+                    int(batch.data[SAMPLE_INDEX_FIELD][lane]),
+                )
+                for lane in range(metadata.micro_batch_size)
+            )
+            if actual_ids != batch.sample_ids:
+                raise ValueError("source replay identity tensors disagree with stable sample IDs")
+            diagnostic_mask = batch.data[DIAGNOSTIC_MASK_FIELD]
+            loss_mask = batch.data["loss_mask"]
+            if isinstance(diagnostic_mask, torch.Tensor) and isinstance(loss_mask, torch.Tensor):
+                if bool(torch.any(diagnostic_mask & (loss_mask == 0))):
+                    raise ValueError("replay plan selects a token outside the true valid mask")
             for name, dtype in expected_fields.items():
                 value = batch.data[name]
                 if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
@@ -563,13 +648,24 @@ class _ReplayPlanFacts:
                 field_bytes = _checked_product(value.numel(), value.element_size())
                 total_bytes = _checked_sum(total_bytes, field_bytes)
                 bindings.append(
-                    (batch_index, name, id(value), tuple(value.shape), value.dtype, field_bytes)
+                    (
+                        batch_index,
+                        name,
+                        id(value),
+                        tuple(value.shape),
+                        tuple(value.stride()),
+                        value.storage_offset(),
+                        value.dtype,
+                        field_bytes,
+                        cls._tensor_digest(value),
+                    )
                 )
         return cls(
             descriptor_hash=metadata.descriptor_hash,
             selected_tokens=actual_selected,
             microbatches=metadata.num_microbatches,
             host_tensor_bytes=total_bytes,
+            source_population=plan._source_population,
             tensor_bindings=tuple(bindings),
         )
 
@@ -722,7 +818,10 @@ def build_local_replay_plan(
         ordered_sample_ids=tuple(sample for batch in batches for sample in batch.sample_ids),
         diagnostic_masks=masks,
     )
-    return ReplayPlan(metadata, batches, True, filler)
+    population = tuple(
+        (sample_id, sample.valid_columns) for sample_id, sample in sorted(by_id.items())
+    )
+    return ReplayPlan(metadata, batches, True, filler, population)
 
 
 def build_distributed_source_plan(
@@ -1246,42 +1345,50 @@ class ReplayRngState:
 
 
 @dataclass
+class _StorageSnapshot:
+    original: torch.UntypedStorage
+    device: torch.device
+    storage_bytes: int
+    aligned_bytes: int
+    contents: torch.Tensor | None = None
+
+    def _byte_view(self) -> torch.Tensor:
+        return torch.empty(0, dtype=torch.uint8, device=self.device).set_(
+            self.original, 0, (self.storage_bytes,), (1,)
+        )
+
+    def capture(self) -> None:
+        self.contents = self._byte_view().detach().clone()
+
+    def restore(self) -> None:
+        if self.contents is None:
+            raise RuntimeError("model-state storage snapshot was not captured")
+        self._byte_view().copy_(self.contents)
+
+    def verify(self) -> bool:
+        return self.contents is not None and torch.equal(self._byte_view(), self.contents)
+
+
+@dataclass
 class _ValueSnapshot:
     original: Any
-    contents: Any
-
-    @classmethod
-    def capture(cls, value: Any) -> "_ValueSnapshot":
-        if isinstance(value, torch.Tensor):
-            contents = value.detach().clone()
-        elif type(value) is list:
-            contents = tuple(cls.capture(item) for item in value)
-        elif type(value) is tuple:
-            contents = tuple(cls.capture(item) for item in value)
-        elif type(value) in (dict, OrderedDict):
-            if any(not _is_snapshot_key(key) for key in value):
-                raise TypeError("mutable model-state mappings require immutable scalar keys")
-            contents = tuple((key, cls.capture(item)) for key, item in value.items())
-        elif type(value) is set:
-            if any(not _is_snapshot_key(item) for item in value):
-                raise TypeError("mutable model-state sets require immutable scalar values")
-            contents = frozenset(value)
-        elif _is_snapshot_leaf(value):
-            contents = value
-        else:
-            raise TypeError(f"unsupported mutable model-state value: {type(value).__qualname__}")
-        return cls(value, contents)
+    contents: Any = None
+    tensor_layout: tuple[Any, ...] | None = None
 
     def restore(self) -> Any:
         if isinstance(self.original, torch.Tensor):
-            self.original.copy_(self.contents)
+            assert isinstance(self.contents, _StorageSnapshot)
+            assert self.tensor_layout is not None
+            shape, stride, offset, requires_grad, _facts = self.tensor_layout
+            with torch.no_grad():
+                self.original.set_(self.contents.original, offset, shape, stride)
+                self.original.requires_grad_(requires_grad)
         elif type(self.original) is list:
             self.original.clear()
             self.original.extend(item.restore() for item in self.contents)
         elif type(self.original) is tuple:
             for item in self.contents:
                 item.restore()
-            return self.original
         elif type(self.original) in (dict, OrderedDict):
             self.original.clear()
             self.original.update((key, item.restore()) for key, item in self.contents)
@@ -1294,44 +1401,22 @@ class _ValueSnapshot:
         if value is not self.original:
             return False
         if isinstance(value, torch.Tensor):
-            return torch.equal(value, self.contents)
-        if type(value) is list:
-            return len(value) == len(self.contents) and all(
-                snapshot.verify(item) for snapshot, item in zip(self.contents, value, strict=True)
-            )
-        if type(value) is tuple:
+            assert isinstance(self.contents, _StorageSnapshot)
+            assert self.tensor_layout is not None
+            return _snapshot_tensor_facts(value) == self.tensor_layout[4]
+        if type(value) in (list, tuple):
             return len(value) == len(self.contents) and all(
                 snapshot.verify(item) for snapshot, item in zip(self.contents, value, strict=True)
             )
         if type(value) in (dict, OrderedDict):
-            if type(value) is not type(self.original):
-                return False
-            return tuple(value) == tuple(key for key, _ in self.contents) and all(
-                snapshot.verify(value[key]) for key, snapshot in self.contents
+            return (
+                type(value) is type(self.original)
+                and tuple(value) == tuple(key for key, _ in self.contents)
+                and all(snapshot.verify(value[key]) for key, snapshot in self.contents)
             )
         if type(value) is set:
             return value == self.contents
         return value is self.original
-
-    @property
-    def tensor_bytes(self) -> int:
-        """Return recursively cloned tensor and mutable-container storage."""
-
-        if isinstance(self.original, torch.Tensor):
-            return self.contents.numel() * self.contents.element_size() + sys.getsizeof(
-                self.contents
-            )
-        if type(self.original) in (list, tuple):
-            return (sys.getsizeof(self.contents) if self.contents else 0) + sum(
-                item.tensor_bytes for item in self.contents
-            )
-        if type(self.original) in (dict, OrderedDict):
-            return (sys.getsizeof(self.contents) if self.contents else 0) + sum(
-                sys.getsizeof(entry) + entry[1].tensor_bytes for entry in self.contents
-            )
-        if type(self.original) is set:
-            return sys.getsizeof(self.contents) if self.contents else 0
-        return 0
 
 
 def _is_snapshot_key(value: Any) -> bool:
@@ -1346,31 +1431,133 @@ def _is_snapshot_leaf(value: Any) -> bool:
     )
 
 
-def _value_tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
-    """Conservatively count recursively cloned state storage before capture."""
+def _snapshot_tensor_facts(value: torch.Tensor) -> tuple[Any, ...]:
+    if value.layout is not torch.strided or value.device.type == "meta":
+        raise TypeError("model-state snapshots require materialized strided tensors")
+    storage = value.untyped_storage()
+    return (
+        id(value),
+        type(value),
+        value.dtype,
+        value.device,
+        value.layout,
+        tuple(value.shape),
+        tuple(value.stride()),
+        value.storage_offset(),
+        value.requires_grad,
+        storage._cdata,
+        storage.nbytes(),
+    )
 
-    seen = set() if seen is None else seen
-    identity = id(value)
-    if identity in seen:
-        return 0
-    seen.add(identity)
-    if isinstance(value, torch.Tensor):
-        return value.numel() * value.element_size() + sys.getsizeof(value)
-    if type(value) in (list, tuple):
-        container_bytes = sys.getsizeof(value) if value else 0
-        return _checked_sum(container_bytes, *(_value_tensor_bytes(item, seen) for item in value))
-    if type(value) in (dict, OrderedDict):
-        container_bytes = sys.getsizeof(value) if value else 0
-        return _checked_sum(
-            container_bytes,
-            *(
-                _checked_sum(sys.getsizeof((key, item)), _value_tensor_bytes(item, seen))
-                for key, item in value.items()
-            ),
-        )
-    if type(value) is set:
-        return sys.getsizeof(value) if value else 0
-    return 0
+
+class _ValueSnapshotPlan:
+    """Walk, account, and capture one alias-aware recursive model-state graph."""
+
+    def __init__(self, maximum_tensor_bytes: int, alignment: int = 256) -> None:
+        if (
+            not 0 <= maximum_tensor_bytes <= _CAPACITY_LIMIT
+            or alignment <= 0
+            or alignment > _CAPACITY_LIMIT
+        ):
+            raise ValueError("model state snapshot cap or alignment is invalid")
+        self.maximum_tensor_bytes = maximum_tensor_bytes
+        self.alignment = alignment
+        self.memo: dict[int, _ValueSnapshot] = {}
+        self.active: set[int] = set()
+        self.storages: dict[tuple[str, int | None, int], _StorageSnapshot] = {}
+        self.tensor_nodes: list[_ValueSnapshot] = []
+        self.tensor_bytes = 0
+
+    def walk(self, value: Any) -> _ValueSnapshot:
+        if _is_snapshot_leaf(value):
+            return _ValueSnapshot(value, value)
+        identity = id(value)
+        if identity in self.active:
+            raise TypeError("cyclic mutable model-state values are not supported")
+        if identity in self.memo:
+            return self.memo[identity]
+        if isinstance(value, torch.Tensor):
+            facts = _snapshot_tensor_facts(value)
+            storage = value.untyped_storage()
+            key = (value.device.type, value.device.index, storage._cdata)
+            storage_snapshot = self.storages.get(key)
+            if storage_snapshot is None:
+                storage_bytes = storage.nbytes()
+                aligned_bytes = _checked_sum(storage_bytes, (-storage_bytes) % self.alignment)
+                prospective = _checked_sum(self.tensor_bytes, aligned_bytes)
+                if prospective > self.maximum_tensor_bytes:
+                    raise ValueError("model state snapshot exceeds its declared byte cap")
+                storage_snapshot = _StorageSnapshot(
+                    storage, value.device, storage_bytes, aligned_bytes
+                )
+                self.storages[key] = storage_snapshot
+                self.tensor_bytes = prospective
+            node = _ValueSnapshot(
+                value,
+                storage_snapshot,
+                (
+                    tuple(value.shape),
+                    tuple(value.stride()),
+                    value.storage_offset(),
+                    value.requires_grad,
+                    facts,
+                ),
+            )
+            self.memo[identity] = node
+            self.tensor_nodes.append(node)
+            return node
+        if type(value) not in (list, tuple, dict, OrderedDict, set):
+            raise TypeError(f"unsupported mutable model-state value: {type(value).__qualname__}")
+        if type(value) in (dict, OrderedDict) and any(not _is_snapshot_key(key) for key in value):
+            raise TypeError("mutable model-state mappings require immutable scalar keys")
+        if type(value) is set and any(not _is_snapshot_key(item) for item in value):
+            raise TypeError("mutable model-state sets require immutable scalar values")
+        node = _ValueSnapshot(value)
+        self.memo[identity] = node
+        self.active.add(identity)
+        try:
+            if type(value) in (list, tuple):
+                node.contents = tuple(self.walk(item) for item in value)
+            elif type(value) in (dict, OrderedDict):
+                node.contents = tuple((key, self.walk(item)) for key, item in value.items())
+            else:
+                node.contents = frozenset(value)
+        finally:
+            self.active.remove(identity)
+        return node
+
+    def capture(self) -> None:
+        """Clone each admitted storage exactly once after complete accounting."""
+
+        try:
+            for storage in self.storages.values():
+                storage.capture()
+        except (MemoryError, RuntimeError) as error:
+            self.release()
+            raise ReplaySnapshotAllocationError(
+                "model state snapshot allocation failed before readiness"
+            ) from error
+
+    def restore(self) -> None:
+        for node in self.tensor_nodes:
+            node.restore()
+        for storage in self.storages.values():
+            storage.restore()
+
+    def verify(self) -> None:
+        if any(not node.verify(node.original) for node in self.tensor_nodes):
+            raise RuntimeError("model tensor layout/alias restoration failed")
+        if any(not storage.verify() for storage in self.storages.values()):
+            raise RuntimeError("model tensor-storage restoration failed")
+
+    def release(self) -> None:
+        for storage in self.storages.values():
+            storage.contents = None
+        self.memo.clear()
+        self.active.clear()
+        self.storages.clear()
+        self.tensor_nodes.clear()
+        self.tensor_bytes = 0
 
 
 @dataclass
@@ -1390,10 +1577,6 @@ class _AttributeSnapshot:
         if self.value is None:
             return not hasattr(self.owner, self.name)
         return hasattr(self.owner, self.name) and self.value.verify(getattr(self.owner, self.name))
-
-    @property
-    def tensor_bytes(self) -> int:
-        return 0 if self.value is None else self.value.tensor_bytes
 
 
 @dataclass
@@ -1425,23 +1608,22 @@ class DenseGPTStateSnapshot:
         models: Sequence[torch.nn.Module],
         mutable_buffers: Sequence[str],
         maximum_tensor_bytes: int = _CAPACITY_LIMIT,
+        alignment: int = 256,
     ) -> None:
         if not 0 <= maximum_tensor_bytes <= _CAPACITY_LIMIT:
             raise ValueError("model state snapshot cap is invalid")
         self.models = tuple(models)
         self.mutable_buffers = frozenset(mutable_buffers)
         self.maximum_tensor_bytes = maximum_tensor_bytes
+        self.alignment = alignment
+        self.snapshot_plan: _ValueSnapshotPlan | None = None
         self.modes: list[tuple[torch.nn.Module, bool]] = []
         self.module_maps: list[tuple[torch.nn.Module, tuple[tuple[str, torch.nn.Module], ...]]] = []
         self.buffer_maps: list[tuple[torch.nn.Module, tuple[str, ...]]] = []
-        self.buffers: list[tuple[str, torch.nn.Module, str, torch.Tensor, torch.Tensor]] = []
+        self.buffers: list[tuple[str, torch.nn.Module, str, torch.Tensor, _ValueSnapshot]] = []
         self.none_buffers: list[tuple[str, torch.nn.Module, str]] = []
         self.attributes: list[_AttributeSnapshot] = []
         self.extra_states: list[_ExtraStateSnapshot] = []
-
-    def _admit(self, additional_bytes: int) -> None:
-        if additional_bytes < 0 or self.tensor_bytes + additional_bytes > self.maximum_tensor_bytes:
-            raise ValueError("model state snapshot exceeds its declared byte cap")
 
     def capture(self) -> None:
         """Capture all explicitly admitted mutable model state."""
@@ -1452,6 +1634,10 @@ class DenseGPTStateSnapshot:
         found: set[str] = set()
         registered: set[str] = set()
         seen: set[tuple[int, str]] = set()
+        pending_buffers: list[tuple[str, torch.nn.Module, str, torch.Tensor]] = []
+        pending_attributes: list[tuple[torch.nn.Module, str, Any]] = []
+        pending_extra_states: list[tuple[torch.nn.Module, Any]] = []
+        missing_attribute = object()
         for model_index, model in enumerate(self.models):
             for module_name, module in model.named_modules():
                 self.module_maps.append((module, tuple(module._modules.items())))
@@ -1465,11 +1651,7 @@ class DenseGPTStateSnapshot:
                         if buffer is None:
                             self.none_buffers.append((qualified, module, local_name))
                         elif isinstance(buffer, torch.Tensor):
-                            size = buffer.numel() * buffer.element_size()
-                            self._admit(size)
-                            self.buffers.append(
-                                (qualified, module, local_name, buffer, buffer.detach().clone())
-                            )
+                            pending_buffers.append((qualified, module, local_name, buffer))
                         else:
                             raise TypeError("registered model buffer is not tensor-or-None")
                 attribute_names = set(self._REFERENCE_ATTRIBUTES)
@@ -1485,19 +1667,14 @@ class DenseGPTStateSnapshot:
                     identity = (id(module), name)
                     if identity not in seen:
                         seen.add(identity)
-                        value: _ValueSnapshot | None = None
                         if hasattr(module, name):
-                            current = getattr(module, name)
-                            self._admit(_value_tensor_bytes(current))
-                            value = _ValueSnapshot.capture(current)
-                        self.attributes.append(_AttributeSnapshot(module, name, value))
+                            pending_attributes.append((module, name, getattr(module, name)))
+                        else:
+                            pending_attributes.append((module, name, missing_attribute))
                 if type(module).get_extra_state is not torch.nn.Module.get_extra_state:
                     if type(module).set_extra_state is torch.nn.Module.set_extra_state:
                         raise TypeError("model extra state has no verified restoration method")
-                    current = module.get_extra_state()
-                    self._admit(_value_tensor_bytes(current))
-                    value = _ValueSnapshot.capture(current)
-                    self.extra_states.append(_ExtraStateSnapshot(module, value))
+                    pending_extra_states.append((module, module.get_extra_state()))
         missing = self.mutable_buffers - found
         if missing:
             raise ValueError(f"declared mutable model buffers were not found: {sorted(missing)}")
@@ -1512,6 +1689,20 @@ class DenseGPTStateSnapshot:
             raise ValueError(
                 f"registered model buffers were not declared mutable: {sorted(undeclared)}"
             )
+        plan = _ValueSnapshotPlan(self.maximum_tensor_bytes, self.alignment)
+        self.snapshot_plan = plan
+        self.buffers = [
+            (qualified, module, local_name, buffer, plan.walk(buffer))
+            for qualified, module, local_name, buffer in pending_buffers
+        ]
+        for module, name, current in pending_attributes:
+            value = None if current is missing_attribute else plan.walk(current)
+            self.attributes.append(_AttributeSnapshot(module, name, value))
+        self.extra_states = [
+            _ExtraStateSnapshot(module, plan.walk(current))
+            for module, current in pending_extra_states
+        ]
+        plan.capture()
 
     def restore(self) -> None:
         """Restore model state without performing verification."""
@@ -1525,9 +1716,11 @@ class DenseGPTStateSnapshot:
             module._modules.update(entries)
         for _name, module, local_name, buffer, snapshot in self.buffers:
             module._buffers[local_name] = buffer
-            buffer.copy_(snapshot)
         for _name, module, local_name in self.none_buffers:
             module._buffers[local_name] = None
+        if self.snapshot_plan is None:
+            raise RuntimeError("model state snapshot plan is unavailable")
+        self.snapshot_plan.restore()
         for attribute in self.attributes:
             attribute.restore()
         for extra_state in self.extra_states:
@@ -1543,7 +1736,7 @@ class DenseGPTStateSnapshot:
         if any(tuple(module._modules.items()) != entries for module, entries in self.module_maps):
             raise RuntimeError("model module graph restoration failed")
         for name, module, local_name, buffer, snapshot in self.buffers:
-            if module._buffers.get(local_name) is not buffer or not torch.equal(buffer, snapshot):
+            if module._buffers.get(local_name) is not buffer or not snapshot.verify(buffer):
                 raise RuntimeError(f"model buffer restoration failed: {name}")
         if any(
             module._buffers.get(local_name) is not None
@@ -1552,6 +1745,9 @@ class DenseGPTStateSnapshot:
             raise RuntimeError("None model-buffer restoration failed")
         if any(module.training != training for module, training in self.modes):
             raise RuntimeError("model training-mode restoration failed")
+        if self.snapshot_plan is None:
+            raise RuntimeError("model state snapshot plan is unavailable")
+        self.snapshot_plan.verify()
         if any(not attribute.verify() for attribute in self.attributes):
             raise RuntimeError("model reference/hook restoration failed")
         if any(not extra_state.verify() for extra_state in self.extra_states):
@@ -1559,13 +1755,9 @@ class DenseGPTStateSnapshot:
 
     @property
     def tensor_bytes(self) -> int:
-        """Return exact cloned model-buffer storage."""
+        """Return exact aligned storage retained by the shared snapshot plan."""
 
-        return (
-            sum(snapshot.numel() * snapshot.element_size() for _, _, _, _, snapshot in self.buffers)
-            + sum(attribute.tensor_bytes for attribute in self.attributes)
-            + sum(extra_state.value.tensor_bytes for extra_state in self.extra_states)
-        )
+        return 0 if self.snapshot_plan is None else self.snapshot_plan.tensor_bytes
 
     def release(self) -> None:
         """Release all captured model references."""
@@ -1577,6 +1769,9 @@ class DenseGPTStateSnapshot:
         self.none_buffers.clear()
         self.attributes.clear()
         self.extra_states.clear()
+        if self.snapshot_plan is not None:
+            self.snapshot_plan.release()
+            self.snapshot_plan = None
 
 
 class IdentityStateSnapshot:
@@ -1680,8 +1875,11 @@ class ReplayStateGuard:
         cuda_device: torch.device | int | None = None,
         fault_injections: Mapping[str, Callable[[], None]] | None = None,
         maximum_model_state_bytes: int = _CAPACITY_LIMIT,
+        model_state_alignment: int = 256,
     ) -> None:
-        self.model = DenseGPTStateSnapshot(models, mutable_buffer_names, maximum_model_state_bytes)
+        self.model = DenseGPTStateSnapshot(
+            models, mutable_buffer_names, maximum_model_state_bytes, model_state_alignment
+        )
         self.identity = IdentityStateSnapshot(replay_iterators, samplers)
         self.overlap = OverlapStateSnapshot(overlap_objects)
         self.tracker_getter = tracker_getter
@@ -2152,18 +2350,7 @@ class NonInterleavedReplaySchedule:
 
 @dataclass(frozen=True)
 class _ReplayScheduleFacts:
-    model_ids: tuple[int, ...]
-    sequence_length: int
-    micro_batch_size: int
-    probe_device: torch.device
-    tp_rank: int
-    tp_size: int
-    cp_rank: int
-    cp_size: int
-    sequence_parallel: bool
-    pipeline_data_owner: bool
-    forward_backward_id: int
-    forward_step_id: int
+    adapter_fields: tuple[tuple[str, Any], ...]
 
     @classmethod
     def observe(
@@ -2189,20 +2376,44 @@ class _ReplayScheduleFacts:
             or not 0 <= schedule.cp_rank < schedule.cp_size
         ):
             raise ValueError("replay schedule topology is invalid")
-        return cls(
-            model_ids=tuple(id(model) for model in schedule.model),
-            sequence_length=schedule.sequence_length,
-            micro_batch_size=schedule.micro_batch_size,
-            probe_device=schedule.probe_device,
-            tp_rank=schedule.tp_rank,
-            tp_size=schedule.tp_size,
-            cp_rank=schedule.cp_rank,
-            cp_size=schedule.cp_size,
-            sequence_parallel=schedule.sequence_parallel,
-            pipeline_data_owner=schedule.pipeline_data_owner,
-            forward_backward_id=id(schedule.forward_backward_func),
-            forward_step_id=id(schedule.forward_step_func),
+        runtime_fields = {"p2p_started", "completed"}
+        expected_fields = {
+            "forward_backward_func",
+            "forward_step_func",
+            "model",
+            "sequence_length",
+            "micro_batch_size",
+            "probe_device",
+            "tp_rank",
+            "tp_size",
+            "cp_rank",
+            "cp_size",
+            "sequence_parallel",
+            "pipeline_data_owner",
+            "decoder_sequence_length",
+            "adjust_tensor_shapes_fn",
+            "pg_collection",
+        }
+        if set(vars(schedule)) - runtime_fields != expected_fields:
+            raise TypeError("replay schedule adapter fields are not the inspected exact surface")
+        adapter_fields = (
+            ("forward_backward_func", _identity_facts(schedule.forward_backward_func)),
+            ("forward_step_func", _identity_facts(schedule.forward_step_func)),
+            ("model", tuple(_identity_facts(model) for model in schedule.model)),
+            ("sequence_length", schedule.sequence_length),
+            ("micro_batch_size", schedule.micro_batch_size),
+            ("probe_device", schedule.probe_device),
+            ("tp_rank", schedule.tp_rank),
+            ("tp_size", schedule.tp_size),
+            ("cp_rank", schedule.cp_rank),
+            ("cp_size", schedule.cp_size),
+            ("sequence_parallel", schedule.sequence_parallel),
+            ("pipeline_data_owner", schedule.pipeline_data_owner),
+            ("decoder_sequence_length", schedule.decoder_sequence_length),
+            ("adjust_tensor_shapes_fn", _identity_facts(schedule.adjust_tensor_shapes_fn)),
+            ("pg_collection", _identity_facts(schedule.pg_collection)),
         )
+        return cls(adapter_fields)
 
     def revalidate(
         self,
@@ -2212,6 +2423,261 @@ class _ReplayScheduleFacts:
     ) -> None:
         if _ReplayScheduleFacts.observe(schedule, models, plan) != self:
             raise RuntimeError("replay schedule changed after memory preflight")
+
+
+def _identity_facts(value: Any) -> tuple[Any, ...]:
+    return (
+        id(value),
+        type(value),
+        getattr(value, "__module__", None),
+        getattr(value, "__qualname__", None),
+    )
+
+
+class _FactNormalizer:
+    """Create a deterministic, alias-aware snapshot of admitted configuration values."""
+
+    def __init__(self) -> None:
+        self.memo: dict[int, int] = {}
+        self.active: set[int] = set()
+
+    def _compound(self, value: Any, build: Callable[[], Any]) -> tuple[Any, ...]:
+        identity = id(value)
+        if identity in self.active:
+            raise TypeError("cyclic execution configuration is not supported")
+        if identity in self.memo:
+            return ("alias", self.memo[identity])
+        slot = len(self.memo)
+        self.memo[identity] = slot
+        self.active.add(identity)
+        try:
+            contents = build()
+        finally:
+            self.active.remove(identity)
+        return ("object", slot, identity, type(value), contents)
+
+    def freeze(self, value: Any) -> Any:
+        if value is None or type(value) in (bool, int, float, complex, str, bytes):
+            return ("scalar", type(value), value)
+        if isinstance(value, Enum):
+            return ("enum", type(value), value.name, self.freeze(value.value))
+        if isinstance(value, (torch.dtype, torch.device, torch.layout)):
+            return ("torch_value", type(value), str(value))
+        if isinstance(value, torch.Tensor):
+            return ("tensor", _snapshot_tensor_facts(value))
+        if isinstance(value, functools.partial):
+            return self._compound(
+                value,
+                lambda: (
+                    self.freeze(value.func),
+                    self.freeze(value.args),
+                    self.freeze(value.keywords),
+                ),
+            )
+        if is_dataclass(value) and not isinstance(value, type):
+            names = {item.name for item in fields(value)}
+            return self._compound(
+                value,
+                lambda: (
+                    tuple(
+                        (item.name, self.freeze(getattr(value, item.name)))
+                        for item in fields(value)
+                    ),
+                    tuple(
+                        (name, self.freeze(item))
+                        for name, item in vars(value).items()
+                        if name not in names
+                    ),
+                ),
+            )
+        if type(value) in (tuple, list):
+            return self._compound(value, lambda: tuple(self.freeze(item) for item in value))
+        if type(value) in (dict, OrderedDict):
+            return self._compound(
+                value,
+                lambda: tuple((self.freeze(key), self.freeze(item)) for key, item in value.items()),
+            )
+        if type(value) in (set, frozenset):
+            return self._compound(
+                value, lambda: tuple(sorted((self.freeze(item) for item in value), key=repr))
+            )
+        if isinstance(value, type) or callable(value):
+            return ("callable", *_identity_facts(value))
+        raise TypeError(f"unsupported execution configuration value: {type(value).__qualname__}")
+
+
+@dataclass(frozen=True)
+class _ModelGraphFacts:
+    modules: tuple[tuple[Any, ...], ...]
+    configs: tuple[tuple[Any, ...], ...]
+
+    @classmethod
+    def observe(cls, models: Sequence[torch.nn.Module]) -> "_ModelGraphFacts":
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        normalizer = _FactNormalizer()
+        module_facts: list[tuple[Any, ...]] = []
+        configs: dict[int, Any] = {}
+        active: set[int] = set()
+
+        def walk(module: torch.nn.Module, path: str) -> None:
+            identity = id(module)
+            if identity in active:
+                raise TypeError("cyclic dense GPT module graphs are not supported")
+            active.add(identity)
+            try:
+                children = tuple(
+                    (name, None if child is None else _identity_facts(child))
+                    for name, child in module._modules.items()
+                )
+                parameters = tuple(
+                    (name, None if parameter is None else _snapshot_tensor_facts(parameter))
+                    for name, parameter in module._parameters.items()
+                )
+                buffers = tuple(
+                    (name, None if buffer is None else _snapshot_tensor_facts(buffer))
+                    for name, buffer in module._buffers.items()
+                )
+                config = vars(module).get("config")
+                config_binding = None if config is None else _identity_facts(config)
+                if config is not None:
+                    configs.setdefault(id(config), config)
+                spec_attributes = tuple(
+                    (name, normalizer.freeze(value))
+                    for name, value in vars(module).items()
+                    if name in ("transformer_layer_spec", "submodules") or type(value) is ModuleSpec
+                )
+                module_facts.append(
+                    (
+                        path,
+                        _identity_facts(module),
+                        children,
+                        parameters,
+                        buffers,
+                        config_binding,
+                        spec_attributes,
+                    )
+                )
+                for name, child in module._modules.items():
+                    if child is not None:
+                        walk(child, f"{path}.{name}")
+            finally:
+                active.remove(identity)
+
+        for model_index, model in enumerate(models):
+            walk(model, str(model_index))
+        config_facts = tuple(
+            (_identity_facts(config), normalizer.freeze(config)) for config in configs.values()
+        )
+        return cls(tuple(module_facts), config_facts)
+
+
+@dataclass(frozen=True)
+class _ResponseProbeFacts:
+    facts: tuple[Any, ...]
+
+    @classmethod
+    def observe(
+        cls, probe: Any, models: Sequence[torch.nn.Module], plan: ReplayPlan
+    ) -> "_ResponseProbeFacts":
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from .function_response import RESPONSE_FAMILIES, ResponseFamily
+
+        descriptors = getattr(probe, "descriptors", None)
+        if not isinstance(descriptors, tuple):
+            raise TypeError("response probe lacks immutable layer descriptors")
+        transformer_layers = {
+            module.layer_number - 1: module
+            for model in models
+            for module in model.modules()
+            if type(module) is TransformerLayer
+        }
+        descriptor_layers = {descriptor.global_layer for descriptor in descriptors}
+        if not descriptor_layers or set(transformer_layers) != descriptor_layers:
+            raise ValueError("response probe layer set disagrees with the dense GPT graph")
+        if len(descriptors) != len(descriptor_layers) * len(RESPONSE_FAMILIES) or any(
+            {descriptor.family for descriptor in descriptors if descriptor.global_layer == layer}
+            != set(RESPONSE_FAMILIES)
+            for layer in descriptor_layers
+        ):
+            raise ValueError("response probe does not cover every local response family")
+        expected_modules = {
+            layer: {
+                ResponseFamily.RESIDUAL: module,
+                ResponseFamily.QKV: module.self_attention.linear_qkv,
+                ResponseFamily.ATTN_OUT: module.self_attention.linear_proj,
+                ResponseFamily.FC1: module.mlp.linear_fc1,
+                ResponseFamily.FC2: module.mlp.linear_fc2,
+            }
+            for layer, module in transformer_layers.items()
+        }
+        if any(
+            descriptor.module is not expected_modules[descriptor.global_layer][descriptor.family]
+            for descriptor in descriptors
+        ):
+            raise ValueError("response hooks are not bound to canonical dense GPT modules")
+        descriptor_facts = tuple(
+            (
+                _identity_facts(descriptor),
+                descriptor.global_layer,
+                descriptor.family,
+                _identity_facts(descriptor.module),
+                descriptor.owner,
+                descriptor.sequence_sharded,
+                descriptor.affine_bias_output,
+            )
+            for descriptor in descriptors
+        )
+        probe.validate_preflight_binding()
+        facts = (
+            _identity_facts(probe),
+            id(descriptors),
+            descriptor_facts,
+            probe.global_layers,
+            probe.device,
+            probe.expected_hook_calls,
+            probe.sequence_parallel,
+            probe.descriptor_hash,
+            _identity_facts(probe.registry),
+            _identity_facts(probe.accumulator),
+            _identity_facts(probe.accumulator.statistics),
+            _FactNormalizer().freeze(probe._preflight_binding),
+            plan.num_microbatches,
+        )
+        return cls(facts)
+
+
+@dataclass(frozen=True)
+class _ReplayExecutionFacts:
+    graph: _ModelGraphFacts
+    schedule: _ReplayScheduleFacts
+    probe: _ResponseProbeFacts
+
+    @classmethod
+    def observe(
+        cls,
+        models: Sequence[torch.nn.Module],
+        schedule: NonInterleavedReplaySchedule,
+        probe: Any,
+        plan: ReplayPlan,
+    ) -> "_ReplayExecutionFacts":
+        _validate_dense_gpt_models(models)
+        return cls(
+            _ModelGraphFacts.observe(models),
+            _ReplayScheduleFacts.observe(schedule, models, plan),
+            _ResponseProbeFacts.observe(probe, models, plan),
+        )
+
+    def revalidate(
+        self,
+        models: Sequence[torch.nn.Module],
+        schedule: NonInterleavedReplaySchedule,
+        probe: Any,
+        plan: ReplayPlan,
+    ) -> None:
+        if _ReplayExecutionFacts.observe(models, schedule, probe, plan) != self:
+            raise RuntimeError("replay execution graph changed after memory preflight")
 
 
 class FatalAbort(Protocol):
@@ -2367,6 +2833,7 @@ class Tier1ReplayTransaction:
         overlap_objects: Sequence[object],
         fatal_abort: FatalAbort,
         maximum_model_state_bytes: int = _CAPACITY_LIMIT,
+        model_state_alignment: int = 256,
         memory_estimate: ReplayMemoryEstimate | None = None,
         preflight_validator: Callable[[], None] | None = None,
     ) -> None:
@@ -2382,6 +2849,7 @@ class Tier1ReplayTransaction:
         self.overlap_objects = tuple(overlap_objects)
         self.fatal_abort = fatal_abort
         self.maximum_model_state_bytes = maximum_model_state_bytes
+        self.model_state_alignment = model_state_alignment
         self.memory_estimate = memory_estimate
         self.preflight_validator = preflight_validator
         self.rng_a: ReplayRngState | None = None
@@ -2396,6 +2864,7 @@ class Tier1ReplayTransaction:
             tracker_getter=self.tracker_getter,
             cuda_device=self.cuda_device,
             maximum_model_state_bytes=self.maximum_model_state_bytes,
+            model_state_alignment=self.model_state_alignment,
         )
 
     def _fatal(self, error: BaseException) -> None:
@@ -2452,6 +2921,8 @@ class Tier1ReplayTransaction:
                 tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
             ):
                 operation()
+            if self.preflight_validator is not None:
+                self.preflight_validator()
         except BaseException as caught:
             error = caught
         try:
@@ -2498,8 +2969,6 @@ class Tier1ReplayTransaction:
             raise RuntimeError("pre replay can run exactly once")
         error: BaseException | None = None
         try:
-            if self.preflight_validator is not None:
-                self.preflight_validator()
             self.rng_a = ReplayRngState.capture(
                 tracker_getter=self.tracker_getter, cuda_device=self.cuda_device
             )
@@ -2613,7 +3082,7 @@ class Tier1ReplayEngine:
         memory_estimate: ReplayMemoryEstimate | None = None
         plan_facts: _ReplayPlanFacts | None = None
         schedule_facts: _ReplayScheduleFacts | None = None
-        model_config_facts: tuple[Any, ...] | None = None
+        execution_facts: _ReplayExecutionFacts | None = None
         try:
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -2644,6 +3113,7 @@ class Tier1ReplayEngine:
                 tracker_getter=self.tracker_getter,
                 cuda_device=self.cuda_device,
                 maximum_model_state_bytes=maximum_extra_bytes,
+                model_state_alignment=memory_policy.alignment,
             )
             state_guard.prepare()
             assert state_guard.rng is not None
@@ -2654,18 +3124,6 @@ class Tier1ReplayEngine:
             model_config = self.models[0].config
             if any(model.config is not model_config for model in self.models):
                 raise ValueError("pipeline model chunks have inconsistent GPT configs")
-            model_config_facts = (
-                id(model_config),
-                model_config.num_layers,
-                model_config.hidden_size,
-                model_config.ffn_hidden_size,
-                model_config.num_attention_heads,
-                model_config.params_dtype,
-                model_config.gated_linear_unit,
-                model_config.tensor_model_parallel_size,
-                model_config.context_parallel_size,
-                model_config.pipeline_model_parallel_size,
-            )
             global_layers = getattr(probe, "global_layers", None)
             descriptors = getattr(probe, "descriptors", None)
             if not isinstance(global_layers, int) or not isinstance(descriptors, tuple):
@@ -2748,6 +3206,7 @@ class Tier1ReplayEngine:
                 attention_key_length=plan.metadata.sequence_length,
             )
             probe.validate_preflight_binding()
+            execution_facts = _ReplayExecutionFacts.observe(self.models, schedule, probe, plan)
             fixed_workspace_bytes = _checked_sum(
                 _checked_product(plan.metadata.micro_batch_size, plan.metadata.sequence_length),
                 _checked_product(plan.metadata.micro_batch_size, cp_local),
@@ -2824,28 +3283,12 @@ class Tier1ReplayEngine:
             memory_estimate is not None
             and plan_facts is not None
             and schedule_facts is not None
-            and model_config_facts is not None
+            and execution_facts is not None
         )
 
         def revalidate_preflight() -> None:
             plan_facts.revalidate(plan)
-            schedule_facts.revalidate(schedule, self.models, plan)
-            probe.validate_preflight_binding()
-            current_config = self.models[0].config
-            current_facts = (
-                id(current_config),
-                current_config.num_layers,
-                current_config.hidden_size,
-                current_config.ffn_hidden_size,
-                current_config.num_attention_heads,
-                current_config.params_dtype,
-                current_config.gated_linear_unit,
-                current_config.tensor_model_parallel_size,
-                current_config.context_parallel_size,
-                current_config.pipeline_model_parallel_size,
-            )
-            if current_facts != model_config_facts:
-                raise RuntimeError("dense GPT configuration changed after memory preflight")
+            execution_facts.revalidate(self.models, schedule, probe, plan)
 
         return Tier1ReplayTransaction(
             models=self.models,
@@ -2860,6 +3303,7 @@ class Tier1ReplayEngine:
             overlap_objects=self.overlap_objects,
             fatal_abort=self.fatal_abort,
             maximum_model_state_bytes=maximum_extra_bytes,
+            model_state_alignment=memory_policy.alignment,
             memory_estimate=memory_estimate,
             preflight_validator=revalidate_preflight,
         )

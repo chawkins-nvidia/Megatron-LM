@@ -17,6 +17,7 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.datasets.data_samplers import (
@@ -40,12 +41,16 @@ from megatron.training.diagnostics.diagnostic_replay import (
     ReplayIterator,
     ReplayMemoryConfig,
     ReplayMemoryPolicy,
+    ReplayPlan,
     ReplayPreflightError,
     ReplayRestorationError,
+    ReplaySnapshotAllocationError,
     ReplayStateGuard,
+    SampleId,
     SamplePopulation,
     StableSampleDataset,
     Tier1ReplayEngine,
+    TokenId,
     _systematic_positions,
     broadcast_replay_plan,
     build_distributed_source_plan,
@@ -517,6 +522,97 @@ def test_mutable_bytearray_cache_is_rejected_even_with_zero_snapshot_cap() -> No
     assert model.custom_cache == bytearray(b"abc")
 
 
+def test_recursive_snapshot_clones_32_tensor_aliases_once_under_cap() -> None:
+    model = _dense_gpt_stub()
+    model.last_child = torch.nn.Identity()
+    shared = torch.arange(1024, dtype=torch.float32)
+    model.last_child.alias_cache = [shared] * 32
+    guard = ReplayStateGuard(
+        (model,), tracker_getter=lambda: _Tracker(), maximum_model_state_bytes=10_000
+    )
+
+    guard.prepare()
+
+    assert guard.model.tensor_bytes == 4096
+    assert guard.model.snapshot_plan is not None
+    assert len(guard.model.snapshot_plan.storages) == 1
+    with guard:
+        shared.add_(7)
+        model.last_child.alias_cache[0] = shared.clone()
+
+    assert all(value is shared for value in model.last_child.alias_cache)
+    torch.testing.assert_close(shared, torch.arange(1024, dtype=torch.float32))
+
+
+def test_recursive_snapshot_restores_partial_view_alias_topology_and_contents() -> None:
+    model = torch.nn.Identity()
+    base = torch.arange(1024, dtype=torch.float32)
+    partial = base[17:81]
+    strided = base[5:133:2]
+    model.view_cache = [base, partial, strided]
+    guard = ReplayStateGuard(
+        (model,), tracker_getter=lambda: _Tracker(), maximum_model_state_bytes=5000
+    )
+
+    guard.prepare()
+
+    assert guard.model.tensor_bytes == 4096
+    assert guard.model.snapshot_plan is not None
+    assert len(guard.model.snapshot_plan.storages) == 1
+    with guard:
+        base.fill_(-1)
+        partial.set_(torch.zeros(64))
+        model.view_cache[:] = [torch.zeros(1)]
+
+    assert len(model.view_cache) == 3
+    assert model.view_cache[0] is base
+    assert model.view_cache[1] is partial
+    assert model.view_cache[2] is strided
+    assert partial.untyped_storage()._cdata == base.untyped_storage()._cdata
+    assert strided.untyped_storage()._cdata == base.untyped_storage()._cdata
+    assert partial.storage_offset() == 17
+    assert strided.storage_offset() == 5
+    assert strided.stride() == (2,)
+    torch.testing.assert_close(base, torch.arange(1024, dtype=torch.float32))
+
+
+def test_recursive_snapshot_rejects_cycles_before_any_storage_clone(monkeypatch) -> None:
+    from megatron.training.diagnostics import diagnostic_replay
+
+    model = torch.nn.Identity()
+    tensor = torch.ones(16)
+    cycle = [tensor]
+    cycle.append(cycle)
+    model.cycle_cache = cycle
+    clones = 0
+
+    def unexpected_clone(_self):
+        nonlocal clones
+        clones += 1
+
+    monkeypatch.setattr(diagnostic_replay._StorageSnapshot, "capture", unexpected_clone)
+
+    with pytest.raises(TypeError, match="cyclic mutable model-state"):
+        ReplayStateGuard((model,), tracker_getter=lambda: _Tracker()).prepare()
+
+    assert clones == 0
+
+
+def test_snapshot_allocation_failure_has_typed_pre_readiness_error(monkeypatch) -> None:
+    from megatron.training.diagnostics import diagnostic_replay
+
+    model = torch.nn.Identity()
+    model.tensor_cache = torch.ones(16)
+
+    def fail_allocation(_self):
+        raise RuntimeError("injected allocator failure")
+
+    monkeypatch.setattr(diagnostic_replay._StorageSnapshot, "capture", fail_allocation)
+
+    with pytest.raises(ReplaySnapshotAllocationError, match="allocation failed before readiness"):
+        ReplayStateGuard((model,), tracker_getter=lambda: _Tracker()).prepare()
+
+
 class _Probe:
     def __init__(self, expected: int) -> None:
         self.expected_hook_calls = expected
@@ -799,6 +895,62 @@ def test_engine_recomputes_selected_tokens_from_fixed_masks() -> None:
     assert not schedule.p2p_started
 
 
+def test_engine_rejects_self_consistent_count_with_nonexistent_selected_samples() -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture()
+    forged_ordered = tuple(
+        SampleId(999 + index, 999 + index) for index in range(len(plan.metadata.ordered_sample_ids))
+    )
+    forged_selected = tuple(
+        sorted(
+            TokenId(
+                forged_ordered[
+                    batch_index * plan.metadata.micro_batch_size
+                    + flat_index // plan.metadata.sequence_length
+                ],
+                flat_index % plan.metadata.sequence_length,
+            )
+            for batch_index, mask in enumerate(plan.metadata.diagnostic_masks)
+            for flat_index, selected in enumerate(mask)
+            if selected
+        )
+    )
+    for batch_index, batch in enumerate(plan.microbatches):
+        start = batch_index * plan.metadata.micro_batch_size
+        batch.sample_ids = forged_ordered[start : start + plan.metadata.micro_batch_size]
+        batch.data[SAMPLE_EPOCH_FIELD].copy_(
+            torch.tensor([sample.epoch for sample in batch.sample_ids])
+        )
+        batch.data[SAMPLE_INDEX_FIELD].copy_(
+            torch.tensor([sample.sampler_index for sample in batch.sample_ids])
+        )
+    forged_metadata = replace(
+        plan.metadata, selected_tokens=forged_selected, ordered_sample_ids=forged_ordered
+    )
+    forged_plan = ReplayPlan(forged_metadata, plan.microbatches, True)
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        _prepare_fixture(engine, forged_plan, probe, schedule)
+
+    assert not schedule.p2p_started
+
+
+def test_engine_rejects_selected_position_outside_true_loss_mask() -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture()
+    selected = plan.metadata.selected_tokens[0]
+    batch_index = next(
+        index
+        for index, batch in enumerate(plan.microbatches)
+        if selected.sample in batch.sample_ids
+    )
+    lane = plan.microbatches[batch_index].sample_ids.index(selected.sample)
+    plan.microbatches[batch_index].data["loss_mask"][lane, selected.sequence_column] = 0
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        _prepare_fixture(engine, plan, probe, schedule)
+
+    assert not schedule.p2p_started
+
+
 @pytest.mark.parametrize("mutation", ("unknown", "oversized"))
 def test_engine_rejects_changed_fixed_batch_fields_before_schedule(mutation: str) -> None:
     engine, _model, plan, probe, schedule = _dense_engine_fixture()
@@ -837,6 +989,74 @@ def test_engine_revalidates_bound_plan_and_topology_before_schedule() -> None:
         transaction.run_pre()
 
     assert not schedule.p2p_started
+
+
+def test_exact_reviewer_post_preflight_graph_schedule_config_and_batch_drift() -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    original_fc1 = model.decoder_layer.mlp.linear_fc1
+    replacement = ColumnParallelLinear.__new__(ColumnParallelLinear)
+    torch.nn.Module.__init__(replacement)
+    model.decoder_layer.mlp.linear_fc1 = replacement
+    model.config.sequence_parallel = not model.config.sequence_parallel
+    schedule.decoder_sequence_length = 999
+    schedule.adjust_tensor_shapes_fn = lambda shapes: shapes
+    schedule.pg_collection = object()
+    plan.microbatches[0].data["tokens"].fill_(999)
+
+    assert probe.descriptors[3].module is original_fc1
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.run_pre()
+
+    assert not schedule.p2p_started
+
+
+@pytest.mark.parametrize("surface", ("parameter", "buffer", "module_spec"))
+def test_parameter_buffer_and_module_spec_graph_drift_is_rejected(surface: str) -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    if surface == "parameter":
+        model.decoder_layer.register_parameter("graph_weight", torch.nn.Parameter(torch.ones(4)))
+    elif surface == "buffer":
+        model.decoder_layer.register_buffer("graph_cache", torch.ones(4))
+        engine.mutable_buffer_names = ("decoder_layer.graph_cache",)
+    else:
+        model.transformer_layer_spec = ModuleSpec(module=TransformerLayer, params={"marker": [1]})
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    if surface == "parameter":
+        model.decoder_layer.graph_weight = torch.nn.Parameter(torch.ones(4))
+    elif surface == "buffer":
+        model.decoder_layer.graph_cache = torch.ones(4)
+    else:
+        model.transformer_layer_spec.params["marker"].append(2)
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.run_pre()
+
+    assert not schedule.p2p_started
+
+
+def test_execution_graph_is_revalidated_again_immediately_before_post_schedule() -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    schedule_calls = []
+
+    def forward_backward(**kwargs):
+        schedule_calls.append(kwargs["num_microbatches"])
+        for _ in range(kwargs["num_microbatches"]):
+            kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"][0])
+
+    def forward_step(_data_iterator, _model):
+        return torch.zeros(1), lambda value: value
+
+    schedule.forward_backward_func = forward_backward
+    schedule.forward_step_func = forward_step
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    transaction.run_pre()
+    model.config.sequence_parallel = not model.config.sequence_parallel
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.finish(update_succeeded=True)
+
+    assert schedule_calls == [plan.num_microbatches]
 
 
 def test_engine_rejects_96mb_actual_probe_scratch_under_10mb_cap() -> None:

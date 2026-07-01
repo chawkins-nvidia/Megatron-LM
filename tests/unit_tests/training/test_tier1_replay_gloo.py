@@ -154,8 +154,10 @@ class _FaultSchedule:
         self.fault = fault
         self.p2p_started = False
         self.completed = False
+        self.calls = 0
 
     def __call__(self, plan, probe, phase):
+        self.calls += 1
         self.p2p_started = True
         dist.barrier()
         if self.fault in ("schedule", "cleanup_schedule") and self.rank == 0:
@@ -276,6 +278,13 @@ def _pre_schedule_fault_worker(rank: int, init_method: str, directory: str, faul
         overlap_objects = (type("Overlap", (), {"param_gather_handle": object()})(),)
     if rank == 0 and fault == "tracker":
         tracker = object()
+    preflight_validator = None
+    if fault == "graph":
+        preflight_validator = lambda: (
+            (_ for _ in ()).throw(RuntimeError("injected execution graph drift"))
+            if rank == 0
+            else None
+        )
     schedule = _FaultSchedule(rank, "none")
     transaction = Tier1ReplayTransaction(
         models=(model,),
@@ -289,6 +298,7 @@ def _pre_schedule_fault_worker(rank: int, init_method: str, directory: str, faul
         samplers=(),
         overlap_objects=overlap_objects,
         fatal_abort=lambda error: (_ for _ in ()).throw(_FatalRaised(str(error))),
+        preflight_validator=preflight_validator,
     )
     try:
         transaction.run_pre()
@@ -297,6 +307,45 @@ def _pre_schedule_fault_worker(rank: int, init_method: str, directory: str, faul
             directory,
             rank,
             "settled-no-schedule" if not schedule.p2p_started else "schedule-called",
+        )
+    finally:
+        if dist.is_initialized():
+            _shutdown()
+
+
+def _post_schedule_drift_worker(rank: int, init_method: str, directory: str) -> None:
+    _init(rank, init_method)
+    tracker = _FailOnSecondSetTracker(fail=False)
+    schedule = _FaultSchedule(rank, "none")
+    drifted = False
+
+    def validate() -> None:
+        if drifted and rank == 0:
+            raise RuntimeError("injected post execution graph drift")
+
+    transaction = Tier1ReplayTransaction(
+        models=(torch.nn.Identity(),),
+        plan=_source_plan(),
+        probe=_Probe(),
+        schedule=schedule,
+        readiness=ReadinessConsensus(CollectiveBinding("world", None, 2)),
+        mutable_buffer_names=(),
+        tracker_getter=lambda: tracker,
+        cuda_device=None,
+        samplers=(),
+        overlap_objects=(),
+        fatal_abort=lambda error: (_ for _ in ()).throw(_FatalRaised(str(error))),
+        preflight_validator=validate,
+    )
+    try:
+        transaction.run_pre()
+        drifted = True
+        transaction.finish(update_succeeded=True)
+    except ReplayPreflightError:
+        _write_result(
+            directory,
+            rank,
+            "settled-no-post-schedule" if schedule.calls == 1 else "post-schedule-called",
         )
     finally:
         if dist.is_initialized():
@@ -315,13 +364,20 @@ def test_two_rank_one_rank_capture_fault_settles_without_hang(tmp_path: Path) ->
     assert _run_two_rank(tmp_path, _readiness_worker) == ["settled", "settled"]
 
 
-@pytest.mark.parametrize("fault", ("overlap", "model", "tracker"))
+@pytest.mark.parametrize("fault", ("overlap", "model", "tracker", "graph"))
 def test_two_rank_guard_fault_settles_before_peer_barrier_schedule(
     tmp_path: Path, fault: str
 ) -> None:
     assert _run_two_rank(tmp_path, _pre_schedule_fault_worker, fault) == [
         "settled-no-schedule",
         "settled-no-schedule",
+    ]
+
+
+def test_two_rank_one_rank_post_graph_drift_settles_before_second_schedule(tmp_path: Path) -> None:
+    assert _run_two_rank(tmp_path, _post_schedule_drift_worker) == [
+        "settled-no-post-schedule",
+        "settled-no-post-schedule",
     ]
 
 
