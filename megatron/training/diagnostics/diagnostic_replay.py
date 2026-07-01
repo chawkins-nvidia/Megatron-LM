@@ -2986,11 +2986,11 @@ class TransactionState(StrEnum):
 def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
     """Admit only the explicitly inspected dense local-MCore GPT surface."""
 
+    from megatron.core.enums import ModelType
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.dot_product_attention import DotProductAttention
-    from megatron.core.transformer.enums import ModelType
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.spec_utils import ModuleSpec
     from megatron.core.transformer.transformer_config import TransformerConfig
