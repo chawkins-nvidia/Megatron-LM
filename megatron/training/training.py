@@ -3174,6 +3174,15 @@ def train(
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
+    # Resolve the canonical pipeline schedule before constructing diagnostics so
+    # the training step and diagnostic replays share the exact same callable.
+    forward_backward_func = get_forward_backward_func()
+    if args.cuda_graph_impl == "full_iteration":
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+        )
+
     diagnostic_heartbeat = None
     if args.diagnostic_heartbeat:
         from megatron.training.diagnostics.tier0 import Tier0Heartbeat
@@ -3236,10 +3245,6 @@ def train(
     num_microbatches = get_num_microbatches()
     eval_duration = 0.0
     eval_iterations = 0
-    # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "full_iteration":
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
     if args.optimizer_cuda_graph:
         optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 

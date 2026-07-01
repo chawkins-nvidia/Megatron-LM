@@ -57,6 +57,17 @@ def test_requested_tier_preserves_disabled_and_tier0_paths(
     assert diagnostics_requested_tier(args) == expected
 
 
+def test_train_resolves_pipeline_schedule_before_diagnostic_construction() -> None:
+    from megatron.training.training import train
+
+    source = inspect.getsource(train)
+    schedule = "forward_backward_func = get_forward_backward_func()"
+    heartbeat = "diagnostic_heartbeat = Tier0Heartbeat("
+
+    assert source.count(schedule) == 1
+    assert source.index(schedule) < source.index(heartbeat)
+
+
 def test_stable_dataset_wrapper_is_opt_in_and_delegates_metadata() -> None:
     dataset = _Dataset()
     disabled = SimpleNamespace(diagnostic_heartbeat=True, diag_enabled=False)
