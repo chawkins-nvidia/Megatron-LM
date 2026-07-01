@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.diagnostics import observe_diagnostic_attention
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -209,6 +210,9 @@ class DotProductAttention(MegatronModule):
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs: Tensor = self.scale_mask_softmax(
             attention_scores, attention_mask, self.softmax_offset
+        )
+        observe_diagnostic_attention(
+            self.layer_number - 1, attention_scores, attention_probs
         )
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.

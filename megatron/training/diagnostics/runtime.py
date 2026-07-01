@@ -172,8 +172,8 @@ class TieredDiagnosticRuntime:
             device=self.device,
             expected_hook_calls=self.num_microbatches,
             sequence_parallel=bool(getattr(args, "sequence_parallel", False)),
-            attention_owner=False,
-            attention_required=False,
+            attention_owner=True,
+            attention_required=True,
             retain_secant_endpoints=self.tier >= 2,
             reduction_binding=reduction_binding,
         )

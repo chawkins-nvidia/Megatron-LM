@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from megatron.core.diagnostics import observe_diagnostic_attention
 from megatron.training.diagnostics.accumulator import ReductionBinding
 from megatron.training.diagnostics.function_response import (
     RESPONSE_FAMILIES,
@@ -239,6 +240,38 @@ def test_attention_keys_derive_from_attention_logits_and_probabilities() -> None
     assert payload["diag/v2/t1/attention/logit_abs_p90"] == pytest.approx(2.8)
     assert payload["diag/v2/t1/attention/entropy_p10"] == pytest.approx(math.log(2))
     assert payload["diag/v2/t1/attention/entropy_p50"] == pytest.approx(math.log(2))
+    assert payload["diag/v2/t1/attention/collapse_fraction"] == 0
+
+
+def test_post_capture_scopes_local_attention_observer_and_restores_it() -> None:
+    probe, modules = _probe(1, expected_hook_calls=1)
+    mask = torch.tensor([[True, False]])
+    logits = torch.tensor([[[[1.0, -1.0], [4.0, -4.0]]]])
+    probabilities = torch.softmax(logits, dim=-1)
+    before = torch.ones((1, 2, 1))
+    after = 2 * before
+
+    probe.set_masks(mask)
+    with probe.capture_pre():
+        for module in modules:
+            module(before)
+
+    probe.set_masks(mask)
+    with probe.capture_post():
+        observe_diagnostic_attention(0, logits, probabilities)
+        for module in modules:
+            module(after)
+
+    # The observer is event-local: this must be an inert fast path after the
+    # replay context exits rather than a second observation.
+    observe_diagnostic_attention(0, logits, probabilities)
+    assert probe._attention_calls == {0: 1}
+
+    accumulator = probe.finalize()
+    accumulator.finalize_local_()
+    payload = derive_tier1_summaries(accumulator)
+    assert math.isfinite(payload["diag/v2/t1/attention/logit_abs_p50"])
+    assert math.isfinite(payload["diag/v2/t1/attention/entropy_p50"])
     assert payload["diag/v2/t1/attention/collapse_fraction"] == 0
 
 

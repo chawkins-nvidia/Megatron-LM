@@ -2,6 +2,7 @@
 
 """Execution identity shared by core diagnostic instrumentation."""
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Iterator
@@ -15,6 +16,10 @@ _DIAGNOSTIC_MICROBATCH_ID: ContextVar[int | None] = ContextVar(
 _DIAGNOSTIC_RECOMPUTE: ContextVar[bool] = ContextVar("diagnostic_recompute", default=False)
 _DIAGNOSTIC_GLOBAL_VALID_TOKENS: ContextVar["torch.Tensor | None"] = ContextVar(
     "diagnostic_global_valid_tokens", default=None
+)
+DiagnosticAttentionObserver = Callable[[int, "torch.Tensor", "torch.Tensor"], None]
+_DIAGNOSTIC_ATTENTION_OBSERVER: ContextVar[DiagnosticAttentionObserver | None] = ContextVar(
+    "diagnostic_attention_observer", default=None
 )
 
 
@@ -78,3 +83,31 @@ def get_diagnostic_global_valid_tokens() -> "torch.Tensor | None":
     """Return the globally pooled valid-token tensor from gradient finalization."""
 
     return _DIAGNOSTIC_GLOBAL_VALID_TOKENS.get()
+
+
+@contextmanager
+def diagnostic_attention_observer(observer: DiagnosticAttentionObserver) -> Iterator[None]:
+    """Install an event-local observer for local dot-product attention.
+
+    The observer is deliberately scoped with a ``ContextVar`` so ordinary
+    training does not retain probe state and nested replay cleanup restores the
+    previous execution context even when a replay forward raises.
+    """
+
+    if not callable(observer):
+        raise TypeError("diagnostic attention observer must be callable")
+    token = _DIAGNOSTIC_ATTENTION_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _DIAGNOSTIC_ATTENTION_OBSERVER.reset(token)
+
+
+def observe_diagnostic_attention(
+    global_layer: int, logits: "torch.Tensor", probabilities: "torch.Tensor"
+) -> None:
+    """Forward local-attention tensors to the active diagnostic replay probe."""
+
+    observer = _DIAGNOSTIC_ATTENTION_OBSERVER.get()
+    if observer is not None:
+        observer(global_layer, logits, probabilities)

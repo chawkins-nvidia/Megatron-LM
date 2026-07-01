@@ -15,6 +15,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from megatron.core.diagnostics import diagnostic_attention_observer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 from .accumulator import PackedSlots, PackedSufficientStatistics, ReductionBinding
@@ -546,7 +547,13 @@ class FunctionResponseProbe:
                         hook=hook,
                     )
                 )
-            yield tuple(registrations)
+            observer_context = (
+                diagnostic_attention_observer(self.observe_attention)
+                if phase == "post"
+                else contextlib.nullcontext()
+            )
+            with observer_context:
+                yield tuple(registrations)
         finally:
             for handle in self._handles:
                 handle.remove()
