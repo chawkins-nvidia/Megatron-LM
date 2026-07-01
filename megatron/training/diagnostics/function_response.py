@@ -430,7 +430,7 @@ class FunctionResponseProbe:
         """Bind immutable live-response limits before either replay schedule."""
 
         if (
-            selected_row_capacity <= 0
+            selected_row_capacity < 0
             or set(response_widths) != set(RESPONSE_FAMILIES)
             or any(width <= 0 for width in response_widths.values())
             or not isinstance(response_dtype, torch.dtype)
@@ -776,6 +776,12 @@ class FunctionResponseProbe:
         self._full_mask = None
         self._sequence_mask = None
         self._finalized = False
+        self._selected_row_capacity = None
+        self._response_widths = None
+        self._response_dtype = None
+        self._attention_heads = None
+        self._attention_key_length = None
+        self._preflight_binding = None
 
     @property
     def retained_pre_bytes(self) -> int:

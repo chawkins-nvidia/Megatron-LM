@@ -660,6 +660,21 @@ def test_transformer_block_nullcontext_state_is_restored() -> None:
     assert vars(original) == {"enter_result": None}
 
 
+def test_exact_nullcontext_is_part_of_revalidated_execution_facts() -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    model.decoder_layer.offload_context = contextlib.nullcontext()
+    original = model.decoder_layer.offload_context
+    schedule_calls = _count_schedule_calls(schedule)
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+
+    original.enter_result = "drift"
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.run_pre()
+
+    assert schedule_calls == []
+    assert original.enter_result == "drift"
+
+
 def test_transformer_block_nullcontext_rejects_mutable_enter_result_with_path() -> None:
     model = _dense_gpt_stub()
     model.decoder = torch.nn.Identity()
@@ -712,6 +727,21 @@ def test_state_plan_reports_every_unsupported_model_attribute() -> None:
     message = str(caught.value)
     assert "model[0].first_bad: builtins.bytearray" in message
     assert "model[0].child.second_bad: builtins.object" in message
+
+
+def test_model_verification_reports_every_failed_attribute_path() -> None:
+    model = _StatefulModel()
+    guard = ReplayStateGuard(
+        (model,), mutable_buffer_names=("cache",), tracker_getter=lambda: _Tracker()
+    )
+    guard.prepare()
+    guard.model.restore()
+    model.input_tensor = torch.tensor([99.0])
+
+    with pytest.raises(RuntimeError, match=r"model\[0\]\.input_tensor"):
+        guard.model.verify()
+
+    guard.model.release()
 
 
 def test_recursive_snapshot_clones_32_tensor_aliases_once_under_cap() -> None:
@@ -1070,6 +1100,23 @@ def _count_schedule_calls(schedule):
     schedule.forward_backward_func = forward_backward
     schedule.forward_step_func = forward_step
     return calls
+
+
+def test_engine_prepares_zero_local_selection_with_exact_event_capacity() -> None:
+    engine, _model, _plan, probe, schedule = _dense_engine_fixture()
+    recorded = (RecordedBatch.from_raw(_raw_batch()),)
+    empty_plan = build_local_replay_plan(
+        recorded,
+        (),
+        micro_batch_size=2,
+        target_microbatches=2,
+        global_selected_tokens=3,
+    )
+
+    transaction = _prepare_fixture(engine, empty_plan, probe, schedule)
+
+    assert probe._selected_row_capacity == 0
+    transaction.release()
 
 
 def _register_external_module_hook(module, registry_name, hook):

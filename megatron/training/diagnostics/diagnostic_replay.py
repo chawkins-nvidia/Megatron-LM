@@ -1713,6 +1713,7 @@ class _ValueSnapshotPlan:
 
 @dataclass
 class _AttributeSnapshot:
+    path: str
     owner: object
     name: str
     value: _ValueSnapshot | None
@@ -1732,6 +1733,7 @@ class _AttributeSnapshot:
 
 @dataclass
 class _ExtraStateSnapshot:
+    path: str
     owner: torch.nn.Module
     value: _ValueSnapshot
 
@@ -1877,14 +1879,18 @@ class DenseGPTStateSnapshot:
             except TypeError as error:
                 unsupported.append(str(error))
                 continue
-            self.attributes.append(_AttributeSnapshot(module, name, value))
+            self.attributes.append(
+                _AttributeSnapshot(f"{module_path}.{name}", module, name, value)
+            )
         for module_path, module, current in pending_extra_states:
             try:
                 value = plan.walk(current, f"{module_path}.extra_state")
             except TypeError as error:
                 unsupported.append(str(error))
                 continue
-            self.extra_states.append(_ExtraStateSnapshot(module, value))
+            self.extra_states.append(
+                _ExtraStateSnapshot(f"{module_path}.extra_state", module, value)
+            )
         if unsupported:
             details = "\n".join(f"- {message}" for message in unsupported)
             raise TypeError(f"unsupported model-state attributes:\n{details}")
@@ -1935,10 +1941,20 @@ class DenseGPTStateSnapshot:
         if self.snapshot_plan is None:
             raise RuntimeError("model state snapshot plan is unavailable")
         self.snapshot_plan.verify()
-        if any(not attribute.verify() for attribute in self.attributes):
-            raise RuntimeError("model reference/hook restoration failed")
-        if any(not extra_state.verify() for extra_state in self.extra_states):
-            raise RuntimeError("model extra-state restoration failed")
+        failed_attributes = [
+            attribute.path for attribute in self.attributes if not attribute.verify()
+        ]
+        if failed_attributes:
+            raise RuntimeError(
+                "model reference/hook restoration failed: " + ", ".join(failed_attributes)
+            )
+        failed_extra_states = [
+            extra_state.path for extra_state in self.extra_states if not extra_state.verify()
+        ]
+        if failed_extra_states:
+            raise RuntimeError(
+                "model extra-state restoration failed: " + ", ".join(failed_extra_states)
+            )
 
     @property
     def tensor_bytes(self) -> int:
@@ -2028,7 +2044,9 @@ class OverlapStateSnapshot:
                     if name in self._ATTRIBUTES and value is not None:
                         raise ValueError(f"Tier-1 replay requires quiescent overlap state: {name}")
                     snapshot = plan.walk(value, f"overlap[{owner_index}].{name}")
-                self.attributes.append(_AttributeSnapshot(owner, name, snapshot))
+                self.attributes.append(
+                    _AttributeSnapshot(f"overlap[{owner_index}].{name}", owner, name, snapshot)
+                )
 
     def restore(self) -> None:
         """Restore overlap references."""
@@ -2039,8 +2057,9 @@ class OverlapStateSnapshot:
     def verify(self) -> None:
         """Verify overlap references remain quiescent."""
 
-        if any(not attribute.verify() for attribute in self.attributes):
-            raise RuntimeError("overlap-state restoration failed")
+        failed = [attribute.path for attribute in self.attributes if not attribute.verify()]
+        if failed:
+            raise RuntimeError("overlap-state restoration failed: " + ", ".join(failed))
 
     def release(self) -> None:
         """Release retained overlap owners and value nodes."""
@@ -2053,8 +2072,10 @@ class ReplayRestorationError(RuntimeError):
 
     def __init__(self, failures: Sequence[tuple[str, BaseException]]) -> None:
         self.failures = tuple(failures)
-        names = ", ".join(name for name, _ in failures)
-        super().__init__(f"Tier-1 restoration failed in stages: {names}")
+        details = "; ".join(
+            f"{name}: {type(error).__name__}: {error}" for name, error in failures
+        )
+        super().__init__(f"Tier-1 restoration failed in stages: {details}")
 
 
 class ReplayStateGuard:
@@ -2699,6 +2720,14 @@ class _FactNormalizer:
             if not self.allow_tensors:
                 raise TypeError("mutable tensor execution attributes are not supported")
             return ("tensor", _snapshot_tensor_facts(value))
+        if type(value) is nullcontext:
+            if set(vars(value)) != {"enter_result"}:
+                raise TypeError("nullcontext execution state has unexpected attributes")
+            if not _is_snapshot_leaf(value.enter_result):
+                raise TypeError("nullcontext execution state requires an immutable enter_result")
+            return self._compound(
+                value, lambda: (("enter_result", self.freeze(value.enter_result)),)
+            )
         if isinstance(value, functools.partial):
             return self._compound(
                 value,
