@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitlab-master.nvidia.com/chawkins/scaling/schemas/diag_v2.launch-artifact-v3.schema.json",
+  "title": "diag/v2 final trainer launch artifact v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "run_id", "rung", "job_name", "training_job_id", "backend",
+    "world_size", "writer_rank", "publication", "files", "repro"
+  ],
+  "properties": {
+    "schema": {"const": "diag/v2/launch-artifact-v3"},
+    "run_id": {"type": "string", "minLength": 1},
+    "rung": {"type": "integer", "minimum": 1},
+    "job_name": {"type": "string", "minLength": 1},
+    "training_job_id": {"type": "string", "pattern": "^[0-9]+(?:_[0-9]+)?$"},
+    "backend": {"const": "megatron"},
+    "world_size": {"type": "integer", "minimum": 1},
+    "writer_rank": {"type": "integer", "minimum": 0},
+    "publication": {"const": "trainer_inside_allocation"},
+    "files": {
+      "type": "object", "minProperties": 5,
+      "additionalProperties": {
+        "type": "object", "additionalProperties": false,
+        "required": ["sha256", "bytes"],
+        "properties": {
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "bytes": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "repro": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scaling_commit", "megatron_commit", "resolved_config_sha256", "scaling_bundle_sha256", "megatron_bundle_sha256"],
+      "properties": {
+        "scaling_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "megatron_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "resolved_config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "scaling_bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "megatron_bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

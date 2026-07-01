@@ -473,7 +473,7 @@ def test_capability_probe_contract_and_cpu_only_subprocess() -> None:
     assert payload["static_capability_sha256"] == contract_hash()
     assert payload["schema_hash"] == schema_hash()
     assert payload["schema"] == "diag/v2/runtime-capabilities"
-    assert payload["supported_max_tier"] == 0
+    assert payload["supported_max_tier"] == 2
     assert payload["runtime_contract_present"]
     assert payload["integrated_heartbeat_consumer"]
     assert payload["runtime_fields"] == list(
@@ -493,7 +493,7 @@ def test_capability_probe_contract_and_cpu_only_subprocess() -> None:
     ]
     assert (
         diagnostic_schema_hash()
-        == "7b7e156949da5370cccf5fd825784dfcc4de79b19ee4eca1d79d976783b5b28a"
+        == "9ca44a0a719e3a096cded95ab64d1cc6e5d3787ff4e8d47e37b069c1f8f684b6"
     )
     assert set(TIER0_METADATA_KEYS).issubset(TIER0_KEYS)
 
