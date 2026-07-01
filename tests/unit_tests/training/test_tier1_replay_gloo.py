@@ -280,7 +280,7 @@ def _pre_schedule_fault_worker(rank: int, init_method: str, directory: str, faul
         tracker = object()
     preflight_validator = None
     if fault == "graph":
-        preflight_validator = lambda: (
+        preflight_validator = lambda _registrations: (
             (_ for _ in ()).throw(RuntimeError("injected execution graph drift"))
             if rank == 0
             else None
@@ -319,7 +319,7 @@ def _post_schedule_drift_worker(rank: int, init_method: str, directory: str) -> 
     schedule = _FaultSchedule(rank, "none")
     drifted = False
 
-    def validate() -> None:
+    def validate(_registrations) -> None:
         if drifted and rank == 0:
             raise RuntimeError("injected post execution graph drift")
 

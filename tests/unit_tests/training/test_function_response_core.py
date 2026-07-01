@@ -15,6 +15,7 @@ from megatron.training.diagnostics.function_response import (
     FunctionResponseResult,
     ResponseFamily,
     ResponseHookDescriptor,
+    ResponseHookRegistration,
     _selected_rows,
     derive_tier1_summaries,
     descriptor_fingerprint,
@@ -67,6 +68,26 @@ def _add_relative_response(probe: FunctionResponseProbe, slot: int, response: fl
     probe.registry.add_update(
         probe.accumulator.statistics, probe.registry.slot_names[slot], before, after
     )
+
+
+def test_capture_returns_exact_immutable_probe_hook_registrations_and_cleans_up() -> None:
+    probe, modules = _probe(1)
+
+    with probe.capture_pre() as registrations:
+        assert type(registrations) is tuple
+        assert len(registrations) == len(probe.descriptors)
+        for descriptor, module, registration in zip(
+            probe.descriptors, modules, registrations, strict=True
+        ):
+            assert type(registration) is ResponseHookRegistration
+            assert registration.descriptor is descriptor
+            assert registration.module is module
+            assert registration.registry_name == "_forward_hooks"
+            assert type(registration.handle_id) is int
+            assert module._forward_hooks[registration.handle_id] is registration.hook
+
+    assert probe._handles == []
+    assert all(not module._forward_hooks for module in modules)
 
 
 def test_tier1_schema_is_exactly_30_unique_canonical_keys() -> None:

@@ -93,6 +93,17 @@ class ResponseHookDescriptor:
         return self.global_layer, self.family
 
 
+@dataclass(frozen=True)
+class ResponseHookRegistration:
+    """Describe one exact probe-owned hook registration."""
+
+    descriptor: ResponseHookDescriptor
+    module: torch.nn.Module
+    registry_name: str
+    handle_id: int
+    hook: Any = field(repr=False)
+
+
 def discover_response_hooks(
     models: Sequence[torch.nn.Module],
     *,
@@ -471,30 +482,40 @@ class FunctionResponseProbe:
         self._sequence_mask = sequence_parallel_mask
 
     @contextlib.contextmanager
-    def capture_pre(self) -> Iterator[None]:
+    def capture_pre(self) -> Iterator[tuple[ResponseHookRegistration, ...]]:
         """Install hooks for the pre-update forward-only schedule."""
 
-        with self._capture("pre"):
-            yield
+        with self._capture("pre") as registrations:
+            yield registrations
 
     @contextlib.contextmanager
-    def capture_post(self) -> Iterator[None]:
+    def capture_post(self) -> Iterator[tuple[ResponseHookRegistration, ...]]:
         """Install hooks for the post-update forward-only schedule."""
 
-        with self._capture("post"):
-            yield
+        with self._capture("post") as registrations:
+            yield registrations
 
     @contextlib.contextmanager
-    def _capture(self, phase: str) -> Iterator[None]:
+    def _capture(self, phase: str) -> Iterator[tuple[ResponseHookRegistration, ...]]:
         if self._phase is not None or self._finalized:
             raise RuntimeError("response capture phases cannot overlap or follow finalize")
         self._phase = phase
         try:
+            registrations: list[ResponseHookRegistration] = []
             for descriptor in self.descriptors:
-                self._handles.append(
-                    descriptor.module.register_forward_hook(self._make_hook(descriptor))
+                hook = self._make_hook(descriptor)
+                handle = descriptor.module.register_forward_hook(hook)
+                self._handles.append(handle)
+                registrations.append(
+                    ResponseHookRegistration(
+                        descriptor=descriptor,
+                        module=descriptor.module,
+                        registry_name="_forward_hooks",
+                        handle_id=handle.id,
+                        hook=hook,
+                    )
                 )
-            yield
+            yield tuple(registrations)
         finally:
             for handle in self._handles:
                 handle.remove()

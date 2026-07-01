@@ -901,6 +901,15 @@ def _count_schedule_calls(schedule):
     return calls
 
 
+def _register_external_module_hook(module, registry_name, hook):
+    registrations = {
+        "_forward_hooks": module.register_forward_hook,
+        "_forward_pre_hooks": module.register_forward_pre_hook,
+        "_backward_hooks": module.register_full_backward_hook,
+    }
+    return registrations[registry_name](hook)
+
+
 def test_engine_prepare_makes_memory_preflight_mandatory_and_engine_owned() -> None:
     binding = CollectiveBinding("world", None, 1)
     tracker = _Tracker()
@@ -1242,6 +1251,94 @@ def test_execution_graph_is_revalidated_again_immediately_before_post_schedule()
         transaction.finish(update_succeeded=True)
 
     assert schedule_calls == [plan.num_microbatches]
+
+
+@pytest.mark.parametrize("phase", ("pre", "post"))
+@pytest.mark.parametrize(
+    "registry_name", ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks")
+)
+@pytest.mark.parametrize("drift", ("add", "remove", "mutate", "replace", "reorder"))
+def test_external_module_hook_drift_is_rejected_and_preserved_at_both_final_gates(
+    monkeypatch, phase: str, registry_name: str, drift: str
+) -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+    schedule_calls = _count_schedule_calls(schedule)
+    target = model.decoder_layer.mlp.linear_fc1
+    ambient_hooks = (lambda *args: None, lambda *args: None)
+    ambient_handles = tuple(
+        _register_external_module_hook(target, registry_name, hook) for hook in ambient_hooks
+    )
+    p2p_entries = []
+    original_setattr = NonInterleavedReplaySchedule.__setattr__
+
+    def track_p2p_entry(instance, name, value):
+        if instance is schedule and name == "p2p_started" and value is True:
+            p2p_entries.append(True)
+        original_setattr(instance, name, value)
+
+    monkeypatch.setattr(NonInterleavedReplaySchedule, "__setattr__", track_p2p_entry)
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    if phase == "post":
+        transaction.run_pre()
+    prior_p2p_entries = len(p2p_entries)
+
+    registry = getattr(target, registry_name)
+    if drift == "add":
+        _register_external_module_hook(target, registry_name, lambda *args: None)
+    elif drift == "remove":
+        ambient_handles[0].remove()
+    elif drift == "mutate":
+        registry[ambient_handles[0].id] = lambda *args: None
+    elif drift == "replace":
+        setattr(target, registry_name, type(registry)(registry))
+        registry = getattr(target, registry_name)
+    else:
+        registry.move_to_end(ambient_handles[0].id)
+    expected_entries = tuple(registry.items())
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        if phase == "pre":
+            transaction.run_pre()
+        else:
+            transaction.finish(update_succeeded=True)
+
+    expected_schedule_calls = [] if phase == "pre" else [plan.num_microbatches]
+    assert schedule_calls == expected_schedule_calls
+    assert prior_p2p_entries == (0 if phase == "pre" else 2)
+    assert len(p2p_entries) == prior_p2p_entries
+    assert schedule.p2p_started is (phase == "post")
+    assert getattr(target, registry_name) is registry
+    assert tuple(registry.items()) == expected_entries
+    assert probe._handles == []
+
+
+@pytest.mark.parametrize("malformation", ("missing", "unknown_registry", "callable"))
+def test_malformed_probe_hook_deltas_fail_closed_before_schedule(malformation: str) -> None:
+    engine, _model, plan, probe, schedule = _dense_engine_fixture()
+    schedule_calls = _count_schedule_calls(schedule)
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+    exact_capture = probe.capture_pre
+
+    @contextlib.contextmanager
+    def malformed_capture():
+        with exact_capture() as registrations:
+            if malformation == "missing":
+                yield registrations[:-1]
+            elif malformation == "unknown_registry":
+                yield (
+                    replace(registrations[0], registry_name="_forward_pre_hooks"),
+                ) + registrations[1:]
+            else:
+                yield (replace(registrations[0], hook=lambda *args: None),) + registrations[1:]
+
+    probe.capture_pre = malformed_capture
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        transaction.run_pre()
+
+    assert schedule_calls == []
+    assert not schedule.p2p_started
+    assert probe._handles == []
 
 
 def test_engine_rejects_96mb_actual_probe_scratch_under_10mb_cap() -> None:

@@ -2464,6 +2464,9 @@ _MODULE_HOOK_MAPS = frozenset(
         "_load_state_dict_post_hooks",
     )
 )
+_MODULE_HOOK_OPTION_MAPS = frozenset(
+    ("_forward_hooks_with_kwargs", "_forward_hooks_always_called", "_forward_pre_hooks_with_kwargs")
+)
 
 
 def _is_module_runtime_binding(name: str) -> bool:
@@ -2557,12 +2560,51 @@ class _ModelGraphFacts:
     configs: tuple[tuple[Any, ...], ...]
 
     @classmethod
-    def observe(cls, models: Sequence[torch.nn.Module]) -> "_ModelGraphFacts":
+    def observe(
+        cls,
+        models: Sequence[torch.nn.Module],
+        probe_hook_deltas: Mapping[tuple[int, str], tuple[Any, ...]] | None = None,
+    ) -> "_ModelGraphFacts":
         module_normalizer = _FactNormalizer(allow_tensors=False)
         config_normalizer = _FactNormalizer()
         module_facts: list[tuple[Any, ...]] = []
         configs: dict[int, Any] = {}
         active: set[int] = set()
+        hook_deltas = {} if probe_hook_deltas is None else probe_hook_deltas
+
+        def hook_map_facts(module: torch.nn.Module) -> tuple[tuple[Any, ...], ...]:
+            facts = []
+            for name in sorted(_MODULE_HOOK_MAPS):
+                registry = vars(module).get(name)
+                if type(registry) not in (dict, OrderedDict):
+                    raise TypeError(f"module hook registry is not an ordered map: {name}")
+                entries = tuple(registry.items())
+                deltas = hook_deltas.get((id(module), name), ())
+                if deltas:
+                    if len(entries) < len(deltas):
+                        raise RuntimeError("probe hook delta is not an ordered registry suffix")
+                    suffix = entries[-len(deltas) :]
+                    if any(
+                        type(key) is not int or key != delta.handle_id or value is not delta.hook
+                        for (key, value), delta in zip(suffix, deltas, strict=True)
+                    ):
+                        raise RuntimeError("probe hook delta is not an ordered registry suffix")
+                    entries = entries[: -len(deltas)]
+                entry_facts = []
+                for key, value in entries:
+                    if type(key) is not int:
+                        raise TypeError("module hook registry keys must be exact integers")
+                    if name in _MODULE_HOOK_OPTION_MAPS:
+                        if type(value) is not bool:
+                            raise TypeError("module hook option registry values must be booleans")
+                        value_facts = ("option", value)
+                    else:
+                        if not callable(value):
+                            raise TypeError("module hook registry values must be callable")
+                        value_facts = ("callable", *_identity_facts(value))
+                    entry_facts.append(((type(key), key), value_facts))
+                facts.append((name, id(registry), type(registry), tuple(entry_facts)))
+            return tuple(facts)
 
         def walk(module: torch.nn.Module, path: str) -> None:
             identity = id(module)
@@ -2608,6 +2650,7 @@ class _ModelGraphFacts:
                         children,
                         parameters,
                         buffers,
+                        hook_map_facts(module),
                         tuple(module_state),
                     )
                 )
@@ -2715,10 +2758,12 @@ class _ReplayExecutionFacts:
         schedule: NonInterleavedReplaySchedule,
         probe: Any,
         plan: ReplayPlan,
+        probe_hook_registrations: Any = (),
     ) -> "_ReplayExecutionFacts":
         _validate_dense_gpt_models(models)
+        probe_hook_deltas = _validated_probe_hook_deltas(probe, probe_hook_registrations)
         return cls(
-            _ModelGraphFacts.observe(models),
+            _ModelGraphFacts.observe(models, probe_hook_deltas),
             _ReplayScheduleFacts.observe(schedule, models, plan),
             _ResponseProbeFacts.observe(probe, models, plan),
         )
@@ -2729,9 +2774,56 @@ class _ReplayExecutionFacts:
         schedule: NonInterleavedReplaySchedule,
         probe: Any,
         plan: ReplayPlan,
+        probe_hook_registrations: Any,
     ) -> None:
-        if _ReplayExecutionFacts.observe(models, schedule, probe, plan) != self:
+        if (
+            _ReplayExecutionFacts.observe(models, schedule, probe, plan, probe_hook_registrations)
+            != self
+        ):
             raise RuntimeError("replay execution graph changed after memory preflight")
+
+
+def _validated_probe_hook_deltas(
+    probe: Any, registrations: Any
+) -> dict[tuple[int, str], tuple[Any, ...]]:
+    from .function_response import FunctionResponseProbe, ResponseHookRegistration
+
+    if not registrations:
+        if type(registrations) is not tuple:
+            raise TypeError("probe hook registrations must be an immutable tuple")
+        return {}
+    if type(probe) is not FunctionResponseProbe or type(registrations) is not tuple:
+        raise TypeError("probe hook registrations require the exact bounded response probe")
+    if probe._phase not in ("pre", "post") or len(registrations) != len(probe.descriptors):
+        raise RuntimeError("probe hook registrations do not match the active capture")
+    if len(probe._handles) != len(registrations):
+        raise RuntimeError("probe hook handles do not match the active capture")
+    grouped: dict[tuple[int, str], list[Any]] = {}
+    for descriptor, handle, registration in zip(
+        probe.descriptors, probe._handles, registrations, strict=True
+    ):
+        if (
+            type(registration) is not ResponseHookRegistration
+            or registration.descriptor is not descriptor
+            or registration.module is not descriptor.module
+            or registration.registry_name != "_forward_hooks"
+            or type(registration.handle_id) is not int
+            or handle.id != registration.handle_id
+            or not callable(registration.hook)
+        ):
+            raise RuntimeError("probe hook registration is malformed or noncanonical")
+        registry = vars(registration.module).get(registration.registry_name)
+        hooks_dict_ref = getattr(handle, "hooks_dict_ref", None)
+        if (
+            type(registry) not in (dict, OrderedDict)
+            or not callable(hooks_dict_ref)
+            or hooks_dict_ref() is not registry
+        ):
+            raise RuntimeError("probe hook registration is not bound to its declared registry")
+        grouped.setdefault((id(registration.module), registration.registry_name), []).append(
+            registration
+        )
+    return {key: tuple(value) for key, value in grouped.items()}
 
 
 class FatalAbort(Protocol):
@@ -2889,7 +2981,7 @@ class Tier1ReplayTransaction:
         maximum_model_state_bytes: int = _CAPACITY_LIMIT,
         model_state_alignment: int = 256,
         memory_estimate: ReplayMemoryEstimate | None = None,
-        preflight_validator: Callable[[], None] | None = None,
+        preflight_validator: Callable[[Any], None] | None = None,
     ) -> None:
         self.models = tuple(models)
         self.plan = plan
@@ -2967,7 +3059,7 @@ class Tier1ReplayTransaction:
             guard.prepare()
             stack.enter_context(guard)
             stack.enter_context(torch.no_grad())
-            stack.enter_context(
+            probe_hook_registrations = stack.enter_context(
                 self.probe.capture_pre() if phase == "pre" else self.probe.capture_post()
             )
             assert self.rng_a is not None
@@ -2976,7 +3068,7 @@ class Tier1ReplayTransaction:
             ):
                 operation()
             if self.preflight_validator is not None:
-                self.preflight_validator()
+                self.preflight_validator(probe_hook_registrations)
         except BaseException as caught:
             error = caught
         try:
@@ -3340,9 +3432,9 @@ class Tier1ReplayEngine:
             and execution_facts is not None
         )
 
-        def revalidate_preflight() -> None:
+        def revalidate_preflight(probe_hook_registrations: Any) -> None:
             plan_facts.revalidate(plan)
-            execution_facts.revalidate(self.models, schedule, probe, plan)
+            execution_facts.revalidate(self.models, schedule, probe, plan, probe_hook_registrations)
 
         return Tier1ReplayTransaction(
             models=self.models,
