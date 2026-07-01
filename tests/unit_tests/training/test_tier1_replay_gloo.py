@@ -14,11 +14,14 @@ from megatron.training.diagnostics.diagnostic_replay import (
     SAMPLE_INDEX_FIELD,
     CollectiveBinding,
     FixedPlanCodec,
+    PopulationCollectiveWorkspace,
     ReadinessConsensus,
     RecordedBatch,
     ReplayPreflightError,
     Tier1ReplayTransaction,
+    _ReplayPlanFacts,
     broadcast_replay_plan,
+    build_distributed_source_plan,
     build_local_replay_plan,
     local_sample_populations,
     select_local_token_ids,
@@ -103,6 +106,51 @@ def _descriptor_worker(rank: int, init_method: str, directory: str) -> None:
         with pytest.raises(RuntimeError, match="descriptor/slot hash mismatch"):
             verify_response_descriptor_consensus(probe.accumulator)
         _write_result(directory, rank, "rejected")
+    finally:
+        _shutdown()
+
+
+def _dp_spanning_plan_worker(rank: int, init_method: str, directory: str) -> None:
+    _init(rank, init_method)
+    try:
+        raw = _raw_batch()
+        raw[SAMPLE_INDEX_FIELD] = torch.tensor([100 + 2 * rank, 101 + 2 * rank], dtype=torch.int64)
+        recorded = (RecordedBatch.from_raw(raw),)
+        binding = CollectiveBinding("dp", None, 2)
+        readiness = ReadinessConsensus(binding)
+        workspace = PopulationCollectiveWorkspace(binding, maximum_local_samples=2, device="cpu")
+        plan = build_distributed_source_plan(
+            recorded,
+            workspace=workspace,
+            readiness=readiness,
+            probe_tokens=16,
+            run_seed=29,
+            event_id=7,
+            micro_batch_size=2,
+            maximum_microbatches=2,
+        )
+        facts = _ReplayPlanFacts.observe(plan)
+        assert plan.metadata.global_selected_tokens == 16
+        assert facts.local_selected_tokens == plan.metadata.local_selected_tokens == 8
+        assert sum(map(sum, plan.metadata.diagnostic_masks)) == 8
+
+        codec = FixedPlanCodec(16, 2, 2, 8)
+        integer, mask = codec.allocate("cpu")
+        codec.encode(plan, integer, mask)
+        decoded = codec.decode(integer, mask)
+        assert decoded.global_selected_tokens == 16
+        assert len(decoded.selected_tokens) == 8
+
+        descriptors: list[str | None] = [None, None]
+        dist.all_gather_object(descriptors, plan.metadata.descriptor_hash)
+        assert len(set(descriptors)) == 2
+        identity = workspace.global_selection_digest.clone()
+        minimum = identity.clone()
+        maximum = identity.clone()
+        dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+        assert torch.equal(minimum, maximum)
+        _write_result(directory, rank, "local=8,global=16,dp-plans-distinct")
     finally:
         _shutdown()
 
@@ -354,6 +402,13 @@ def _post_schedule_drift_worker(rank: int, init_method: str, directory: str) -> 
 
 def test_two_rank_tp_source_non_source_plan_equality(tmp_path: Path) -> None:
     assert _run_two_rank(tmp_path, _plan_worker) == ["ok", "ok"]
+
+
+def test_two_rank_dp_selection_spans_distinct_local_plans(tmp_path: Path) -> None:
+    assert _run_two_rank(tmp_path, _dp_spanning_plan_worker) == [
+        "local=8,global=16,dp-plans-distinct",
+        "local=8,global=16,dp-plans-distinct",
+    ]
 
 
 def test_two_rank_missing_descriptor_hash_is_rejected(tmp_path: Path) -> None:

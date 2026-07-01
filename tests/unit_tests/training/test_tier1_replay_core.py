@@ -51,6 +51,7 @@ from megatron.training.diagnostics.diagnostic_replay import (
     StableSampleDataset,
     Tier1ReplayEngine,
     TokenId,
+    _ReplayPlanFacts,
     _systematic_positions,
     broadcast_replay_plan,
     build_distributed_source_plan,
@@ -292,6 +293,59 @@ def test_fixed_plan_codec_constructs_equal_neutral_non_source_plan() -> None:
     assert neutral.metadata.descriptor_hash == source.metadata.descriptor_hash
     assert neutral.num_microbatches == source.num_microbatches
     assert not neutral.source_rank
+
+
+def test_plan_facts_and_codec_preserve_dp_global_and_rank_local_selection() -> None:
+    recorded = (RecordedBatch.from_raw(_raw_batch()),)
+    local_tokens = tuple(TokenId(recorded[0].samples[0].sample_id, column) for column in (0, 2))
+    plan = build_local_replay_plan(
+        recorded, local_tokens, micro_batch_size=2, target_microbatches=2, global_selected_tokens=5
+    )
+
+    facts = _ReplayPlanFacts.observe(plan)
+    assert facts.local_selected_tokens == 2
+    assert plan.metadata.global_selected_tokens == 5
+    assert sum(map(sum, plan.metadata.diagnostic_masks)) == 2
+
+    codec = FixedPlanCodec(8, 4, 2, 8)
+    integer, mask = codec.allocate("cpu")
+    codec.encode(plan, integer, mask)
+    decoded = codec.decode(integer, mask)
+    assert decoded.global_selected_tokens == 5
+    assert decoded.selected_tokens == local_tokens
+    assert sum(map(sum, decoded.diagnostic_masks)) == 2
+
+    zero_owner = build_local_replay_plan(
+        recorded, (), micro_batch_size=2, target_microbatches=2, global_selected_tokens=5
+    )
+    assert _ReplayPlanFacts.observe(zero_owner).local_selected_tokens == 0
+    codec.encode(zero_owner, integer, mask)
+    decoded_zero = codec.decode(integer, mask)
+    assert decoded_zero.global_selected_tokens == 5
+    assert decoded_zero.local_selected_tokens == 0
+    assert not any(map(any, decoded_zero.diagnostic_masks))
+
+
+def test_plan_facts_reject_local_masks_above_dp_global_count() -> None:
+    plan = _plan()
+    plan.metadata = replace(plan.metadata, global_selected_tokens=1)
+
+    with pytest.raises(ValueError, match="local replay masks exceed"):
+        _ReplayPlanFacts.observe(plan)
+
+
+def test_selection_collective_rejects_malformed_local_or_global_counts() -> None:
+    binding = CollectiveBinding("dp", None, 1)
+    readiness = ReadinessConsensus(binding)
+    workspace = PopulationCollectiveWorkspace(binding, maximum_local_samples=2, device="cpu")
+    token = TokenId(SampleId(0, 7), 1)
+
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        workspace.verify_global_selection((token,), global_selected_tokens=2, readiness=readiness)
+    with pytest.raises(ReplayPreflightError, match="failed collectively"):
+        workspace.verify_global_selection(
+            (token, token), global_selected_tokens=2, readiness=readiness
+        )
 
 
 def test_bounded_population_workspace_builds_deterministic_source_plan() -> None:

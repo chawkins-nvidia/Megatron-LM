@@ -50,6 +50,18 @@ def _hash64(*values: int) -> int:
     return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
 
 
+def _selected_token_digest(tokens: Sequence[TokenId]) -> bytes:
+    """Hash one rank's canonical local selection without conflating DP scope."""
+
+    digest = hashlib.sha256()
+    ordered = tuple(sorted(tokens))
+    digest.update(len(ordered).to_bytes(8, "little", signed=False))
+    for token in ordered:
+        for value in (token.sample.epoch, token.sample.sampler_index, token.sequence_column):
+            digest.update(int(value).to_bytes(8, "little", signed=True))
+    return digest.digest()
+
+
 def _systematic_positions(total: int, selected: int, offset: int) -> frozenset[int]:
     """Return one cyclic fixed grid; exhaustive offsets give exact inclusion."""
 
@@ -354,9 +366,11 @@ class PopulationCollectiveWorkspace:
         binding.validate()
         if torch.device(device).type != "cpu":
             raise RuntimeError("population exchange requires CPU/Gloo control wires")
-        if dist.is_available() and dist.is_initialized() and str(
-            dist.get_backend(binding.group)
-        ).lower() != "gloo":
+        if (
+            dist.is_available()
+            and dist.is_initialized()
+            and str(dist.get_backend(binding.group)).lower() != "gloo"
+        ):
             raise RuntimeError("population exchange requires a pre-existing Gloo group")
         if maximum_local_samples <= 0:
             raise ValueError("population workspace needs a positive local sample cap")
@@ -369,6 +383,11 @@ class PopulationCollectiveWorkspace:
             (binding.size * maximum_local_samples, 3), -1, dtype=torch.int64, device=device
         )
         self.schedule_count = torch.zeros(1, dtype=torch.int64, device=device)
+        self.local_selection_digest = torch.zeros(32, dtype=torch.uint8, device=device)
+        self.selection_digests = torch.zeros(binding.size * 32, dtype=torch.uint8, device=device)
+        self.global_selection_digest = torch.zeros(32, dtype=torch.uint8, device=device)
+        self.selection_digest_min = torch.zeros(32, dtype=torch.uint8, device=device)
+        self.selection_digest_max = torch.zeros(32, dtype=torch.uint8, device=device)
 
     def gather(
         self, local: Sequence[SamplePopulation], readiness: ReadinessConsensus
@@ -422,6 +441,81 @@ class PopulationCollectiveWorkspace:
             dist.all_reduce(self.schedule_count, op=dist.ReduceOp.MAX, group=self.binding.group)
         return int(self.schedule_count[0])
 
+    def verify_global_selection(
+        self,
+        local: Sequence[TokenId],
+        *,
+        global_selected_tokens: int,
+        readiness: ReadinessConsensus,
+    ) -> str:
+        """Verify the DP-total count and one partition-aware global identity.
+
+        Each DP rank legitimately owns a different local replay plan.  This
+        collective therefore exchanges only the local count and SHA-256, then
+        binds those rank-ordered facts into one global digest.  Exact plan
+        equality remains an MP-replica concern.
+        """
+
+        self.binding.require_same(readiness.binding)
+        error: BaseException | None = None
+        try:
+            if global_selected_tokens <= 0:
+                raise ValueError("global replay selection must be positive")
+            if len(local) != len(set(local)):
+                raise ValueError("local replay selection contains duplicate tokens")
+            if len(local) > global_selected_tokens:
+                raise ValueError("local replay selection exceeds its DP-global count")
+            local_digest = _selected_token_digest(local)
+            self.local_count.fill_(len(local))
+            for index, value in enumerate(local_digest):
+                self.local_selection_digest[index] = value
+        except BaseException as caught:
+            error = caught
+        readiness.settle(error, "DP selection packing")
+        if self.binding.size > 1:
+            dist.all_gather_into_tensor(self.counts, self.local_count, group=self.binding.group)
+            dist.all_gather_into_tensor(
+                self.selection_digests, self.local_selection_digest, group=self.binding.group
+            )
+        else:
+            self.counts.copy_(self.local_count)
+            self.selection_digests.copy_(self.local_selection_digest)
+        global_digest: bytes | None = None
+        error = None
+        try:
+            counts = tuple(int(value) for value in self.counts)
+            if sum(counts) != global_selected_tokens:
+                raise ValueError("DP-local replay selections do not sum to the global count")
+            digest = hashlib.sha256()
+            for rank, count in enumerate(counts):
+                digest.update(rank.to_bytes(8, "little", signed=False))
+                digest.update(count.to_bytes(8, "little", signed=False))
+                start = rank * 32
+                digest.update(bytes(self.selection_digests[start : start + 32].tolist()))
+            global_digest = digest.digest()
+            for index, value in enumerate(global_digest):
+                self.global_selection_digest[index] = value
+            self.selection_digest_min.copy_(self.global_selection_digest)
+            self.selection_digest_max.copy_(self.global_selection_digest)
+        except BaseException as caught:
+            error = caught
+        readiness.settle(error, "DP selection identity construction")
+        if self.binding.size > 1:
+            dist.all_reduce(
+                self.selection_digest_min, op=dist.ReduceOp.MIN, group=self.binding.group
+            )
+            dist.all_reduce(
+                self.selection_digest_max, op=dist.ReduceOp.MAX, group=self.binding.group
+            )
+        error = (
+            ValueError("DP ranks disagree on the global replay selection identity")
+            if not torch.equal(self.selection_digest_min, self.selection_digest_max)
+            else None
+        )
+        readiness.settle(error, "DP selection identity consensus")
+        assert global_digest is not None
+        return global_digest.hex()
+
 
 @dataclass
 class ReplayMicrobatch:
@@ -448,7 +542,7 @@ class ReplayMicrobatch:
 
 @dataclass(frozen=True)
 class ReplayPlanMetadata:
-    """Rank-independent, fixed-capacity replay schedule metadata."""
+    """DP-local, MP-replica-consistent fixed replay schedule metadata."""
 
     micro_batch_size: int
     sequence_length: int
@@ -459,8 +553,14 @@ class ReplayPlanMetadata:
     diagnostic_masks: tuple[tuple[bool, ...], ...]
 
     @property
+    def local_selected_tokens(self) -> int:
+        """Return the selected-token count owned by this DP coordinate."""
+
+        return len(self.selected_tokens)
+
+    @property
     def descriptor_hash(self) -> str:
-        """Return the canonical metadata/slot-order hash."""
+        """Return the canonical DP-local metadata/slot-order hash."""
 
         digest = hashlib.sha256()
         for value in (
@@ -527,7 +627,7 @@ class ReplayPlan:
 @dataclass(frozen=True)
 class _ReplayPlanFacts:
     descriptor_hash: str
-    selected_tokens: int
+    local_selected_tokens: int
     microbatches: int
     host_tensor_bytes: int
     source_population: tuple[tuple[SampleId, tuple[int, ...]], ...]
@@ -564,8 +664,8 @@ class _ReplayPlanFacts:
         actual_selected = sum(
             sum(bool(value) for value in mask) for mask in metadata.diagnostic_masks
         )
-        if actual_selected != metadata.global_selected_tokens:
-            raise ValueError("replay plan selected-token metadata disagrees with fixed masks")
+        if actual_selected > metadata.global_selected_tokens:
+            raise ValueError("local replay masks exceed the DP-global selected-token count")
         if (
             len(metadata.selected_tokens) != actual_selected
             or len(set(metadata.selected_tokens)) != actual_selected
@@ -681,7 +781,7 @@ class _ReplayPlanFacts:
                 )
         return cls(
             descriptor_hash=metadata.descriptor_hash,
-            selected_tokens=actual_selected,
+            local_selected_tokens=actual_selected,
             microbatches=metadata.num_microbatches,
             host_tensor_bytes=total_bytes,
             source_population=plan._source_population,
@@ -890,6 +990,11 @@ def build_distributed_source_plan(
         error = caught
     readiness.settle(error, "local plan reconstruction")
     assert plan is not None
+    workspace.verify_global_selection(
+        plan.metadata.selected_tokens,
+        global_selected_tokens=global_selected_tokens,
+        readiness=readiness,
+    )
     target = workspace.maximum_schedule_count(plan.num_microbatches)
     error = (
         ReplayPreflightError("Tier-1 replay exceeds its fixed microbatch cap")
@@ -958,10 +1063,12 @@ class FixedPlanCodec:
             metadata.micro_batch_size != self.micro_batch_size
             or metadata.sequence_length != self.sequence_length
             or metadata.num_microbatches > self.maximum_microbatches
-            or len(metadata.selected_tokens) > self.maximum_tokens
-            or not len(metadata.selected_tokens)
-            <= metadata.global_selected_tokens
-            <= self.maximum_tokens
+            or not (
+                0
+                <= metadata.local_selected_tokens
+                <= metadata.global_selected_tokens
+                <= self.maximum_tokens
+            )
         ):
             raise ValueError("replay plan exceeds its fixed codec")
         if integer.numel() != self.integer_count or mask.numel() != self.mask_count:
@@ -976,7 +1083,7 @@ class FixedPlanCodec:
                 metadata.micro_batch_size,
                 metadata.sequence_length,
                 metadata.global_selected_tokens,
-                len(metadata.selected_tokens),
+                metadata.local_selected_tokens,
                 len(metadata.ordered_sample_ids),
             ),
             dtype=torch.int64,
@@ -2813,9 +2920,9 @@ def _validated_probe_hook_deltas(
         return {}
     if type(probe) is not FunctionResponseProbe or type(registrations) is not tuple:
         raise TypeError("probe hook registrations require the exact bounded response probe")
-    if probe._phase not in ("pre", "post", "post_repeat", "midpoint") or len(
-        registrations
-    ) != len(probe.descriptors):
+    if probe._phase not in ("pre", "post", "post_repeat", "midpoint") or len(registrations) != len(
+        probe.descriptors
+    ):
         raise RuntimeError("probe hook registrations do not match the active capture")
     if len(probe._handles) != len(registrations):
         raise RuntimeError("probe hook handles do not match the active capture")
@@ -3403,7 +3510,7 @@ class Tier1ReplayEngine:
             }
             local_attention_heads = model_config.num_attention_heads // schedule.tp_size
             probe.bind_preflight(
-                selected_row_capacity=plan_facts.selected_tokens,
+                selected_row_capacity=plan_facts.local_selected_tokens,
                 response_widths=response_widths,
                 response_dtype=params_dtype,
                 attention_heads=local_attention_heads,
@@ -3434,7 +3541,7 @@ class Tier1ReplayEngine:
                 raise ValueError("source replay tensors disagree with fixed-field byte accounting")
             attention_workspace_bytes = _checked_product(
                 8,
-                plan_facts.selected_tokens,
+                plan_facts.local_selected_tokens,
                 local_attention_heads,
                 plan.metadata.sequence_length,
                 max(torch.empty((), dtype=params_dtype).element_size(), 4),
