@@ -5519,11 +5519,11 @@ hpo_r6_promoted_unembedding_i0p00143125_lr6p875em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -5654,11 +5654,11 @@ hpo_r6_promoted_unembedding_i0p00143125_lr0p000275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -5789,11 +5789,11 @@ hpo_r6_promoted_unembedding_i0p00143125_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -5924,11 +5924,11 @@ hpo_r6_promoted_unembedding_i0p00143125_lr0p0044:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -6059,11 +6059,11 @@ hpo_r6_promoted_unembedding_i0p00143125_lr0p0176:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -6194,11 +6194,11 @@ hpo_r6_promoted_unembedding_i0p005725_lr6p875em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -6329,11 +6329,11 @@ hpo_r6_promoted_unembedding_i0p005725_lr0p000275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -6464,11 +6464,11 @@ hpo_r6_promoted_unembedding_i0p005725_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -6599,11 +6599,11 @@ hpo_r6_promoted_unembedding_i0p005725_lr0p0044:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -6734,11 +6734,11 @@ hpo_r6_promoted_unembedding_i0p005725_lr0p0176:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -6869,11 +6869,11 @@ hpo_r6_promoted_unembedding_i0p0229_lr6p875em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -7004,11 +7004,11 @@ hpo_r6_promoted_unembedding_i0p0229_lr0p000275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -7139,11 +7139,11 @@ hpo_r6_promoted_unembedding_i0p0229_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -7274,11 +7274,11 @@ hpo_r6_promoted_unembedding_i0p0229_lr0p0044:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -7409,11 +7409,11 @@ hpo_r6_promoted_unembedding_i0p0229_lr0p0176:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -7544,11 +7544,11 @@ hpo_r6_promoted_unembedding_i0p0916_lr6p875em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -7679,11 +7679,11 @@ hpo_r6_promoted_unembedding_i0p0916_lr0p000275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -7814,11 +7814,11 @@ hpo_r6_promoted_unembedding_i0p0916_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -7949,11 +7949,11 @@ hpo_r6_promoted_unembedding_i0p0916_lr0p0044:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -8084,11 +8084,11 @@ hpo_r6_promoted_unembedding_i0p0916_lr0p0176:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -8219,11 +8219,11 @@ hpo_r6_promoted_unembedding_i0p3664_lr6p875em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -8354,11 +8354,11 @@ hpo_r6_promoted_unembedding_i0p3664_lr0p000275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -8489,11 +8489,11 @@ hpo_r6_promoted_unembedding_i0p3664_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -8624,11 +8624,11 @@ hpo_r6_promoted_unembedding_i0p3664_lr0p0044:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -8759,11 +8759,11 @@ hpo_r6_promoted_unembedding_i0p3664_lr0p0176:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -8894,11 +8894,11 @@ hpo_r6_promoted_unembedding_low_init_ext1_i8p9453125em05_lr6p875em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -9029,11 +9029,11 @@ hpo_r6_promoted_unembedding_low_init_ext1_i8p9453125em05_lr0p000275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -9164,11 +9164,11 @@ hpo_r6_promoted_unembedding_low_init_ext1_i8p9453125em05_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -9299,11 +9299,11 @@ hpo_r6_promoted_unembedding_low_init_ext1_i8p9453125em05_lr0p0044:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -9434,11 +9434,11 @@ hpo_r6_promoted_unembedding_low_init_ext1_i0p0003578125_lr6p875em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -9569,11 +9569,11 @@ hpo_r6_promoted_unembedding_low_init_ext1_i0p0003578125_lr0p000275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -9704,11 +9704,11 @@ hpo_r6_promoted_unembedding_low_init_ext1_i0p0003578125_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -9839,11 +9839,11 @@ hpo_r6_promoted_unembedding_low_init_ext1_i0p0003578125_lr0p0044:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -9974,11 +9974,11 @@ hpo_r6_promoted_qkv_i0p000229_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -10109,11 +10109,11 @@ hpo_r6_promoted_qkv_i0p000229_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -10244,11 +10244,11 @@ hpo_r6_promoted_qkv_i0p000229_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -10379,11 +10379,11 @@ hpo_r6_promoted_qkv_i0p000229_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -10514,11 +10514,11 @@ hpo_r6_promoted_qkv_i0p000229_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -10649,11 +10649,11 @@ hpo_r6_promoted_qkv_i0p001145_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -10784,11 +10784,11 @@ hpo_r6_promoted_qkv_i0p001145_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -10919,11 +10919,11 @@ hpo_r6_promoted_qkv_i0p001145_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -11054,11 +11054,11 @@ hpo_r6_promoted_qkv_i0p001145_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -11189,11 +11189,11 @@ hpo_r6_promoted_qkv_i0p001145_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -11324,11 +11324,11 @@ hpo_r6_promoted_qkv_i0p005725_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -11459,11 +11459,11 @@ hpo_r6_promoted_qkv_i0p005725_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -11594,11 +11594,11 @@ hpo_r6_promoted_qkv_i0p005725_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -11729,11 +11729,11 @@ hpo_r6_promoted_qkv_i0p005725_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -11864,11 +11864,11 @@ hpo_r6_promoted_qkv_i0p005725_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -11999,11 +11999,11 @@ hpo_r6_promoted_qkv_i0p028625_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -12134,11 +12134,11 @@ hpo_r6_promoted_qkv_i0p028625_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -12269,11 +12269,11 @@ hpo_r6_promoted_qkv_i0p028625_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -12404,11 +12404,11 @@ hpo_r6_promoted_qkv_i0p028625_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -12539,11 +12539,11 @@ hpo_r6_promoted_qkv_i0p028625_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -12674,11 +12674,11 @@ hpo_r6_promoted_qkv_i0p143125_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -12809,11 +12809,11 @@ hpo_r6_promoted_qkv_i0p143125_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -12944,11 +12944,11 @@ hpo_r6_promoted_qkv_i0p143125_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -13079,11 +13079,11 @@ hpo_r6_promoted_qkv_i0p143125_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -13214,11 +13214,11 @@ hpo_r6_promoted_qkv_i0p143125_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -13349,11 +13349,11 @@ hpo_r6_promoted_attention_out_i0p000229_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -13484,11 +13484,11 @@ hpo_r6_promoted_attention_out_i0p000229_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -13619,11 +13619,11 @@ hpo_r6_promoted_attention_out_i0p000229_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -13754,11 +13754,11 @@ hpo_r6_promoted_attention_out_i0p000229_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -13889,11 +13889,11 @@ hpo_r6_promoted_attention_out_i0p000229_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -14024,11 +14024,11 @@ hpo_r6_promoted_attention_out_i0p001145_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -14159,11 +14159,11 @@ hpo_r6_promoted_attention_out_i0p001145_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -14294,11 +14294,11 @@ hpo_r6_promoted_attention_out_i0p001145_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -14429,11 +14429,11 @@ hpo_r6_promoted_attention_out_i0p001145_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -14564,11 +14564,11 @@ hpo_r6_promoted_attention_out_i0p001145_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -14699,11 +14699,11 @@ hpo_r6_promoted_attention_out_i0p005725_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -14834,11 +14834,11 @@ hpo_r6_promoted_attention_out_i0p005725_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -14969,11 +14969,11 @@ hpo_r6_promoted_attention_out_i0p005725_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -15104,11 +15104,11 @@ hpo_r6_promoted_attention_out_i0p005725_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -15239,11 +15239,11 @@ hpo_r6_promoted_attention_out_i0p005725_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -15374,11 +15374,11 @@ hpo_r6_promoted_attention_out_i0p028625_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -15509,11 +15509,11 @@ hpo_r6_promoted_attention_out_i0p028625_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -15644,11 +15644,11 @@ hpo_r6_promoted_attention_out_i0p028625_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -15779,11 +15779,11 @@ hpo_r6_promoted_attention_out_i0p028625_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -15914,11 +15914,11 @@ hpo_r6_promoted_attention_out_i0p028625_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -16049,11 +16049,11 @@ hpo_r6_promoted_attention_out_i0p143125_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -16184,11 +16184,11 @@ hpo_r6_promoted_attention_out_i0p143125_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -16319,11 +16319,11 @@ hpo_r6_promoted_attention_out_i0p143125_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -16454,11 +16454,11 @@ hpo_r6_promoted_attention_out_i0p143125_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -16589,11 +16589,11 @@ hpo_r6_promoted_attention_out_i0p143125_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -16724,11 +16724,11 @@ hpo_r6_promoted_attention_out_i0p715625_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -16859,11 +16859,11 @@ hpo_r6_promoted_attention_out_i0p715625_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -16994,11 +16994,11 @@ hpo_r6_promoted_attention_out_i0p715625_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -17129,11 +17129,11 @@ hpo_r6_promoted_attention_out_i0p715625_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -17264,11 +17264,11 @@ hpo_r6_promoted_attention_out_i0p715625_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -17399,11 +17399,11 @@ hpo_r6_promoted_mlp_up_i0p000229_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -17534,11 +17534,11 @@ hpo_r6_promoted_mlp_up_i0p000229_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -17669,11 +17669,11 @@ hpo_r6_promoted_mlp_up_i0p000229_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -17804,11 +17804,11 @@ hpo_r6_promoted_mlp_up_i0p000229_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -17939,11 +17939,11 @@ hpo_r6_promoted_mlp_up_i0p001145_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -18074,11 +18074,11 @@ hpo_r6_promoted_mlp_up_i0p001145_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -18209,11 +18209,11 @@ hpo_r6_promoted_mlp_up_i0p001145_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -18344,11 +18344,11 @@ hpo_r6_promoted_mlp_up_i0p001145_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -18479,11 +18479,11 @@ hpo_r6_promoted_mlp_up_i0p005725_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -18614,11 +18614,11 @@ hpo_r6_promoted_mlp_up_i0p005725_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -18749,11 +18749,11 @@ hpo_r6_promoted_mlp_up_i0p005725_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -18884,11 +18884,11 @@ hpo_r6_promoted_mlp_up_i0p005725_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -19019,11 +19019,11 @@ hpo_r6_promoted_mlp_up_i0p028625_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -19154,11 +19154,11 @@ hpo_r6_promoted_mlp_up_i0p028625_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -19289,11 +19289,11 @@ hpo_r6_promoted_mlp_up_i0p028625_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -19424,11 +19424,11 @@ hpo_r6_promoted_mlp_up_i0p028625_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -19559,11 +19559,11 @@ hpo_r6_promoted_mlp_up_high_init_ext1_i0p1145_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -19694,11 +19694,11 @@ hpo_r6_promoted_mlp_up_high_init_ext1_i0p1145_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -19829,11 +19829,11 @@ hpo_r6_promoted_mlp_up_high_init_ext1_i0p1145_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -19964,11 +19964,11 @@ hpo_r6_promoted_mlp_up_high_init_ext1_i0p458_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -20099,11 +20099,11 @@ hpo_r6_promoted_mlp_up_high_init_ext1_i0p458_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -20234,11 +20234,11 @@ hpo_r6_promoted_mlp_up_high_init_ext1_i0p458_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -20369,11 +20369,11 @@ hpo_r6_promoted_mlp_down_i0p000229_lr4p4em05:
         const: 0.01
       lr_mult:
         const: 0.04
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -20504,11 +20504,11 @@ hpo_r6_promoted_mlp_down_i0p000229_lr0p00022:
         const: 0.01
       lr_mult:
         const: 0.2
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -20639,11 +20639,11 @@ hpo_r6_promoted_mlp_down_i0p000229_lr0p0011:
         const: 0.01
       lr_mult:
         const: 1.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -20774,11 +20774,11 @@ hpo_r6_promoted_mlp_down_i0p000229_lr0p0055:
         const: 0.01
       lr_mult:
         const: 5.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -20909,11 +20909,11 @@ hpo_r6_promoted_mlp_down_i0p001145_lr4p4em05:
         const: 0.049999999999999996
       lr_mult:
         const: 0.04
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -21044,11 +21044,11 @@ hpo_r6_promoted_mlp_down_i0p001145_lr0p00022:
         const: 0.049999999999999996
       lr_mult:
         const: 0.2
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -21179,11 +21179,11 @@ hpo_r6_promoted_mlp_down_i0p001145_lr0p0011:
         const: 0.049999999999999996
       lr_mult:
         const: 1.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -21314,11 +21314,11 @@ hpo_r6_promoted_mlp_down_i0p001145_lr0p0055:
         const: 0.049999999999999996
       lr_mult:
         const: 5.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -21449,11 +21449,11 @@ hpo_r6_promoted_mlp_down_i0p005725_lr4p4em05:
         const: 0.25
       lr_mult:
         const: 0.04
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -21584,11 +21584,11 @@ hpo_r6_promoted_mlp_down_i0p005725_lr0p00022:
         const: 0.25
       lr_mult:
         const: 0.2
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -21719,11 +21719,11 @@ hpo_r6_promoted_mlp_down_i0p005725_lr0p0011:
         const: 0.25
       lr_mult:
         const: 1.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -21854,11 +21854,11 @@ hpo_r6_promoted_mlp_down_i0p005725_lr0p0055:
         const: 0.25
       lr_mult:
         const: 5.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -21989,11 +21989,11 @@ hpo_r6_promoted_mlp_down_i0p028625_lr4p4em05:
         const: 1.25
       lr_mult:
         const: 0.04
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -22124,11 +22124,11 @@ hpo_r6_promoted_mlp_down_i0p028625_lr0p00022:
         const: 1.25
       lr_mult:
         const: 0.2
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -22259,11 +22259,11 @@ hpo_r6_promoted_mlp_down_i0p028625_lr0p0011:
         const: 1.25
       lr_mult:
         const: 1.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -22394,11 +22394,11 @@ hpo_r6_promoted_mlp_down_i0p028625_lr0p0055:
         const: 1.25
       lr_mult:
         const: 5.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -22529,11 +22529,11 @@ hpo_r6_promoted_mlp_down_high_init_ext1_i0p1145_lr4p4em05:
         const: 5.0
       lr_mult:
         const: 0.039999999999999994
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -22664,11 +22664,11 @@ hpo_r6_promoted_mlp_down_high_init_ext1_i0p1145_lr0p00022:
         const: 5.0
       lr_mult:
         const: 0.19999999999999998
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -22799,11 +22799,11 @@ hpo_r6_promoted_mlp_down_high_init_ext1_i0p1145_lr0p0011:
         const: 5.0
       lr_mult:
         const: 1.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -22934,11 +22934,11 @@ hpo_r6_promoted_mlp_down_high_init_ext1_i0p458_lr4p4em05:
         const: 20.0
       lr_mult:
         const: 0.039999999999999994
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -23069,11 +23069,11 @@ hpo_r6_promoted_mlp_down_high_init_ext1_i0p458_lr0p00022:
         const: 20.0
       lr_mult:
         const: 0.19999999999999998
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -23204,11 +23204,11 @@ hpo_r6_promoted_mlp_down_high_init_ext1_i0p458_lr0p0011:
         const: 20.0
       lr_mult:
         const: 1.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -23339,11 +23339,11 @@ hpo_r6_promoted_mlp_down_low_init_ext2_i4p58em05_lr4p4em05:
         const: 0.002
       lr_mult:
         const: 0.039999999999999994
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -23474,11 +23474,11 @@ hpo_r6_promoted_mlp_down_low_init_ext2_i4p58em05_lr0p00022:
         const: 0.002
       lr_mult:
         const: 0.19999999999999998
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -23609,11 +23609,11 @@ hpo_r6_promoted_mlp_down_low_init_ext2_i4p58em05_lr0p0011:
         const: 0.002
       lr_mult:
         const: 1.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -23744,11 +23744,11 @@ hpo_r6_promoted_mlp_down_low_init_ext2_i9p16em06_lr4p4em05:
         const: 0.0004
       lr_mult:
         const: 0.039999999999999994
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -23879,11 +23879,11 @@ hpo_r6_promoted_mlp_down_low_init_ext2_i9p16em06_lr0p00022:
         const: 0.0004
       lr_mult:
         const: 0.19999999999999998
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -24014,11 +24014,11 @@ hpo_r6_promoted_mlp_down_low_init_ext2_i9p16em06_lr0p0011:
         const: 0.0004
       lr_mult:
         const: 1.0
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: norm_bias_identity
       types:
       - norm_bias
@@ -25904,11 +25904,11 @@ hpo_r6_promoted_norm_bias_i1_lr4p4em05:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: promoted_norm_bias_tuned
       types:
       - norm_bias
@@ -26039,11 +26039,11 @@ hpo_r6_promoted_norm_bias_i1_lr0p00022:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: promoted_norm_bias_tuned
       types:
       - norm_bias
@@ -26174,11 +26174,11 @@ hpo_r6_promoted_norm_bias_i1_lr0p0011:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: promoted_norm_bias_tuned
       types:
       - norm_bias
@@ -26309,11 +26309,11 @@ hpo_r6_promoted_norm_bias_i1_lr0p0055:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: promoted_norm_bias_tuned
       types:
       - norm_bias
@@ -26444,11 +26444,11 @@ hpo_r6_promoted_norm_bias_i1_lr0p0275:
         const: 0.0014010500883955843
       lr_mult:
         const: 0.11401613914349151
-    - name: qk_norm_identity
+    - name: qk_norm_promoted
       types:
       - qk_norm
       lr_mult:
-        const: 1.0
+        const: 2.2081769778058304
     - name: promoted_norm_bias_tuned
       types:
       - norm_bias
