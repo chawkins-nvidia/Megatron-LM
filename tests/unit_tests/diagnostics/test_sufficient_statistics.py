@@ -369,6 +369,43 @@ def test_default_moment_workspace_is_96_mib_and_chunk_equivalent() -> None:
     )
 
 
+@pytest.mark.parametrize("operation", ("tensor", "pair", "update"))
+def test_bound_workspace_matches_legacy_for_shaped_bf16_and_broadcast_mask(
+    operation: str,
+) -> None:
+    shape = torch.Size((7, 2, 5))
+    capacity = 17
+    values = torch.linspace(-3.0, 5.0, shape.numel(), dtype=torch.bfloat16).view(shape)
+    other = torch.linspace(2.0, -1.0, shape.numel(), dtype=torch.bfloat16).view(shape)
+    mask = (torch.arange(shape[0] * shape[1]).view(shape[0], shape[1], 1) % 3 != 0).float()
+    assert torch.broadcast_to(mask, shape).stride(-1) == 0
+
+    def accumulate(*, bind_workspace: bool) -> PackedSufficientStatistics:
+        accumulator = PackedSufficientStatistics(
+            (operation,),
+            "cpu",
+            descriptor_hash=f"shaped-workspace-{operation}-{bind_workspace}",
+            reduction_binding=ReductionBinding.flat_world(None),
+            scratch_element_capacity=capacity,
+        )
+        if bind_workspace:
+            storage = torch.empty(accumulator.maximum_scratch_bytes, dtype=torch.uint8)
+            accumulator.bind_workspace(storage)
+        if operation == "tensor":
+            accumulator.add_masked_tensor(operation, values, mask=mask)
+        elif operation == "pair":
+            accumulator.add_masked_pair(operation, values, other, mask=mask)
+        else:
+            accumulator.add_update(operation, values, other, mask=mask)
+        return accumulator.finalize_local_()
+
+    legacy = accumulate(bind_workspace=False)
+    bound = accumulate(bind_workspace=True)
+    torch.testing.assert_close(bound.sum_pack, legacy.sum_pack, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(bound.max_pack, legacy.max_pack, rtol=0, atol=0)
+    torch.testing.assert_close(bound.min_pack, legacy.min_pack, rtol=0, atol=0)
+
+
 def test_update_scratch_bound_covers_chunked_delta_without_full_size_temporary() -> None:
     capacity = 31
     accumulator = PackedSufficientStatistics(

@@ -492,11 +492,11 @@ class PackedSufficientStatistics:
             clean, finite_weights, work = (
                 workspace.fp64[index, :count] for index in range(3)
             )
-            values_fp32.copy_(chunks[0])
+            values_fp32.view(chunks[0].shape).copy_(chunks[0])
             if weights is None:
                 chunk_weights.fill_(1)
             else:
-                chunk_weights.copy_(chunks[1])
+                chunk_weights.view(chunks[1].shape).copy_(chunks[1])
             self._isfinite_out(chunk_weights, selected, auxiliary)
             torch.ge(chunk_weights, 0, out=auxiliary)
             torch.logical_and(selected, auxiliary, out=selected)
@@ -1624,7 +1624,7 @@ class PackedSufficientStatistics:
                 weights_fp32 = self._workspace.fp32[4, :count]
                 finite = self._workspace.boolean[4, :count]
                 nonnegative = self._workspace.boolean[3, :count]
-                weights_fp32.copy_(weight_chunk)
+                weights_fp32.view(weight_chunk.shape).copy_(weight_chunk)
                 self._isfinite_out(weights_fp32, finite, nonnegative)
                 torch.ge(weights_fp32, 0, out=nonnegative)
                 finite.logical_and_(nonnegative)
