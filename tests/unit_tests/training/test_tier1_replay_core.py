@@ -1124,6 +1124,11 @@ def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):
         (model,),
         readiness=ReadinessConsensus(CollectiveBinding("world", None, 1)),
         tracker_getter=lambda: tracker,
+        cuda_device=(
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else None
+        ),
     )
     return engine, model, plan, probe, schedule
 

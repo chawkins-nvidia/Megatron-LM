@@ -257,7 +257,11 @@ def _transaction_worker(rank: int, init_method: str, directory: str, fault: str)
         readiness=ReadinessConsensus(CollectiveBinding("world", None, 2)),
         mutable_buffer_names=(),
         tracker_getter=lambda: tracker,
-        cuda_device=None,
+        cuda_device=(
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else None
+        ),
         samplers=(),
         overlap_objects=(),
         fatal_abort=fatal_abort,
