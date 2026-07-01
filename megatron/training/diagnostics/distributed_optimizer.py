@@ -509,7 +509,8 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
 
         self.optimizer = distributed_optimizer
         self.registry = registry
-        self.metric_name_by_parameter = dict(metric_name_by_parameter)
+        supplied_metric_names = dict(metric_name_by_parameter)
+        self.metric_name_by_parameter: dict[torch.nn.Parameter, str] = {}
         self.diagnostic_max_extra_bytes = diagnostic_max_extra_bytes
         self.max_memory_fraction = max_memory_fraction
         self.finish_chunk_elements = finish_chunk_elements
@@ -542,16 +543,20 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             }
             shard_parameters = {shard.model_param for shard in shards}
             if any(
-                shard.logical_owner and shard.model_param not in self.metric_name_by_parameter
+                descriptor_kinds.get(logical_name) != StatisticKind.UPDATE
+                for logical_name in supplied_metric_names.values()
+            ):
+                raise ValueError("invalid typed owner binding")
+            local_metric_names = {
+                parameter: logical_name
+                for parameter, logical_name in supplied_metric_names.items()
+                if parameter in shard_parameters
+            }
+            if any(
+                shard.logical_owner and shard.model_param not in local_metric_names
                 for shard in shards
             ):
                 raise ValueError("missing typed owner binding")
-            if any(
-                parameter not in shard_parameters
-                or descriptor_kinds.get(logical_name) != StatisticKind.UPDATE
-                for parameter, logical_name in self.metric_name_by_parameter.items()
-            ):
-                raise ValueError("invalid typed owner binding")
         except Exception:
             self._record_construction_failure(
                 DistributedOptimizerEventStatus.CONSTRUCTOR_BINDING_FAILED
@@ -568,6 +573,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         self._bound_shards = shards
         self._bound_offsets = offsets
         self._unique_capture_indices = unique_capture_indices
+        self.metric_name_by_parameter = local_metric_names
 
     @staticmethod
     def negotiate_capabilities(

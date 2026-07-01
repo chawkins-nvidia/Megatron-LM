@@ -137,3 +137,24 @@ def test_secant_runtime_orders_commit_endpoints_midpoint_and_restore() -> None:
     offsets = tuple(source.index(operation) for operation in operations)
     assert offsets == tuple(sorted(offsets))
     assert source.count("_materialize_parameters()") == 2
+
+
+def test_complete_optimizer_event_reports_typed_begin_status_before_unarmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = TieredDiagnosticRuntime.__new__(TieredDiagnosticRuntime)
+    runtime._attempt_due = True
+    runtime.transaction = object()
+    errors: list[BaseException] = []
+    runtime.fatal_abort = errors.append
+    adapter = SimpleNamespace(
+        armed=False,
+        status_for_event_consensus=lambda: torch.tensor([2], dtype=torch.int64),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    with pytest.raises(RuntimeError, match="fatal-abort protocol returned"):
+        runtime.complete_optimizer_event(adapter, None, update_successful=True)
+
+    assert len(errors) == 1
+    assert str(errors[0]) == "pre-update snapshot failed with adapter status 2"

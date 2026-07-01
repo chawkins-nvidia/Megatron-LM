@@ -639,6 +639,45 @@ def test_real_param_buffers_cover_multiple_buffers_buckets_boundaries_and_paddin
     assert {shard.model_param for shard in shards} == set(parameters)
 
 
+def test_real_dp_partition_filters_stage_wide_bindings_to_local_owner_shards() -> None:
+    optimizer, owned_parameters = _real_buffer_optimizer()
+    all_parameters = tuple(parameter for buffer in optimizer.buffers for parameter in buffer.params)
+    nonlocal_parameters = set(all_parameters) - set(owned_parameters)
+    assert nonlocal_parameters
+    registry, names = _registry(
+        {
+            parameter: (f"update/fc1/{index}", MetricFamily.FC1)
+            for index, parameter in enumerate(all_parameters)
+        }
+    )
+
+    adapter = Bf16DistributedOptimizerDiagnosticAdapter(
+        optimizer,
+        registry,
+        names,
+        diagnostic_max_extra_bytes=1_000_000,
+        finish_chunk_elements=3,
+    )
+
+    assert adapter.local_status.item() == DistributedOptimizerEventStatus.OK
+    assert set(adapter.metric_name_by_parameter) == set(owned_parameters)
+    accumulator = registry.new_accumulator("cpu")
+    assert adapter.begin_event() is not None
+    with torch.no_grad():
+        for shard in adapter.iter_owner_shards():
+            shard.main_shard.add_(0.5)
+        optimizer._copy_main_params_to_model_params()
+    assert adapter.finish_event(accumulator, update_successful=True) is not None
+    accumulator.finalize_local_()
+    assert all(
+        accumulator.relative_rms(names[parameter]).valid for parameter in owned_parameters
+    )
+    assert all(
+        not accumulator.relative_rms(names[parameter]).valid
+        for parameter in nonlocal_parameters
+    )
+
+
 def test_one_child_chain_is_accepted_and_multiple_children_fail_closed() -> None:
     optimizer, parameters = _fake_optimizer()
     chain = ChainedOptimizer([optimizer])
@@ -827,6 +866,20 @@ def test_constructor_iterator_and_binding_failures_are_typed_local_status() -> N
     )
     assert (
         binding_adapter.local_status.item()
+        == DistributedOptimizerEventStatus.CONSTRUCTOR_BINDING_FAILED
+    )
+
+    invalid_optimizer, invalid_parameters = _fake_optimizer()
+    invalid_registry, invalid_names = _cross_lane_registry(invalid_parameters)
+    invalid_names[invalid_parameters[0]] = "event/runtime_status"
+    invalid_adapter = Bf16DistributedOptimizerDiagnosticAdapter(
+        invalid_optimizer,
+        invalid_registry,
+        invalid_names,
+        diagnostic_max_extra_bytes=1_000_000,
+    )
+    assert (
+        invalid_adapter.local_status.item()
         == DistributedOptimizerEventStatus.CONSTRUCTOR_BINDING_FAILED
     )
 

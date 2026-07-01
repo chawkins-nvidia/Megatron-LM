@@ -371,8 +371,13 @@ class TieredDiagnosticRuntime:
         if self.transaction is None:
             self._fatal(RuntimeError("diagnostic replay transaction is absent"))
         assert self.transaction is not None
-        if update_successful and not adapter.armed:
-            self._fatal(RuntimeError("diagnostic optimizer snapshot was not armed"))
+        if update_successful:
+            try:
+                self._require_adapter_ok(adapter, "pre-update snapshot")
+            except BaseException as error:
+                self._fatal(error)
+            if not adapter.armed:
+                self._fatal(RuntimeError("diagnostic optimizer snapshot was not armed"))
         if not update_successful:
             adapter.abort_event()
             self.transaction.finish(update_succeeded=False)
