@@ -52,7 +52,7 @@ from .function_response import (
     layerwise_tier1_keys,
 )
 from .registry import MetricFamily
-from .schema import LAYERWISE_SCALAR_PATTERN, is_layerwise_scalar_pattern
+from .schema import is_layerwise_scalar_pattern
 from .secant import (
     TIER2_OUTPUT_KEYS,
     SecantCellDescriptor,
@@ -125,8 +125,9 @@ class TieredDiagnosticRuntime:
         self.layerwise_scalars = is_layerwise_scalar_pattern(
             getattr(args, "diagnostic_layer_pattern", None)
         )
+        layer_pattern = getattr(args, "diagnostic_layer_pattern", None)
         self.selected_global_layers = (
-            selected_global_layer_ids(int(args.num_layers), LAYERWISE_SCALAR_PATTERN)
+            selected_global_layer_ids(int(args.num_layers), layer_pattern)
             if self.layerwise_scalars
             else ()
         )

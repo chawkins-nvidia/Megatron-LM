@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -84,7 +85,6 @@ from .registry import (
 )
 
 from .schema import (  # isort: skip
-    LAYERWISE_SCALAR_PATTERN,
     LAYERWISE_TIER0_METADATA_KEYS,
     TIER0_METADATA_KEYS,
     TIER0_METRIC_KEYS,
@@ -689,7 +689,7 @@ class Tier0Heartbeat:
         if self.layerwise_scalars and self.schema_num_layers is None:
             raise ValueError("log4firstlast diagnostics require num_layers")
         self.selected_global_layers = (
-            selected_global_layer_ids(self.schema_num_layers, LAYERWISE_SCALAR_PATTERN)
+            selected_global_layer_ids(self.schema_num_layers, self.layer_pattern)
             if self.layerwise_scalars
             else ()
         )
@@ -856,6 +856,22 @@ class Tier0Heartbeat:
 
     def _initialize_artifact_writer(self) -> None:
         """Construct the existing last-rank artifact owner and agree setup."""
+
+        # Observe-only launches deliberately use the ordinary training path and
+        # therefore do not stage the immutable DIAG_V2_* provenance contract.
+        # They still emit scalar diagnostics, but must not make artifact
+        # publication a training-correctness gate. Any partially populated
+        # strict contract remains fail-closed below.
+        provenance_names = (
+            "DIAG_V2_SCALING_COMMIT",
+            "DIAG_V2_MEGATRON_COMMIT",
+            "DIAG_V2_RESOLVED_CONFIG_SHA256",
+            "DIAG_V2_SCALING_BUNDLE_SHA256",
+            "DIAG_V2_MEGATRON_BUNDLE_SHA256",
+            "DIAG_V2_RUNG",
+        )
+        if not any(os.environ.get(name) for name in provenance_names):
+            return
 
         rank = dist.get_rank() if dist.is_initialized() else 0
         sink_rank = (dist.get_world_size() - 1) if dist.is_initialized() else 0
