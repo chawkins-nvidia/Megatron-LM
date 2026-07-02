@@ -858,6 +858,25 @@ def test_complete_event_runtime_probe_catches_prior_tensor_producing_calls(
     assert counts == {name: 0 for name in counts}
 
 
+def test_status_only_unsupported_capability_disables_tiered_runtime() -> None:
+    args = _status_only_args()
+    args.diag_enabled = True
+    args.diag_max_tier = 2
+    heartbeat = Tier0Heartbeat(
+        args,
+        [nn.Linear(2, 2)],
+        object(),
+        reduction_binding=ReductionBinding.flat_world(
+            None, reducer=lambda *_args, **_kwargs: None
+        ),
+    )
+
+    assert not heartbeat.capability.supported
+    assert heartbeat.tiered_runtime is None
+    assert heartbeat.prepare_attempt(num_microbatches=1)
+    assert heartbeat.finish_optimizer_event(True, iteration=0)
+
+
 def test_multirank_wandb_ownership_keeps_validation_on_the_single_owner() -> None:
     args = SimpleNamespace(diagnostic_heartbeat=True, world_size=8)
     owners = [

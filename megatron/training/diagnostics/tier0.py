@@ -795,7 +795,8 @@ class Tier0Heartbeat:
 
         self.tiered_runtime = None
         if (
-            bool(getattr(args, "diag_enabled", False))
+            self.capability.supported
+            and bool(getattr(args, "diag_enabled", False))
             and int(getattr(args, "diag_max_tier", 0)) >= 1
         ):
             if forward_step_func is None or forward_backward_func is None:
