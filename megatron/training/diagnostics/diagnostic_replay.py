@@ -42,6 +42,7 @@ _MODEL_FIELDS: tuple[tuple[str, torch.dtype], ...] = (
     ("loss_mask", torch.float32),
     ("position_ids", torch.int64),
 )
+_IGNORABLE_METADATA_FIELDS = frozenset(("dataset_id",))
 _CAPACITY_LIMIT = (1 << 63) - 1
 _PLAN_MAGIC = 0x5449455231504C4E
 _PLAN_VERSION = 2
@@ -169,11 +170,14 @@ class RecordedBatch:
     def from_raw(cls, raw: Mapping[str, Any]) -> "RecordedBatch":
         """Validate a raw pre-broadcast batch and retain only references."""
 
-        expected_fields = {name for name, _dtype in _MODEL_FIELDS} | _RESERVED_FIELDS
-        if set(raw) != expected_fields:
+        required_fields = {name for name, _dtype in _MODEL_FIELDS} | _RESERVED_FIELDS
+        missing_fields = required_fields - set(raw)
+        unexpected_fields = set(raw) - required_fields - _IGNORABLE_METADATA_FIELDS
+        if missing_fields or unexpected_fields:
             raise ValueError(
                 "Tier-1 replay requires exactly the fixed tokens, labels, loss_mask, "
-                "position_ids, and identity fields"
+                "position_ids, identity fields, and known non-model metadata; "
+                f"missing={sorted(missing_fields)}, unexpected={sorted(unexpected_fields)}"
             )
         for name in _RESERVED_FIELDS:
             value = raw[name]

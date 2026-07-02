@@ -266,6 +266,16 @@ def test_raw_replay_fields_are_fixed_and_attention_masks_fail_closed() -> None:
         RecordedBatch.from_raw(raw)
 
 
+def test_raw_replay_accepts_blended_dataset_identity_metadata() -> None:
+    raw = _raw_batch()
+    raw["dataset_id"] = torch.tensor([1, 2], dtype=torch.int64)
+
+    recorded = RecordedBatch.from_raw(raw)
+
+    assert recorded.raw is raw
+    assert tuple(sample.sample_id.sampler_index for sample in recorded.samples) == (3, 7)
+
+
 def test_replay_recorder_rejects_batch_and_byte_overflow_before_retaining() -> None:
     raw = _raw_batch()
     one_batch_bytes = RecordedBatch.from_raw(raw).tensor_bytes
