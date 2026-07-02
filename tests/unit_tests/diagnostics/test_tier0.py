@@ -222,6 +222,70 @@ def test_narrow_backend_capability_rejects_unsupported_modes(
     assert reason in reasons
 
 
+def test_qk_layernorm_is_supported_by_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical = _install_supported_capability_fakes(monkeypatch)
+    reasons = tier0_module._local_capability_reasons(
+        _capability_args(qk_layernorm=True),
+        [nn.Linear(1, 1)],
+        object(),
+        canonical,
+    )
+    assert reasons == ()
+
+
+def test_qk_layernorm_parameters_bind_to_layer_norm_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Attention(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear_qkv = nn.Linear(2, 2)
+            self.linear_proj = nn.Linear(2, 2)
+            self.q_layernorm = nn.LayerNorm(2)
+            self.k_layernorm = nn.LayerNorm(2)
+
+    class MLP(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear_fc1 = nn.Linear(2, 2)
+            self.linear_fc2 = nn.Linear(2, 2)
+
+    class Layer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer_number = 1
+            self.self_attention = Attention()
+            self.mlp = MLP()
+            self.input_layernorm = nn.LayerNorm(2)
+            self.pre_mlp_layernorm = nn.LayerNorm(2)
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pre_process = False
+            self.post_process = False
+            self.layer = Layer()
+            self.decoder = SimpleNamespace(final_layernorm=None)
+
+    monkeypatch.setattr(tier0_module, "GPTModel", Model)
+    monkeypatch.setattr(tier0_module, "TransformerLayer", Layer)
+    model = Model()
+    _, bindings = tier0_module.build_update_registry(
+        [model],
+        num_layers=1,
+        reduction_binding=ReductionBinding.flat_world(None),
+    )
+
+    qk_parameters = (
+        *model.layer.self_attention.q_layernorm.parameters(),
+        *model.layer.self_attention.k_layernorm.parameters(),
+    )
+    assert qk_parameters
+    assert all(bindings[parameter] == "update/norm/layer_0" for parameter in qk_parameters)
+
+
 @pytest.mark.parametrize(
     ("boundary", "one_past", "boundary_microbatches", "one_past_microbatches"),
     (

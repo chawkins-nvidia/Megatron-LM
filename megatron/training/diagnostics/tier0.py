@@ -425,8 +425,6 @@ def _local_capability_reasons(
         reasons.append("fp8_fp4")
     if getattr(args, "num_experts", None) not in (None, 0):
         reasons.append("moe")
-    if getattr(args, "qk_layernorm", False):
-        reasons.append("qk_layernorm")
     if getattr(args, "expert_model_parallel_size", 1) != 1:
         reasons.append("expert_parallel")
     if getattr(args, "virtual_pipeline_model_parallel_size", None) is not None:
@@ -522,7 +520,6 @@ def negotiate_tier0_capability(
         "packed_micro_batch_size",
         "param_gather_overlap",
         "per_token_loss",
-        "qk_layernorm",
         "single_distributed_optimizer_chain",
         "transformer_engine",
         "virtual_pipeline",
@@ -639,6 +636,14 @@ def build_update_registry(
                 (MetricFamily.FC2, module.mlp.linear_fc2),
                 (MetricFamily.NORM, getattr(module, "input_layernorm", None)),
                 (MetricFamily.NORM, getattr(module, "pre_mlp_layernorm", None)),
+                (
+                    MetricFamily.NORM,
+                    getattr(module.self_attention, "q_layernorm", None),
+                ),
+                (
+                    MetricFamily.NORM,
+                    getattr(module.self_attention, "k_layernorm", None),
+                ),
             )
             for family, typed_module in typed_modules:
                 name = f"update/{family.value}/layer_{layer}"

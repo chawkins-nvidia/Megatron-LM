@@ -23,7 +23,7 @@ LAUNCH_ARTIFACT_SCHEMA = "diag/v2/launch-artifact-v3"
 SUPPORT_SIGNATURE = (
     "dense_mcore_gpt:local:bf16:chained_distributed_optimizer_fp32_master:"
     "per_token_loss:dp_tp_pp_cp:sequence_parallel_optional:recompute_mcore:"
-    "canonical_gpt_mask_producer:no_te_fp8_fsdp_moe_vpp_mtp_custom_layout:"
+    "canonical_gpt_mask_producer:qk_layernorm:no_te_fp8_fsdp_moe_vpp_mtp_custom_layout:"
     "no_hybrid_cp_param_gather_overlap"
 )
 CONSUMED_DIAGNOSTIC_CONFIG_FIELDS = (
