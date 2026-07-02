@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.training.datasets.data_samplers import SamplerIssuedIndex
 
 from .accumulator import PackedSlots, PackedSufficientStatistics
@@ -3021,6 +3022,12 @@ class _ModelGraphFacts:
                                 f"{type(value).__qualname__}"
                             )
                             continue
+                    elif (
+                        name == "inv_freq"
+                        and type(module) is RotaryEmbedding
+                        and isinstance(value, torch.Tensor)
+                    ):
+                        fact = ("immutable_rotary_tensor", _snapshot_tensor_facts(value))
                     elif _is_module_runtime_binding(name):
                         fact = (
                             "runtime_binding",

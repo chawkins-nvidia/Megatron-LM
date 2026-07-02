@@ -12,6 +12,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -1205,6 +1206,19 @@ def test_execution_facts_report_every_unsupported_module_tensor_path() -> None:
     message = str(caught.value)
     assert "model[0].decoder_layer.first_runtime_tensor" in message
     assert "model[0].decoder_layer.mlp.second_runtime_tensor" in message
+
+
+def test_execution_facts_snapshot_rotary_inverse_frequency() -> None:
+    model = _dense_gpt_stub()
+    rotary = RotaryEmbedding.__new__(RotaryEmbedding)
+    torch.nn.Module.__init__(rotary)
+    rotary.inv_freq = torch.ones(4)
+    model.rotary_pos_emb = rotary
+
+    facts = _ModelGraphFacts.observe((model,))
+    rotary.inv_freq = rotary.inv_freq.clone()
+
+    assert _ModelGraphFacts.observe((model,)) != facts
 
 
 def test_execution_facts_admit_only_exact_transformer_block_pipeline_input() -> None:
