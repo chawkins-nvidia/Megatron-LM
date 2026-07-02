@@ -39,16 +39,16 @@ def maybe_apply_parametrization_init(args, config):
 
     from megatron.training.parametrization import load_parametrization, load_parametrization_block
 
-    depth_base = getattr(args, 'parametrization_depth_base', None)
-    m_L = (config.num_layers / depth_base) if depth_base else None
     kwargs = dict(
-        m_N=getattr(args, 'parametrization_m_n', 1.0),
-        m_L=m_L,
+        m_N=getattr(args, 'parametrization_m_n', None),
+        model_width=config.hidden_size,
+        model_depth=config.num_layers,
+        width_base=getattr(args, 'parametrization_width_base', None),
         alpha=getattr(args, 'parametrization_alpha', None),
         residual_const=getattr(args, 'parametrization_residual_const', None),
         residual_attention_const=getattr(args, 'parametrization_residual_attention_const', None),
         residual_mlp_const=getattr(args, 'parametrization_residual_mlp_const', None),
-        depth_base=depth_base,
+        depth_base=getattr(args, 'parametrization_depth_base', None),
     )
     if has_file:
         par = load_parametrization(args.parametrization_config, cand, **kwargs)
@@ -62,8 +62,8 @@ def maybe_apply_parametrization_init(args, config):
     par.apply_init(config, residual_depth_multiplier=residual_mult)
     print_rank_0(
         f'[#118 param] applied init: source={source}, candidate={name}, '
-        f'm_N={getattr(args, "parametrization_m_n", 1.0)}, '
-        f'm_L={m_L}, residual_depth_multiplier={residual_mult}, '
+        f'm_N={par.cfg.ratios["m_N"]}, m_L={par.cfg.ratios["m_L"]}, '
+        f'width_base={par.cfg.width_base}, residual_depth_multiplier={residual_mult}, '
         f'enabled={par.cfg.enabled}, alpha={par.cfg.alpha}, '
         f'depth_base={par.cfg.depth_base}, '
         f'residual_attention_mult={getattr(config, "residual_attention_mult", 1.0)}, '

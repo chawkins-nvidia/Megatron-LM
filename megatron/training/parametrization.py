@@ -151,6 +151,7 @@ class ParametrizationConfig:
     enabled: bool = False
     ratios: Dict[str, float] = field(default_factory=lambda: {v: 1.0 for v in RATIO_VARS})
     alpha: float = 0.5  # load-bearing depth exponent: residual branch mult = C * m_L ** (-alpha)
+    width_base: Optional[int] = None  # base hidden width N_0; used to derive m_N
     depth_base: Optional[int] = None  # base depth L_0; None => depth scaling OFF (mult 1.0, inert)
     residual_const: float = 1.0  # backward-compatible default C for both residual branch types
     residual_attention_const: Optional[float] = None  # attention branch C; None => residual_const
@@ -193,11 +194,13 @@ class ParametrizationConfig:
             )
             for r in (d.get("rules", []) or [])
         )
+        width_base = d.get("width_base")
         depth_base = d.get("depth_base")
         return ParametrizationConfig(
             enabled=True,
             ratios=ratios,
             alpha=float(d.get("alpha", 0.5)),
+            width_base=int(width_base) if width_base is not None else None,
             depth_base=int(depth_base) if depth_base is not None else None,
             residual_const=float(d.get("residual_const", 1.0)),
             residual_attention_const=(
@@ -242,6 +245,13 @@ class Parametrization:
 
     # ---- static config sanity ------------------------------------------------------
     def _validate_static(self) -> None:
+        if self.cfg.width_base is not None and self.cfg.width_base <= 0:
+            raise ValueError("[#118 param] width_base must be positive")
+        if self.cfg.depth_base is not None and self.cfg.depth_base <= 0:
+            raise ValueError("[#118 param] depth_base must be positive")
+        for ratio_name, ratio in self.cfg.ratios.items():
+            if ratio <= 0:
+                raise ValueError(f"[#118 param] ratio {ratio_name} must be positive")
         type_ids = {t.id for t in self.cfg.types}
         if self.cfg.expected_types and set(self.cfg.expected_types) - type_ids:
             missing = set(self.cfg.expected_types) - type_ids
@@ -536,6 +546,7 @@ class Parametrization:
             {
                 "ratios": self.cfg.ratios,
                 "alpha": self.cfg.alpha,
+                "width_base": self.cfg.width_base,
                 "depth_base": self.cfg.depth_base,
                 "residual_const": self.cfg.residual_const,
                 "residual_attention_const": self.cfg.residual_attention_const,
@@ -573,6 +584,9 @@ def _block_with_runtime_overrides(
     ratios: Optional[Dict[str, float]] = None,
     m_N: Optional[float] = None,
     m_L: Optional[float] = None,
+    model_width: Optional[int] = None,
+    model_depth: Optional[int] = None,
+    width_base: Optional[int] = None,
     alpha: Optional[float] = None,
     residual_const: Optional[float] = None,
     residual_attention_const: Optional[float] = None,
@@ -580,6 +594,16 @@ def _block_with_runtime_overrides(
     depth_base: Optional[int] = None,
 ) -> dict:
     block = dict(block)  # shallow copy so we never mutate the loaded doc
+    if width_base is not None:
+        block["width_base"] = int(width_base)
+    if depth_base is not None:
+        block["depth_base"] = int(depth_base)
+    resolved_width_base = block.get("width_base")
+    resolved_depth_base = block.get("depth_base")
+    if m_N is None and model_width is not None and resolved_width_base is not None:
+        m_N = float(model_width) / float(resolved_width_base)
+    if m_L is None and model_depth is not None and resolved_depth_base is not None:
+        m_L = float(model_depth) / float(resolved_depth_base)
     if ratios or m_N is not None or m_L is not None:
         merged = dict(block.get("ratios", {}) or {})
         if ratios:
@@ -598,8 +622,6 @@ def _block_with_runtime_overrides(
         block["residual_attention_const"] = float(residual_attention_const)
     if residual_mlp_const is not None:
         block["residual_mlp_const"] = float(residual_mlp_const)
-    if depth_base is not None:
-        block["depth_base"] = int(depth_base)
     return block
 
 
@@ -609,6 +631,9 @@ def load_parametrization_block(
     ratios: Optional[Dict[str, float]] = None,
     m_N: Optional[float] = None,
     m_L: Optional[float] = None,
+    model_width: Optional[int] = None,
+    model_depth: Optional[int] = None,
+    width_base: Optional[int] = None,
     alpha: Optional[float] = None,
     residual_const: Optional[float] = None,
     residual_attention_const: Optional[float] = None,
@@ -624,6 +649,9 @@ def load_parametrization_block(
         ratios=ratios,
         m_N=m_N,
         m_L=m_L,
+        model_width=model_width,
+        model_depth=model_depth,
+        width_base=width_base,
         alpha=alpha,
         residual_const=residual_const,
         residual_attention_const=residual_attention_const,
@@ -640,6 +668,9 @@ def load_parametrization(
     ratios: Optional[Dict[str, float]] = None,
     m_N: Optional[float] = None,
     m_L: Optional[float] = None,
+    model_width: Optional[int] = None,
+    model_depth: Optional[int] = None,
+    width_base: Optional[int] = None,
     alpha: Optional[float] = None,
     residual_const: Optional[float] = None,
     residual_attention_const: Optional[float] = None,
@@ -674,6 +705,9 @@ def load_parametrization(
         ratios=ratios,
         m_N=m_N,
         m_L=m_L,
+        model_width=model_width,
+        model_depth=model_depth,
+        width_base=width_base,
         alpha=alpha,
         residual_const=residual_const,
         residual_attention_const=residual_attention_const,

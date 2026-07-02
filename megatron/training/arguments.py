@@ -2681,8 +2681,12 @@ def _add_learning_rate_args(parser):
                        'from the unified object.')
     group.add_argument('--parametrization-candidate', type=str, default=None,
                        help='(#118) Candidate name within --parametrization-config.')
-    group.add_argument('--parametrization-m-n', type=float, default=1.0,
-                       help='(#118) Width ratio m_N = hidden_size / base_hidden_size.')
+    group.add_argument('--parametrization-m-n', type=float, default=None,
+                       help='(#118) Optional explicit width ratio m_N. By default it is '
+                       'derived as hidden_size / parametrization width_base.')
+    group.add_argument('--parametrization-width-base', type=int, default=None,
+                       help='(#118 CompleteP) Optional runtime override for base hidden width N_0. '
+                       'Inline/file config width_base is used when this is unset.')
     group.add_argument('--parametrization-depth-base', type=int, default=None,
                        help='(#118 CompleteP) Base depth L_0 for depth scaling. When set, '
                        'm_L = num_layers / depth_base is derived and residual multipliers are '

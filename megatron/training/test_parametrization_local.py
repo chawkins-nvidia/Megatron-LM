@@ -193,6 +193,33 @@ def test_explicit_multiplier_aliases_and_inline_loader():
     assert approx(par.init_std_mult("hidden"), 2.0 ** -0.5)
 
 
+def test_inline_loader_derives_width_and_depth_ratios():
+    cfg = c1_config()
+    cfg["width_base"] = 1536
+    cfg["depth_base"] = 8
+    par = P.load_parametrization_block(cfg, model_width=768, model_depth=4)
+    assert approx(par.cfg.ratios["m_N"], 0.5)
+    assert approx(par.cfg.ratios["m_L"], 0.5)
+    assert par.cfg.width_base == 1536
+    assert par.cfg.depth_base == 8
+
+    hidden = next(rule for rule in par.cfg.rules if rule.name == "hidden")
+    override = par._override_for_rule(hidden, 3e-3, 3e-5, 1e-15)
+    expected_lr_mult = 0.5**-1 * 0.5**-0.5
+    assert approx(override["max_lr"], 3e-3 * expected_lr_mult)
+    assert approx(par.init_std_mult("hidden"), 0.5**-0.5)
+
+    explicit = P.load_parametrization_block(
+        cfg,
+        model_width=768,
+        model_depth=4,
+        m_N=2.0,
+        m_L=4.0,
+    )
+    assert explicit.cfg.ratios["m_N"] == 2.0
+    assert explicit.cfg.ratios["m_L"] == 4.0
+
+
 def test_completep_depth_uses_unscaled_output_init_std():
     install_fake_megatron_utils()
     cfg = c1_config()

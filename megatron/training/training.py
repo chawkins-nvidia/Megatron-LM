@@ -1782,7 +1782,6 @@ def setup_model_and_optimizer(
     # qkv/proj/fc1/fc2/readout, so rules with init_std are applied here after modules exist
     # and before optimizer state is captured.
     _par118 = None
-    _m_L118 = None
     _parametrization_block118 = getattr(args, 'parametrization', None)
     _inline_candidate118 = (
         _parametrization_block118.get('candidate_name')
@@ -1802,18 +1801,18 @@ def setup_model_and_optimizer(
             unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
         )
         model_config = get_model_config(model_config_source)
-        _depth_base118 = getattr(args, 'parametrization_depth_base', None)
-        _m_L118 = (model_config.num_layers / _depth_base118) if _depth_base118 else None
         _parametrization_kwargs118 = dict(
-            m_N=getattr(args, 'parametrization_m_n', 1.0),
-            m_L=_m_L118,
+            m_N=getattr(args, 'parametrization_m_n', None),
+            model_width=model_config.hidden_size,
+            model_depth=model_config.num_layers,
+            width_base=getattr(args, 'parametrization_width_base', None),
             alpha=getattr(args, 'parametrization_alpha', None),
             residual_const=getattr(args, 'parametrization_residual_const', None),
             residual_attention_const=getattr(
                 args, 'parametrization_residual_attention_const', None
             ),
             residual_mlp_const=getattr(args, 'parametrization_residual_mlp_const', None),
-            depth_base=_depth_base118,
+            depth_base=getattr(args, 'parametrization_depth_base', None),
         )
         if _has_file_parametrization118:
             _par118 = load_parametrization(
@@ -1876,8 +1875,9 @@ def setup_model_and_optimizer(
             print_rank_0(
                 f'[#118 param] source={"file" if _has_file_parametrization118 else "inline"} '
                 f'candidate={getattr(args, "parametrization_candidate", None) or _inline_candidate118} '
-                f'm_N={getattr(args, "parametrization_m_n", 1.0)} m_L={_m_L118} '
-                f'alpha={_par118.cfg.alpha} depth_base={_par118.cfg.depth_base} '
+                f'm_N={_par118.cfg.ratios["m_N"]} m_L={_par118.cfg.ratios["m_L"]} '
+                f'width_base={_par118.cfg.width_base} alpha={_par118.cfg.alpha} '
+                f'depth_base={_par118.cfg.depth_base} '
                 f'enabled={manifest.get("enabled")} n_override_groups={len(par_overrides)} '
                 f'realized_params={n_real} hash={manifest.get("config_hash")}'
             )
