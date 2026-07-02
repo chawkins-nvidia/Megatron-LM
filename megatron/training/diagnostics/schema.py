@@ -82,6 +82,9 @@ TIER0_METADATA_KEYS: tuple[str, ...] = (
 TIER0_KEYS: tuple[str, ...] = (*TIER0_METRIC_KEYS, *TIER0_METADATA_KEYS)
 
 LAYERWISE_SCALAR_PATTERN = "log4firstlast"
+LAYERWISE_SCALAR_PATTERNS = frozenset(
+    {LAYERWISE_SCALAR_PATTERN, "log4pluslast", "log4plusonelast"}
+)
 _LAYERWISE_CAPTURE_FAMILIES = ("qkv", "attn_out", "fc1", "fc2")
 LAYERWISE_TIER0_METADATA_KEYS: tuple[str, ...] = (
     f"{SCHEMA_PREFIX}event/successful_update",
@@ -98,7 +101,8 @@ def is_layerwise_scalar_pattern(pattern: str | None) -> bool:
     """Return whether ``pattern`` selects the explicit layerwise scalar schema."""
 
     return (
-        isinstance(pattern, str) and pattern.strip().lower() == LAYERWISE_SCALAR_PATTERN
+        isinstance(pattern, str)
+        and pattern.strip().lower() in LAYERWISE_SCALAR_PATTERNS
     )
 
 
@@ -159,7 +163,7 @@ def tier0_keys_for_pattern(
         return TIER0_KEYS
     if num_layers is None:
         raise ValueError("layerwise diagnostic schema requires num_layers")
-    global_layers = selected_global_layer_ids(num_layers, LAYERWISE_SCALAR_PATTERN)
+    global_layers = selected_global_layer_ids(num_layers, layer_pattern)
     return (
         *layerwise_tier0_metric_keys(global_layers, num_layers=num_layers),
         *LAYERWISE_TIER0_METADATA_KEYS,
@@ -186,7 +190,7 @@ def tiered_keys_for_pattern(
 
             expected.extend(
                 layerwise_tier1_keys(
-                    selected_global_layer_ids(num_layers, LAYERWISE_SCALAR_PATTERN)
+                    selected_global_layer_ids(num_layers, layer_pattern)
                 )
             )
         else:
@@ -200,7 +204,7 @@ def tiered_keys_for_pattern(
 
             expected.extend(
                 layerwise_tier2_keys(
-                    selected_global_layer_ids(num_layers, LAYERWISE_SCALAR_PATTERN)
+                    selected_global_layer_ids(num_layers, layer_pattern)
                 )
             )
         else:

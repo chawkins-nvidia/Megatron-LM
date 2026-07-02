@@ -165,6 +165,33 @@ def test_log4firstlast_r4_schema_is_exact_unpooled_and_layer_suffixed() -> None:
     )
 
 
+def test_log4pluslast_r3_schema_uses_paired_boundaries_and_last() -> None:
+    selected = (0, 1, 3, 4, 5)
+    t0 = tier0_keys_for_pattern(num_layers=6, layer_pattern="log4pluslast")
+    keys = tiered_keys_for_pattern(
+        effective_tier=2,
+        num_layers=6,
+        layer_pattern="log4pluslast",
+    )
+
+    assert len(t0) == 131
+    assert len(keys) == len(set(keys)) == 273
+    for layer in selected:
+        assert f"diag/v2/t0/activation/residual/rms/layer_{layer}" in keys
+        assert f"diag/v2/t1/response/qkv/dy_rel/layer_{layer}" in keys
+        assert f"diag/v2/t2/fc2/secant_error/layer_{layer}" in keys
+    assert not any("/layer_2" in key for key in keys)
+    assert_payload_schema(
+        dict.fromkeys(t0), num_layers=6, layer_pattern="log4pluslast"
+    )
+    assert_tiered_payload_schema(
+        dict.fromkeys(keys),
+        effective_tier=2,
+        num_layers=6,
+        layer_pattern="log4pluslast",
+    )
+
+
 def test_status_and_reason_codes_are_stable() -> None:
     assert {status.name: status.value for status in Tier0Status} == {
         "OK": 0,
