@@ -805,7 +805,7 @@ def _assemble_microbatch(
     if not samples:
         raise ValueError("a replay microbatch requires at least one lane")
     data: dict[str, Any] = {}
-    for key in (key for key in samples[0].batch if key not in _RESERVED_FIELDS):
+    for key, _dtype in _MODEL_FIELDS:
         rows = [sample.row(key) for sample in samples]
         first = rows[0]
         if isinstance(first, torch.Tensor):

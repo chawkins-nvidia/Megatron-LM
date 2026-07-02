@@ -271,9 +271,12 @@ def test_raw_replay_accepts_blended_dataset_identity_metadata() -> None:
     raw["dataset_id"] = torch.tensor([1, 2], dtype=torch.int64)
 
     recorded = RecordedBatch.from_raw(raw)
+    selected = (TokenId(recorded.samples[0].sample_id, 0),)
+    plan = build_local_replay_plan((recorded,), selected, micro_batch_size=2)
 
     assert recorded.raw is raw
     assert tuple(sample.sample_id.sampler_index for sample in recorded.samples) == (3, 7)
+    assert "dataset_id" not in plan.microbatches[0].data
 
 
 def test_replay_recorder_rejects_batch_and_byte_overflow_before_retaining() -> None:
