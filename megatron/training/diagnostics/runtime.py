@@ -25,6 +25,7 @@ from megatron.training.diagnostic_layer_selection import selected_global_layer_i
 from .accumulator import PackedSufficientStatistics, ReductionBinding
 from .diagnostic_replay import (
     CollectiveBinding,
+    FixedPlanCodec,
     NonInterleavedReplaySchedule,
     PopulationCollectiveWorkspace,
     ProductionFatalAbort,
@@ -34,6 +35,7 @@ from .diagnostic_replay import (
     StableSampleDataset,
     Tier1ReplayEngine,
     Tier1ReplayTransaction,
+    broadcast_replay_plan,
     build_distributed_source_plan,
 )
 from .distributed_optimizer import (
@@ -210,6 +212,9 @@ class TieredDiagnosticRuntime:
             self.secant = SecantStatistics(self.secant_binding, self.device)
 
         self._dp_binding, self._dp_readiness = self._data_parallel_control()
+        self._tp_binding, self._tp_readiness = self._cuda_control(
+            "tensor_parallel", self._tensor_parallel_group()
+        )
         self._mp_binding, self._mp_readiness = self._cuda_control(
             "model_parallel", self._model_parallel_group()
         )
@@ -280,8 +285,17 @@ class TieredDiagnosticRuntime:
             return data_iterator
         if isinstance(data_iterator, (list, tuple)):
             raise RuntimeError("Tier-1/2 replay rejects virtual-pipeline iterators")
+        if self._tp_rank() != 0:
+            if data_iterator is not None:
+                raise RuntimeError(
+                    "Tier-1/2 replay TP non-source rank unexpectedly owns training data"
+                )
+            self.recorder = None
+            return data_iterator
         if data_iterator is None:
-            raise RuntimeError("Tier-1/2 replay requires a training data iterator")
+            raise RuntimeError(
+                "Tier-1/2 replay TP source rank requires a data iterator"
+            )
         self.recorder = ReplayBatchRecorder(
             data_iterator,
             maximum_batches=self.num_microbatches,
@@ -302,23 +316,42 @@ class TieredDiagnosticRuntime:
             return
         error: BaseException | None = None
         try:
-            if self.recorder is None:
+            if self._tp_rank() == 0 and self.recorder is None:
                 raise RuntimeError(
                     "diagnostic replay did not record the training schedule"
                 )
-            plan = build_distributed_source_plan(
-                self.recorder.recorded,
-                workspace=self.population_workspace,
-                readiness=self._dp_readiness,
-                probe_tokens=min(
-                    int(getattr(self.args, "diag_max_valid_positions_global", 4096)),
-                    self.num_microbatches
-                    * int(getattr(self.args, "micro_batch_size", 1)),
+            probe_tokens = min(
+                int(getattr(self.args, "diag_max_valid_positions_global", 4096)),
+                self.num_microbatches * int(getattr(self.args, "micro_batch_size", 1)),
+            )
+            source_plan = (
+                build_distributed_source_plan(
+                    self.recorder.recorded,
+                    workspace=self.population_workspace,
+                    readiness=self._dp_readiness,
+                    probe_tokens=probe_tokens,
+                    run_seed=int(
+                        getattr(self.args, "diag_sample_seed", self.args.seed)
+                    ),
+                    event_id=event_id,
+                    micro_batch_size=int(self.args.micro_batch_size),
+                    maximum_microbatches=self.num_microbatches,
+                )
+                if self._tp_rank() == 0 and self.recorder is not None
+                else None
+            )
+            plan = broadcast_replay_plan(
+                source_plan,
+                codec=FixedPlanCodec(
+                    maximum_tokens=probe_tokens,
+                    maximum_microbatches=self.num_microbatches,
+                    micro_batch_size=int(self.args.micro_batch_size),
+                    sequence_length=int(self.args.seq_length),
                 ),
-                run_seed=int(getattr(self.args, "diag_sample_seed", self.args.seed)),
-                event_id=event_id,
-                micro_batch_size=int(self.args.micro_batch_size),
-                maximum_microbatches=self.num_microbatches,
+                binding=self._tp_binding,
+                source_group_rank=0,
+                readiness=self._tp_readiness,
+                device=self.device,
             )
             assert self.probe is not None
             self.probe.reset_event(expected_hook_calls=plan.num_microbatches)
@@ -703,6 +736,11 @@ class TieredDiagnosticRuntime:
         if not dist.is_available() or not dist.is_initialized():
             return None
         return parallel_state.get_model_parallel_group()
+
+    def _tensor_parallel_group(self) -> object | None:
+        if not dist.is_available() or not dist.is_initialized():
+            return None
+        return parallel_state.get_tensor_model_parallel_group()
 
     def _model_device(self) -> torch.device:
         for model in self.models:

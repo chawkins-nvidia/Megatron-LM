@@ -168,6 +168,35 @@ def test_first_backend_accepts_tensor_parallelism_and_still_rejects_cp(
         runtime._validate_first_backend()
 
 
+def test_tp_non_source_accepts_only_neutral_training_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = TieredDiagnosticRuntime.__new__(TieredDiagnosticRuntime)
+    runtime._attempt_due = True
+    runtime.recorder = None
+    runtime.num_microbatches = 1
+    runtime.args = SimpleNamespace()
+    monkeypatch.setattr(runtime, "_tp_rank", lambda: 1)
+
+    assert runtime.wrap_data_iterator(None) is None
+    with pytest.raises(RuntimeError, match="non-source rank unexpectedly owns"):
+        runtime.wrap_data_iterator(iter(()))
+
+
+def test_tp_source_still_requires_training_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = TieredDiagnosticRuntime.__new__(TieredDiagnosticRuntime)
+    runtime._attempt_due = True
+    runtime.recorder = None
+    runtime.num_microbatches = 1
+    runtime.args = SimpleNamespace()
+    monkeypatch.setattr(runtime, "_tp_rank", lambda: 0)
+
+    with pytest.raises(RuntimeError, match="TP source rank requires"):
+        runtime.wrap_data_iterator(None)
+
+
 def test_complete_optimizer_event_reports_typed_begin_status_before_unarmed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
