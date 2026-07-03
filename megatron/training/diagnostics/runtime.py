@@ -3,9 +3,9 @@
 """Tier-1/2 runtime bound to the successful-update diagnostic heartbeat.
 
 The first production slice is intentionally narrow and fail closed: dense local
-MCore GPT, TP=CP=1, PP<=2, BF16 distributed Adam, and arbitrary DP.  Tier 0
-remains available outside that surface.  The replay and secant payloads still
-use rank-independent global registries and one shared packed reduction sequence.
+MCore GPT, CP=1, PP<=2, BF16 distributed Adam, and arbitrary TP/DP. Tier 0
+remains available outside that surface. The replay and secant payloads use
+rank-independent global registries and one shared packed reduction sequence.
 """
 
 from __future__ import annotations
@@ -643,8 +643,6 @@ class TieredDiagnosticRuntime:
 
     def _validate_first_backend(self) -> None:
         reasons = []
-        if self._tp_size() != 1:
-            reasons.append("tensor_parallel_size_must_be_1")
         if int(getattr(self.args, "context_parallel_size", 1)) != 1:
             reasons.append("context_parallel_size_must_be_1")
         if int(getattr(self.args, "pipeline_model_parallel_size", 1)) > 2:

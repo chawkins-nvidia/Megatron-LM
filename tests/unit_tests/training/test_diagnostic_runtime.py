@@ -16,7 +16,10 @@ from megatron.training.diagnostics.runtime import (
     diagnostics_requested_tier,
     wrap_stable_training_dataset,
 )
-from megatron.training.diagnostics.schema import TIER0_KEYS, assert_tiered_payload_schema
+from megatron.training.diagnostics.schema import (
+    TIER0_KEYS,
+    assert_tiered_payload_schema,
+)
 from megatron.training.diagnostics.secant import TIER2_OUTPUT_KEYS
 
 
@@ -137,6 +140,32 @@ def test_secant_runtime_orders_commit_endpoints_midpoint_and_restore() -> None:
     offsets = tuple(source.index(operation) for operation in operations)
     assert offsets == tuple(sorted(offsets))
     assert source.count("_materialize_parameters()") == 2
+
+
+def test_first_backend_accepts_tensor_parallelism_and_still_rejects_cp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = TieredDiagnosticRuntime.__new__(TieredDiagnosticRuntime)
+    runtime.required_tier = 1
+    runtime.tier = 2
+    runtime.models = (object(),)
+    runtime.args = SimpleNamespace(
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        transformer_impl="local",
+        diagnostic_unsupported_policy="error",
+    )
+    monkeypatch.setattr(runtime, "_tp_size", lambda: 2)
+
+    runtime._validate_first_backend()
+    assert runtime.tier == 2
+
+    runtime.args.context_parallel_size = 2
+    with pytest.raises(
+        RuntimeError,
+        match="context_parallel_size_must_be_1",
+    ):
+        runtime._validate_first_backend()
 
 
 def test_complete_optimizer_event_reports_typed_begin_status_before_unarmed(
