@@ -79,6 +79,7 @@ from megatron.training.diagnostics.function_response import (
     FunctionResponseProbe,
     ResponseFamily,
     ResponseHookDescriptor,
+    derive_tier1_summaries,
 )
 
 
@@ -1030,6 +1031,24 @@ def test_dense_gpt_spec_accepts_complete_local_rmsnorm_spec() -> None:
     _validate_dense_gpt_models((model,))
 
 
+def test_dense_gpt_replay_accepts_selective_mcore_recompute() -> None:
+    model = _dense_gpt_stub()
+    model.config.recompute_granularity = "selective"
+
+    _validate_dense_gpt_models((model,))
+
+
+@pytest.mark.parametrize("recompute_granularity", ("full", "custom"))
+def test_dense_gpt_replay_rejects_unsupported_recompute_modes(
+    recompute_granularity: str,
+) -> None:
+    model = _dense_gpt_stub()
+    model.config.recompute_granularity = recompute_granularity
+
+    with pytest.raises(ValueError, match=r"GPT capabilities: \['recompute'\]"):
+        _validate_dense_gpt_models((model,))
+
+
 def test_dense_gpt_children_accept_transformer_engine_final_rmsnorm() -> None:
     from megatron.core.extensions.transformer_engine import HAVE_TE, TENorm
 
@@ -1157,6 +1176,56 @@ def _prepare_fixture(engine, plan, probe, schedule, *, maximum_extra_bytes: int 
         currently_reserved_bytes=0,
         total_device_bytes=2**41,
     )
+
+
+def test_selective_mcore_recompute_produces_tier1_dy_rel() -> None:
+    engine, model, plan, probe, schedule = _dense_engine_fixture()
+
+    def raise_fatal(error: BaseException) -> None:
+        raise error
+
+    engine.fatal_abort = raise_fatal
+    model.config.recompute_granularity = "selective"
+    probe.attention_required = False
+    response_scale = [1.0]
+    widths = {
+        ResponseFamily.RESIDUAL: model.config.hidden_size,
+        ResponseFamily.QKV: 3 * model.config.hidden_size,
+        ResponseFamily.ATTN_OUT: model.config.hidden_size,
+        ResponseFamily.FC1: model.config.ffn_hidden_size,
+        ResponseFamily.FC2: model.config.hidden_size,
+    }
+
+    def observe_responses() -> None:
+        for descriptor in probe.descriptors:
+            output = torch.full(
+                (8, 2, widths[descriptor.family]),
+                response_scale[0],
+                dtype=torch.float32,
+            )
+            for hook in descriptor.module._forward_hooks.values():
+                hook(descriptor.module, (), (output, None))
+
+    def forward_backward(**kwargs) -> None:
+        for _ in range(kwargs["num_microbatches"]):
+            kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"][0])
+
+    def forward_step(_data_iterator, _model):
+        observe_responses()
+        return torch.zeros(1), lambda value: value
+
+    schedule.forward_backward_func = forward_backward
+    schedule.forward_step_func = forward_step
+    transaction = _prepare_fixture(engine, plan, probe, schedule)
+
+    transaction.run_pre()
+    response_scale[0] = 1.25
+    result = transaction.finish(update_succeeded=True)
+    result.finalize_local_()
+
+    assert derive_tier1_summaries(result)[
+        "diag/v2/t1/response/residual/dy_rel/first"
+    ] == pytest.approx(0.25)
 
 
 def _count_schedule_calls(schedule):

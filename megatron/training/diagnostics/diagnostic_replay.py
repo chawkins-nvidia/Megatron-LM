@@ -3361,12 +3361,13 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
         config = getattr(model, "config", None)
         if type(config) is not TransformerConfig:
             raise TypeError("Tier-1 replay requires an exact TransformerConfig")
+        # Selective MCore checkpoints only rerun during backward; replay is forward-only.
         unsupported = {
             "transformer_engine": config.transformer_impl != "local",
             "mixture_of_experts": config.num_moe_experts is not None,
             "expert_parallel": config.expert_model_parallel_size != 1,
             "fp8": config.fp8 is not None or config.fp8_param,
-            "recompute": config.recompute_granularity is not None,
+            "recompute": config.recompute_granularity not in (None, "selective"),
             "deferred_embedding_wgrad": config.defer_embedding_wgrad_compute,
             "cpu_offloading": config.cpu_offloading,
             "cuda_graph": config.cuda_graph_impl != "none",
