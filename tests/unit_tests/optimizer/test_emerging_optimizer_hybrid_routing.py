@@ -250,6 +250,10 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
             *,
             block_size=256,
             precondition_frequency=10,
+            graft=False,
+            graft_beta2=0.999,
+            graft_eps=1e-8,
+            start_preconditioning_step=1,
         ) -> None:
             self.params = params
             self.kwargs = {
@@ -259,6 +263,10 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
                 "weight_decay": weight_decay,
                 "block_size": block_size,
                 "precondition_frequency": precondition_frequency,
+                "graft": graft,
+                "graft_beta2": graft_beta2,
+                "graft_eps": graft_eps,
+                "start_preconditioning_step": start_preconditioning_step,
             }
 
     registry = Mock()
@@ -273,6 +281,10 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
         shampoo_eps=3e-11,
         shampoo_block_size=128,
         shampoo_precondition_frequency=7,
+        shampoo_graft=True,
+        shampoo_graft_beta2=0.96,
+        shampoo_graft_eps=4e-9,
+        shampoo_start_preconditioning_step=11,
     )
 
     kwargs = emerging._shampoo_config_to_kwargs(config, model_chunks=[], pg_collection=None)
@@ -285,6 +297,10 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
         "weight_decay": pytest.approx(0.02),
         "block_size": 128,
         "precondition_frequency": 7,
+        "graft": True,
+        "graft_beta2": pytest.approx(0.96),
+        "graft_eps": pytest.approx(4e-9),
+        "start_preconditioning_step": 11,
     }
 
     registry.reset_mock()
@@ -309,6 +325,10 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
         "weight_decay": pytest.approx(0.02),
         "block_size": 128,
         "precondition_frequency": 7,
+        "graft": True,
+        "graft_beta2": pytest.approx(0.96),
+        "graft_eps": pytest.approx(4e-9),
+        "start_preconditioning_step": 11,
     }
     assert init_state_fn is emerging._eopt_init_state_fn
 

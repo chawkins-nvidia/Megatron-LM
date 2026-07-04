@@ -315,6 +315,18 @@ class OptimizerConfig:
     shampoo_precondition_frequency: int = 10
     """Number of optimizer steps between standalone Shampoo preconditioner updates."""
 
+    shampoo_graft: bool = False
+    """Whether standalone Shampoo uses an Adam graft for update magnitude."""
+
+    shampoo_graft_beta2: float = 0.999
+    """Elementwise second-moment coefficient for standalone Shampoo's Adam graft."""
+
+    shampoo_graft_eps: float = 1e-8
+    """Numerical stability epsilon for standalone Shampoo's Adam graft."""
+
+    shampoo_start_preconditioning_step: int = 1
+    """First one-based step at which Adam-grafted Shampoo uses its preconditioner."""
+
     adaptive_muon_moment2_method: str = "adamuon"
     """The method to use for the moment2 update in Adaptive Muon optimizer."""
 

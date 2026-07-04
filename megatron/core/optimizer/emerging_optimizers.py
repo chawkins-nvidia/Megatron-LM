@@ -420,8 +420,8 @@ def _shampoo_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, 
 
     The package registry is the source of truth for the concrete class and constructor
     signature. Standalone Shampoo shares Megatron's global learning rate, weight decay,
-    and Adam betas while exposing only its algorithm-specific epsilon, block size, and
-    precondition frequency under the ``shampoo_`` prefix.
+    and Adam betas while exposing its algorithm-specific preconditioner and graft
+    controls under the ``shampoo_`` prefix.
     """
     shampoo_cls = registry.get_optimizer_cls("shampoo")
     kwargs = _kwargs_from_config(shampoo_cls, "shampoo", config)

@@ -2379,6 +2379,15 @@ def _add_regularization_args(parser):
     group.add_argument('--shampoo-precondition-frequency', type=int, default=10,
                        help='Number of optimizer steps between standalone Shampoo '
                             'preconditioner updates.')
+    group.add_argument('--shampoo-graft', action='store_true',
+                       help='Use an Adam graft for standalone Shampoo update magnitude.')
+    group.add_argument('--shampoo-graft-beta2', type=float, default=0.999,
+                       help='Elementwise second-moment coefficient for the Shampoo Adam graft.')
+    group.add_argument('--shampoo-graft-eps', type=float, default=1e-8,
+                       help='Numerical stability epsilon for the Shampoo Adam graft.')
+    group.add_argument('--shampoo-start-preconditioning-step', type=int, default=1,
+                       help='First one-based step at which Adam-grafted Shampoo uses '
+                            'its preconditioner.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
