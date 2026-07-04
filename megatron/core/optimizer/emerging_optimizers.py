@@ -8,14 +8,24 @@ To add a new emerging optimizer:
   3. Add an ``EmergingOptimizerEntry`` to ``_EMERGING_OPTIMIZERS`` at the bottom.
 """
 
+import hashlib
 import inspect
+import json
 import logging
+import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, get_args
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
 
+from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ShardedObject,
+    ShardedTensor,
+    ShardedTensorFactory,
+)
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_size, log_single_rank
@@ -51,6 +61,245 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+_CHECKPOINT_ADAPTER_SCHEMA = 1
+_CHECKPOINT_ADAPTER_ATTR = "_megatron_checkpoint_adapter"
+_SUPPORTED_LOCAL_AUX_OPTIMIZERS = {"soap", "shampoo"}
+_SOAP_AUX_STATE_KEYS = {"L", "R", "Q_L", "Q_R"}
+_SCHEDULER_OWNED_PARAM_GROUP_FIELDS = {"lr", "weight_decay"}
+
+
+def _normalize_checkpoint_value(value: Any, context: str) -> Any:
+    """Convert optimizer configuration and layout values to canonical JSON data."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise RuntimeError(f"{context} must be finite, got {value}")
+        return value
+    if isinstance(value, (tuple, list)):
+        return [
+            _normalize_checkpoint_value(item, f"{context}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, Mapping):
+        normalized = {}
+        for key in sorted(value):
+            if not isinstance(key, str):
+                raise RuntimeError(f"{context} has a non-string key {key!r}")
+            normalized[key] = _normalize_checkpoint_value(value[key], f"{context}.{key}")
+        return normalized
+    raise RuntimeError(
+        f"{context} has unsupported checkpoint value {value!r} ({type(value).__name__})"
+    )
+
+
+def _validate_local_aux_checkpoint_topology(topology: Mapping[str, int]) -> None:
+    """Reject topology dimensions not covered by the local auxiliary-state adapter."""
+    unsupported = {
+        name: topology[name] for name in ("tp", "pp", "cp", "ep", "etp") if topology[name] != 1
+    }
+    if unsupported:
+        raise RuntimeError(
+            "SOAP/Shampoo local auxiliary-state checkpoints currently support only "
+            f"TP=PP=CP=EP=ETP=1; got {unsupported}. Use no_save_optim or implement "
+            "logical global-block checkpoint factories before enabling this topology."
+        )
+    if topology["dp"] != topology["world_size"]:
+        raise RuntimeError(
+            "SOAP/Shampoo local auxiliary-state checkpoint topology is inconsistent: "
+            f"DP={topology['dp']} but world_size={topology['world_size']} with all model "
+            "parallel dimensions equal to one"
+        )
+
+
+def _local_aux_checkpoint_topology() -> dict[str, int]:
+    """Return the exact replicated-dense topology covered by the minimum adapter."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        topology = {"world_size": 1, "dp": 1, "tp": 1, "pp": 1, "cp": 1, "ep": 1, "etp": 1}
+    else:
+        topology = {
+            "world_size": torch.distributed.get_world_size(),
+            "dp": parallel_state.get_data_parallel_world_size(with_context_parallel=True),
+            "tp": parallel_state.get_tensor_model_parallel_world_size(),
+            "pp": parallel_state.get_pipeline_model_parallel_world_size(),
+            "cp": parallel_state.get_context_parallel_world_size(),
+            "ep": parallel_state.get_expert_model_parallel_world_size(),
+            "etp": parallel_state.get_expert_tensor_parallel_world_size(),
+        }
+    if any(not isinstance(value, int) or value < 1 for value in topology.values()):
+        raise RuntimeError(f"invalid SOAP/Shampoo checkpoint topology: {topology}")
+    _validate_local_aux_checkpoint_topology(topology)
+    return topology
+
+
+def _effective_constructor_config(optimizer_cls: type, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture every effective constructor field needed to recreate an optimizer."""
+    effective = {}
+    for name, parameter in inspect.signature(optimizer_cls.__init__).parameters.items():
+        if name in {"self", "params"}:
+            continue
+        if name in kwargs:
+            value = kwargs[name]
+        elif parameter.default is not inspect.Parameter.empty:
+            value = parameter.default
+        else:
+            raise RuntimeError(
+                f"cannot fingerprint required {optimizer_cls.__name__} constructor field {name!r}"
+            )
+        effective[name] = _normalize_checkpoint_value(value, f"{optimizer_cls.__name__}.{name}")
+    return effective
+
+
+@dataclass(frozen=True)
+class LocalAuxStateCheckpointAdapter:
+    """Topology-preserving checkpoint adapter for SOAP/Shampoo auxiliary state.
+
+    This deliberately supports only replicated dense optimization. Auxiliary tensors are
+    checkpointed as independent full tensors and replicated across DP in the same way as the
+    owning model parameter. Topology-changing restore requires logical global-block factories
+    and is rejected by the persisted fingerprint.
+    """
+
+    optimizer_identity: str
+    optimizer_class: str
+    constructor_config: Mapping[str, Any]
+    schema_version: int = _CHECKPOINT_ADAPTER_SCHEMA
+
+    def _is_aux_tensor_key(self, state_key: str) -> bool:
+        if self.optimizer_identity == "soap":
+            return state_key in _SOAP_AUX_STATE_KEYS
+        if self.optimizer_identity == "shampoo":
+            return (
+                state_key.startswith("left_factor_")
+                or state_key.startswith("right_factor_")
+                or state_key.startswith("left_inverse_root_")
+                or state_key.startswith("right_inverse_root_")
+            )
+        return False
+
+    def shard_state_value(
+        self,
+        param_id: int,
+        state_key: str,
+        value: Any,
+        model_param: ShardedTensor | ShardedTensorFactory,
+    ) -> ShardedTensor | LocalNonpersistentObject | None:
+        """Convert one non-parameter-shaped state value for ``torch_dist``."""
+        model_data = model_param.data
+        if torch.is_tensor(value) and torch.is_tensor(model_data):
+            if tuple(value.shape) == tuple(model_data.shape):
+                return None
+            if not self._is_aux_tensor_key(state_key):
+                raise RuntimeError(
+                    f"unsupported {self.optimizer_identity} state tensor {state_key!r} for "
+                    f"param {param_id}: state shape {tuple(value.shape)} differs from model "
+                    f"shape {tuple(model_data.shape)}"
+                )
+            _local_aux_checkpoint_topology()
+            return ShardedTensor.from_rank_offsets(
+                f"optimizer.state.{self.optimizer_identity}.{state_key}.param_{param_id}."
+                f"{model_param.key}",
+                value,
+                replica_id=model_param.replica_id,
+            )
+        if self.optimizer_identity == "shampoo" and state_key == "block_ranges":
+            return LocalNonpersistentObject(value)
+        raise RuntimeError(
+            f"unsupported non-tensor {self.optimizer_identity} optimizer state "
+            f"{state_key!r} ({type(value).__name__}) for param {param_id}"
+        )
+
+    @staticmethod
+    def _state_layout(optimizer, optimizer_state_dict: Mapping[str, Any]) -> dict[str, Any]:
+        groups = []
+        saved_groups = optimizer_state_dict["param_groups"]
+        if len(saved_groups) != len(optimizer.param_groups):
+            raise RuntimeError("optimizer param-group count changed while fingerprinting")
+        for group_index, (live_group, saved_group) in enumerate(
+            zip(optimizer.param_groups, saved_groups)
+        ):
+            groups.append(
+                {
+                    "config": _normalize_checkpoint_value(
+                        {
+                            key: value
+                            for key, value in saved_group.items()
+                            if key != "params" and key not in _SCHEDULER_OWNED_PARAM_GROUP_FIELDS
+                        },
+                        f"param_groups[{group_index}]",
+                    ),
+                    "params": [
+                        {"shape": list(param.shape), "dtype": str(param.dtype)}
+                        for param in live_group["params"]
+                    ],
+                }
+            )
+
+        states = {}
+        for param_id, param_state in sorted(optimizer_state_dict["state"].items()):
+            state_layout = {}
+            for state_key, value in sorted(param_state.items()):
+                if torch.is_tensor(value):
+                    state_layout[state_key] = {
+                        "kind": "tensor",
+                        "shape": list(value.shape),
+                        "dtype": str(value.dtype),
+                    }
+                elif state_key == "block_ranges":
+                    state_layout[state_key] = {
+                        "kind": "deterministic",
+                        "value": _normalize_checkpoint_value(
+                            value, f"state[{param_id}].{state_key}"
+                        ),
+                    }
+                else:
+                    state_layout[state_key] = {"kind": "scalar", "type": type(value).__name__}
+            states[str(param_id)] = state_layout
+        return {"param_groups": groups, "state": states}
+
+    def fingerprint(self, optimizer, optimizer_state_dict: Mapping[str, Any]) -> dict[str, Any]:
+        """Build a value-independent schema/config/topology/layout fingerprint."""
+        payload = {
+            "schema_version": self.schema_version,
+            "optimizer_identity": self.optimizer_identity,
+            "optimizer_class": self.optimizer_class,
+            "constructor_config": self.constructor_config,
+            "topology": _local_aux_checkpoint_topology(),
+            "layout": self._state_layout(optimizer, optimizer_state_dict),
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return {"payload": payload, "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+
+    def sharded_fingerprint(
+        self, optimizer, optimizer_state_dict: Mapping[str, Any]
+    ) -> ShardedObject:
+        """Wrap the common DP-replicated fingerprint for ``torch_dist``."""
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        return ShardedObject(
+            key=f"optimizer.checkpoint_adapter.{self.optimizer_identity}",
+            data=self.fingerprint(optimizer, optimizer_state_dict),
+            global_shape=(1,),
+            global_offset=(0,),
+            replica_id=rank,
+        )
+
+    def validate_fingerprint(
+        self, loaded: Any, optimizer, optimizer_state_dict: Mapping[str, Any]
+    ) -> None:
+        """Fail before optimizer load when schema, config, topology, or layout changed."""
+        expected = self.fingerprint(optimizer, optimizer_state_dict)
+        if not isinstance(loaded, Mapping) or loaded != expected:
+            loaded_digest = loaded.get("sha256") if isinstance(loaded, Mapping) else None
+            raise RuntimeError(
+                f"{self.optimizer_identity} optimizer checkpoint fingerprint mismatch: "
+                f"loaded={loaded_digest!r}, expected={expected['sha256']!r}. Same-topology "
+                "restore requires identical optimizer config and state layout."
+            )
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -106,6 +355,8 @@ class EmergingOptimizerEntry:
         config_to_kwargs: ``(config, model_chunks, pg_collection) -> dict`` of constructor kwargs.
         default_param_overrides: Per-parameter config overrides applied automatically
             (e.g. route non-linear params to Adam).
+        checkpoint_adapter_factory: Optional factory for optimizer-specific ``torch_dist``
+            state mappings.
     """
 
     optimizer_cls: type
@@ -114,6 +365,7 @@ class EmergingOptimizerEntry:
     default_param_overrides: Dict[ParamKey, ParamGroupOverride] = field(
         default_factory=_default_param_overrides_factory
     )
+    checkpoint_adapter_factory: Callable | None = None
 
 
 def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg_collection):
@@ -126,6 +378,13 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
             eopt_name, config, model_chunks, pg_collection
         )
     optimizer = entry.optimizer_cls(param_groups, **eopt_kwargs)
+    if entry.checkpoint_adapter_factory is not None:
+        checkpoint_adapter = entry.checkpoint_adapter_factory(
+            eopt_name,
+            entry.optimizer_cls,
+            _effective_constructor_config(entry.optimizer_cls, eopt_kwargs),
+        )
+        setattr(optimizer, _CHECKPOINT_ADAPTER_ATTR, checkpoint_adapter)
     return optimizer, entry.init_state_fn
 
 
@@ -430,6 +689,21 @@ def _shampoo_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, 
     return kwargs
 
 
+def _local_aux_checkpoint_adapter_factory(
+    optimizer_identity: str, optimizer_cls: type, constructor_config: Mapping[str, Any]
+) -> LocalAuxStateCheckpointAdapter:
+    """Create the bounded same-topology adapter for SOAP or Shampoo."""
+    if optimizer_identity not in _SUPPORTED_LOCAL_AUX_OPTIMIZERS:
+        raise RuntimeError(
+            f"local auxiliary-state checkpoints are not registered for {optimizer_identity!r}"
+        )
+    return LocalAuxStateCheckpointAdapter(
+        optimizer_identity=optimizer_identity,
+        optimizer_class=f"{optimizer_cls.__module__}.{optimizer_cls.__qualname__}",
+        constructor_config=constructor_config,
+    )
+
+
 # -----------------------------------------------------------------------
 # Register emerging optimizers
 # -----------------------------------------------------------------------
@@ -466,6 +740,7 @@ if HAVE_EMERGING_OPTIMIZERS and "shampoo" in registry.get_optimizer_name_list():
     _EMERGING_OPTIMIZERS["shampoo"] = EmergingOptimizerEntry(
         optimizer_cls=registry.get_optimizer_cls("shampoo"),
         config_to_kwargs=_shampoo_config_to_kwargs,
+        checkpoint_adapter_factory=_local_aux_checkpoint_adapter_factory,
     )
 
 # Register soap with default config
@@ -476,5 +751,8 @@ if HAVE_EMERGING_OPTIMIZERS:
             # skip already registered local versions, e.g. TensorParallel versions.
             continue
         _EMERGING_OPTIMIZERS[eopt_name] = EmergingOptimizerEntry(
-            optimizer_cls=registry.get_optimizer_cls(eopt_name)
+            optimizer_cls=registry.get_optimizer_cls(eopt_name),
+            checkpoint_adapter_factory=(
+                _local_aux_checkpoint_adapter_factory if eopt_name == "soap" else None
+            ),
         )

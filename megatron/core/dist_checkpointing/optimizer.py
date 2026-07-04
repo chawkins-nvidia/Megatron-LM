@@ -7,7 +7,7 @@ for model parameters.
 import logging
 from copy import deepcopy
 from dataclasses import replace
-from typing import Dict, Iterable, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,9 @@ def optim_state_to_sharding_state(
     optim_state_dict: StateDict,
     id_to_sharded_param_map: Dict[int, ShardedTensor],
     exclude_keys: Tuple[str] = (),
+    state_sharding_fn: Optional[
+        Callable[[int, str, Any, Union[ShardedTensor, ShardedTensorFactory]], Optional[Any]]
+    ] = None,
 ):
     """Turn optimizer state dict to sharded state dict based on model state dict *in-place*.
 
@@ -127,6 +130,9 @@ def optim_state_to_sharding_state(
             to model sharded tensors. Can be generated with `get_param_id_to_sharded_param_map`
             function.
         exclude_keys (Tuple[str]): optimizer state keys to exclude from the final state dict.
+        state_sharding_fn (Callable, optional): optimizer-specific conversion for state values
+            that do not have the model parameter's shape. Returning ``None`` delegates to the
+            default parameter-shaped conversion.
 
     Returns:
         None: state dict is modified in place
@@ -138,8 +144,16 @@ def optim_state_to_sharding_state(
             if state_key in exclude_keys:
                 continue
             if param_id in id_to_sharded_param_map:
-                sharded_state[param_id][state_key] = make_sharded_optimizer_tensor(
-                    id_to_sharded_param_map[param_id], param, prefix=f'optimizer.state.{state_key}'
+                model_param = id_to_sharded_param_map[param_id]
+                converted = None
+                if state_sharding_fn is not None:
+                    converted = state_sharding_fn(param_id, state_key, param, model_param)
+                sharded_state[param_id][state_key] = (
+                    converted
+                    if converted is not None
+                    else make_sharded_optimizer_tensor(
+                        model_param, param, prefix=f'optimizer.state.{state_key}'
+                    )
                 )
             else:
                 raise ValueError(f'Param id {param_id} does not match any model sharded param')

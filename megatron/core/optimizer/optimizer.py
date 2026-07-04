@@ -54,6 +54,8 @@ from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
 
+_CHECKPOINT_ADAPTER_STATE_KEY = "optimizer_checkpoint_adapter"
+
 
 def _zero_grad_group_helper(
     group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
@@ -311,6 +313,42 @@ class MegatronOptimizer(ABC):
         self.optimizer.state = value
 
     state = property(_get_state, _set_state)
+
+    def _get_checkpoint_adapter(self):
+        """Return an optional optimizer-specific ``torch_dist`` checkpoint adapter."""
+        return getattr(self.optimizer, "_megatron_checkpoint_adapter", None)
+
+    def _add_checkpoint_adapter_state(self, state_dict, optimizer_state_dict):
+        """Add persisted schema/config/topology/layout metadata when an adapter is active."""
+        adapter = self._get_checkpoint_adapter()
+        if adapter is not None:
+            state_dict[_CHECKPOINT_ADAPTER_STATE_KEY] = adapter.sharded_fingerprint(
+                self.optimizer, optimizer_state_dict
+            )
+        return adapter
+
+    def _validate_checkpoint_adapter_state(self, state_dict):
+        """Validate and remove adapter metadata before the raw Torch optimizer load."""
+        adapter = self._get_checkpoint_adapter()
+        loaded = state_dict.pop(_CHECKPOINT_ADAPTER_STATE_KEY, None)
+        if adapter is None:
+            if loaded is not None:
+                raise RuntimeError(
+                    "optimizer checkpoint requires an adapter but the current optimizer has none"
+                )
+            return
+        if loaded is None:
+            if getattr(self, "_checkpoint_adapter_state_required", False):
+                raise RuntimeError(
+                    "torch_dist optimizer checkpoint is missing required adapter fingerprint"
+                )
+            # Legacy Torch checkpoints use the raw optimizer state_dict and predate this
+            # torch_dist-only adapter.
+            return
+        if hasattr(loaded, "data"):
+            loaded = loaded.data
+        adapter.validate_fingerprint(loaded, self.optimizer, self.optimizer.state_dict())
+        self._checkpoint_adapter_state_required = False
 
     # Promote param_groups so it can be retrieved or set via
     # "optimizer_instance.param_groups"
@@ -834,8 +872,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
+            self._checkpoint_adapter_state_required = self._get_checkpoint_adapter() is not None
 
         state_dict = self.state_dict()
+        checkpoint_adapter = self._add_checkpoint_adapter_state(state_dict, state_dict['optimizer'])
 
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, chain.from_iterable(g for g in self.float16_groups)
@@ -866,7 +906,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # expected to have the same shape as the model parameters,
         # so we save the step separately and ignore it here
         optim_state_to_sharding_state(
-            state_dict['optimizer'], id_to_sharded_param_map, exclude_keys="step"
+            state_dict['optimizer'],
+            id_to_sharded_param_map,
+            exclude_keys="step",
+            state_sharding_fn=(
+                checkpoint_adapter.shard_state_value if checkpoint_adapter is not None else None
+            ),
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
@@ -875,6 +920,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        self._validate_checkpoint_adapter_state(state_dict)
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -1027,6 +1073,7 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
+        self._validate_checkpoint_adapter_state(state_dict)
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
@@ -1045,8 +1092,10 @@ class FP32Optimizer(MegatronOptimizer):
     ):
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
+            self._checkpoint_adapter_state_required = self._get_checkpoint_adapter() is not None
 
         state_dict = self.state_dict()
+        checkpoint_adapter = self._add_checkpoint_adapter_state(state_dict, state_dict)
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, self.get_parameters()
         )
@@ -1055,7 +1104,14 @@ class FP32Optimizer(MegatronOptimizer):
         # all optimizer parameters passed to optim_state_to_sharding_state are
         # expected to have the same shape as the model parameters,
         # so we save the step separately and ignore it here
-        optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
+        optim_state_to_sharding_state(
+            state_dict,
+            id_to_sharded_param_map,
+            exclude_keys="step",
+            state_sharding_fn=(
+                checkpoint_adapter.shard_state_value if checkpoint_adapter is not None else None
+            ),
+        )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
         if step:
