@@ -69,6 +69,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _is_nonlinear_or_embedding,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -309,6 +310,8 @@ def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    hybrid_optimizer: Optional[str] = None,
+    hybrid_default_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -327,6 +330,12 @@ def _get_param_groups(
             specified on a per-layer basis. NOTE: if you want to skip applying weight decay on bias
             and length 1 parameters, and also do not want to do any other overrides, set this to an
             empty dictionary rather than the default value of None.
+        hybrid_optimizer (Optional[str]): selected emerging optimizer for matrix parameters. When
+            set, per-group optimizer overrides may select only this optimizer or Adam, and
+            embeddings, readout parameters, and non-2D parameters always fall back to Adam.
+        hybrid_default_overrides (Optional[Dict[ParamKey, ParamGroupOverride]]): fallback roles
+            declared by the selected optimizer package. Explicit compiled roles must agree with
+            matching package defaults.
     Returns:
         List of parameter groups.
     """
@@ -343,10 +352,89 @@ def _get_param_groups(
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
             param_overrides_list: list[ParamGroupOverride] = []
-            if config_overrides is not None:
-                for param_key, param_override in config_overrides.items():
+            optimizer_overrides: list[str] = []
+            default_optimizer_overrides: list[str] = []
+
+            def collect_matching_overrides(
+                overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+                optimizer_names: list[str],
+            ) -> None:
+                if overrides is None:
+                    return
+                for param_key, param_override in overrides.items():
                     if param_key.matches(param, name):
-                        param_overrides_list.append(param_override)
+                        if hybrid_optimizer is not None and "optimizer" in param_override:
+                            optimizer_name = param_override["optimizer"]
+                            allowed_optimizers = {hybrid_optimizer, "adam"}
+                            if optimizer_name not in allowed_optimizers:
+                                raise ValueError(
+                                    f"Unsupported optimizer override '{optimizer_name}' for "
+                                    f"hybrid optimizer '{hybrid_optimizer}'. Allowed values: "
+                                    f"{sorted(allowed_optimizers)}"
+                                )
+                            optimizer_names.append(optimizer_name)
+                            non_optimizer_override = {
+                                key: value
+                                for key, value in param_override.items()
+                                if key != "optimizer"
+                            }
+                            if non_optimizer_override:
+                                param_overrides_list.append(non_optimizer_override)
+                        else:
+                            param_overrides_list.append(param_override)
+
+            collect_matching_overrides(config_overrides, optimizer_overrides)
+            collect_matching_overrides(
+                hybrid_default_overrides, default_optimizer_overrides
+            )
+
+            if hybrid_optimizer is not None:
+                unique_optimizer_overrides = set(optimizer_overrides)
+                if len(unique_optimizer_overrides) > 1:
+                    raise ValueError(
+                        f"Conflicting overrides for optimizer: "
+                        f"{sorted(unique_optimizer_overrides)}"
+                    )
+                unique_default_optimizer_overrides = set(default_optimizer_overrides)
+                if len(unique_default_optimizer_overrides) > 1:
+                    raise ValueError(
+                        f"Conflicting package default overrides for optimizer: "
+                        f"{sorted(unique_default_optimizer_overrides)}"
+                    )
+                if (
+                    unique_optimizer_overrides
+                    and unique_default_optimizer_overrides
+                    and unique_optimizer_overrides != unique_default_optimizer_overrides
+                ):
+                    raise ValueError(
+                        f"Parameter '{name}' has explicit optimizer role "
+                        f"{sorted(unique_optimizer_overrides)}, which conflicts with package "
+                        f"fallback {sorted(unique_default_optimizer_overrides)}"
+                    )
+                resolved_optimizer_overrides = (
+                    unique_optimizer_overrides or unique_default_optimizer_overrides
+                )
+                requires_adam_fallback = _is_nonlinear_or_embedding(param) or (
+                    unique_default_optimizer_overrides == {"adam"}
+                )
+                if requires_adam_fallback:
+                    # Matrix optimizers do not support embeddings/readout or non-2D tensors.
+                    # A compiled role must agree with the required fallback; silently rewriting a
+                    # contradictory role would hide a parametrization routing error.
+                    if resolved_optimizer_overrides and resolved_optimizer_overrides != {"adam"}:
+                        raise ValueError(
+                            f"Parameter '{name}' requires optimizer='adam' because it is an "
+                            "embedding, readout, or non-2D tensor, but its compiled optimizer "
+                            f"role resolved to {sorted(resolved_optimizer_overrides)}"
+                        )
+                    resolved_optimizer = "adam"
+                else:
+                    resolved_optimizer = (
+                        next(iter(resolved_optimizer_overrides))
+                        if resolved_optimizer_overrides
+                        else hybrid_optimizer
+                    )
+                param_overrides_list.append(ParamGroupOverride(optimizer=resolved_optimizer))
 
             if param_overrides_list:
                 param_override: ParamGroupOverride | None = combine_param_group_overrides(
@@ -424,7 +512,10 @@ def _get_param_groups(
         param_groups.append(param_group)
 
     if os.environ.get("MEGATRON_LOG_OPTIMIZER_PARAM_GROUPS", "1") != "0":
-        opt_impl = "torch-adamw" if USING_PYTORCH_OPTIMIZER else "fused-adam"
+        if hybrid_optimizer is None:
+            opt_impl = "torch-adamw" if USING_PYTORCH_OPTIMIZER else "fused-adam"
+        else:
+            opt_impl = f"hybrid:{hybrid_optimizer}"
         _rank0_print_optimizer_group(
             "OPTIMIZER_PARAM_GROUP_SUMMARY "
             f"optimizer={config.optimizer} impl={opt_impl} "
@@ -441,6 +532,7 @@ def _get_param_groups(
             _rank0_print_optimizer_group(
                 "OPTIMIZER_PARAM_GROUP "
                 f"index={idx} params={len(param_group['params'])} "
+                f"optimizer={param_group.get('optimizer', config.optimizer)} "
                 f"wd_mult={wd_mult} "
                 f"start_wd={start_wd} end_wd={end_wd} "
                 f"effective_start_wd={start_wd * wd_mult} "
@@ -758,23 +850,39 @@ def _get_megatron_optimizer_based_on_param_groups(
 
 
 def check_config_overrides_consistency(
-    config: OptimizerConfig, config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]]
+    config: OptimizerConfig,
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    allowed_optimizer_overrides: Optional[set[str]] = None,
 ):
-    """Check if the config overrides are consistent with the config."""
+    """Check whether per-parameter overrides are consistent with the top-level config.
 
-    # TODO: Remove `optimizer` from this eventually (e.g., if we use Muon for some layers and
-    # Adam for other layers). This would need some more refactoring to work though (param_groups
-    # filtered by optimizer passed into _get_megatron_optimizer_based_on_param_groups).
+    Standard Adam/SGD paths retain their strict optimizer consistency check. An emerging
+    hybrid path may explicitly allow its selected matrix optimizer and Adam fallback while
+    all other optimizer identities remain invalid.
+    """
+
     if config_overrides is not None:
         fields_to_check_for_consistency = [
             'overlap_param_gather_with_optimizer_step',
-            'optimizer',
             'optimizer_cpu_offload',
         ]
-        for field_name in fields_to_check_for_consistency:
-            base_field = getattr(config, field_name, None)
-            all_config_overrides = list(config_overrides.values())
-            for config_override in all_config_overrides:
+        all_config_overrides = list(config_overrides.values())
+        for config_override in all_config_overrides:
+            if 'optimizer' in config_override:
+                optimizer_override = config_override['optimizer']
+                if allowed_optimizer_overrides is None:
+                    if optimizer_override != config.optimizer:
+                        raise ValueError(
+                            "Field optimizer should not be overriden in a config override."
+                        )
+                elif optimizer_override not in allowed_optimizer_overrides:
+                    raise ValueError(
+                        f"Unsupported optimizer override '{optimizer_override}'. Allowed values: "
+                        f"{sorted(allowed_optimizer_overrides)}"
+                    )
+
+            for field_name in fields_to_check_for_consistency:
+                base_field = getattr(config, field_name, None)
                 if field_name in config_override:
                     field = config_override[field_name]
                     if field != base_field:
@@ -821,7 +929,11 @@ def _get_megatron_emerging_optimizer(
             "Install it with: pip install emerging-optimizers"
         )
     if eopt_name not in _EMERGING_OPTIMIZERS:
-        raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
+        available = sorted(_EMERGING_OPTIMIZERS)
+        raise ValueError(
+            f"Emerging optimizer '{eopt_name}' is not registered by the installed "
+            f"emerging_optimizers package. Registered optimizers: {available}"
+        )
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
@@ -841,12 +953,15 @@ def _get_megatron_emerging_optimizer(
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
 
-    # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
-    config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
-
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
-    all_param_groups = _get_param_groups(model_chunks, config, config_overrides)
+    all_param_groups = _get_param_groups(
+        model_chunks,
+        config,
+        dict(config_overrides or {}),
+        hybrid_optimizer=eopt_name,
+        hybrid_default_overrides=_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides,
+    )
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
@@ -863,7 +978,7 @@ def _get_megatron_emerging_optimizer(
 
         if opt_name in _EMERGING_OPTIMIZERS:
             optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
+                config, groups, opt_name, model_chunks, pg_collection
             )
             if use_layer_wise:
                 result = (optimizer, init_state_fn)
@@ -954,7 +1069,15 @@ def get_megatron_optimizer(
     if config_overrides is None:
         config_overrides = get_standard_config_overrides(config)
 
-    check_config_overrides_consistency(config, config_overrides)
+    selected_optimizer = config.optimizer
+    if selected_optimizer.startswith('dist_'):
+        selected_optimizer = selected_optimizer[len('dist_') :]
+    allowed_optimizer_overrides = None
+    if config.optimizer not in ('adam', 'sgd'):
+        allowed_optimizer_overrides = {selected_optimizer, 'adam'}
+    check_config_overrides_consistency(
+        config, config_overrides, allowed_optimizer_overrides=allowed_optimizer_overrides
+    )
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.

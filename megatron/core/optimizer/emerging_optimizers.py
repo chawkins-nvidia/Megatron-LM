@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, get_args
 import torch
 from torch.optim.optimizer import ParamsT
 
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_size, log_single_rank
 
@@ -34,11 +35,19 @@ try:
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
+    try:
+        # Standalone Shampoo is newer than the minimum supported package version. Importing
+        # the module is what registers it with the package registry.
+        from emerging_optimizers.shampoo import Shampoo  # pylint: disable=unused-import
+    except ImportError:
+        Shampoo = None
+
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
     AdaptiveMuon = object
+    Shampoo = None
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +87,7 @@ def _eopt_init_state_fn(opt, config=None):
         opt._init_group(group, skip_non_grad_params=False)
 
 
-def _default_param_overrides_factory() -> Dict[ParamKey, Dict[str, Any]]:
+def _default_param_overrides_factory() -> Dict[ParamKey, ParamGroupOverride]:
     """Default param overrides: route non-linear/embedding params to Adam."""
     return {
         ParamKey(
@@ -102,7 +111,7 @@ class EmergingOptimizerEntry:
     optimizer_cls: type
     init_state_fn: Callable = _eopt_init_state_fn
     config_to_kwargs: Callable | None = None
-    default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
+    default_param_overrides: Dict[ParamKey, ParamGroupOverride] = field(
         default_factory=_default_param_overrides_factory
     )
 
@@ -406,6 +415,21 @@ def _default_adam_based_eopt_config_to_kwargs(
     return kwargs
 
 
+def _shampoo_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert ``OptimizerConfig`` to standalone Shampoo constructor kwargs.
+
+    The package registry is the source of truth for the concrete class and constructor
+    signature. Standalone Shampoo shares Megatron's global learning rate, weight decay,
+    and Adam betas while exposing only its algorithm-specific epsilon, block size, and
+    precondition frequency under the ``shampoo_`` prefix.
+    """
+    shampoo_cls = registry.get_optimizer_cls("shampoo")
+    kwargs = _kwargs_from_config(shampoo_cls, "shampoo", config)
+    if "betas" in inspect.signature(shampoo_cls.__init__).parameters:
+        kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
+    return kwargs
+
+
 # -----------------------------------------------------------------------
 # Register emerging optimizers
 # -----------------------------------------------------------------------
@@ -437,6 +461,12 @@ _EMERGING_OPTIMIZERS.update(
         ),
     }
 )
+
+if HAVE_EMERGING_OPTIMIZERS and "shampoo" in registry.get_optimizer_name_list():
+    _EMERGING_OPTIMIZERS["shampoo"] = EmergingOptimizerEntry(
+        optimizer_cls=registry.get_optimizer_cls("shampoo"),
+        config_to_kwargs=_shampoo_config_to_kwargs,
+    )
 
 # Register soap with default config
 # TODO(skyw): register all emerging optimizers.

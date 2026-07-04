@@ -181,6 +181,93 @@ def test_multipliers_and_reduce_to_baseline():
     assert approx(par2.init_std_mult("norm_bias"), 1.0)
 
 
+def test_optimizer_roles_compile_with_numerical_overrides():
+    cfg = c1_config(m_N=2.0)
+    roles = {
+        "hidden": "matrix",
+        "embedding": "fallback_adam",
+        "unembedding": "tied_adam",
+        "norm_bias": "fallback_adam",
+        "qk_norm": "router_adam",
+    }
+    for rule in cfg["rules"]:
+        rule["optimizer_role"] = roles[rule["name"]]
+    par = P.Parametrization(P.ParametrizationConfig.from_dict(cfg))
+
+    hidden = next(rule for rule in par.cfg.rules if rule.name == "hidden")
+    hidden_override = par._override_for_rule(
+        hidden, 3e-3, 3e-5, 1e-15, selected_optimizer="soap"
+    )
+    assert hidden_override["optimizer"] == "soap"
+    assert approx(hidden_override["max_lr"], 3e-3 * 0.5)
+    assert approx(hidden_override["min_lr"], 3e-5 * 0.5)
+    assert approx(hidden_override["eps"], 1e-15 * 0.5)
+    assert approx(hidden_override["wd_mult"], 2.0)
+
+    embedding = next(rule for rule in par.cfg.rules if rule.name == "embedding")
+    assert (
+        par._override_for_rule(
+            embedding, 3e-3, 3e-5, 1e-15, selected_optimizer="dist_muon"
+        )["optimizer"]
+        == "adam"
+    )
+
+    try:
+        par._override_for_rule(hidden, 3e-3, 3e-5, 1e-15)
+        raise AssertionError("expected optimizer_role to require a selected optimizer")
+    except ValueError as e:
+        assert "no selected optimizer" in str(e)
+
+
+def test_unknown_optimizer_role_is_rejected():
+    cfg = c1_config()
+    for rule in cfg["rules"]:
+        rule["optimizer_role"] = "fallback_adam"
+    cfg["rules"][0]["optimizer_role"] = "generic_matrix"
+    try:
+        P.Parametrization(P.ParametrizationConfig.from_dict(cfg))
+        raise AssertionError("expected unknown optimizer_role to fail")
+    except ValueError as e:
+        assert "unknown optimizer_role" in str(e)
+
+
+def test_optimizer_roles_are_closed_world_for_emerging_optimizers():
+    partial = c1_config()
+    partial["rules"][0]["optimizer_role"] = "matrix"
+    try:
+        P.Parametrization(P.ParametrizationConfig.from_dict(partial))
+        raise AssertionError("expected partial optimizer roles to fail")
+    except ValueError as e:
+        assert "optimizer_role is closed-world" in str(e)
+
+    no_roles = P.Parametrization(P.ParametrizationConfig.from_dict(c1_config()))
+    try:
+        no_roles.build_config_overrides(
+            3e-3, 3e-5, 1e-15, selected_optimizer="shampoo"
+        )
+        raise AssertionError("expected emerging optimizer without roles to fail")
+    except ValueError as e:
+        assert "requires an explicit optimizer_role on every rule" in str(e)
+
+
+def test_config_hash_covers_type_exclusions_but_not_documentation_fixture():
+    base = c1_config()
+    changed_exclusion = copy.deepcopy(base)
+    changed_exclusion["type_registry"]["hidden"]["exclude_globs"] = ["*router*"]
+    changed_fixture = copy.deepcopy(base)
+    changed_fixture["type_registry"]["hidden"]["fixture"] = "decoder.layers.0.hidden.weight"
+
+    base_hash = P.Parametrization(P.ParametrizationConfig.from_dict(base)).config_hash()
+    exclusion_hash = P.Parametrization(
+        P.ParametrizationConfig.from_dict(changed_exclusion)
+    ).config_hash()
+    fixture_hash = P.Parametrization(
+        P.ParametrizationConfig.from_dict(changed_fixture)
+    ).config_hash()
+    assert base_hash != exclusion_hash
+    assert base_hash == fixture_hash
+
+
 def test_explicit_multiplier_aliases_and_inline_loader():
     cfg = c1_config(m_N=2.0)
     hidden = next(r for r in cfg["rules"] if r["name"] == "hidden")

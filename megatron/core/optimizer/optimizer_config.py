@@ -306,6 +306,15 @@ class OptimizerConfig:
     soap_use_kl_shampoo: bool = True
     """Whether to use the KL-Shampoo preconditioner."""
 
+    shampoo_eps: float = 1e-12
+    """Numerical stability epsilon for the standalone Shampoo optimizer."""
+
+    shampoo_block_size: Optional[int] = 256
+    """Maximum standalone Shampoo preconditioner block size. None disables blocking."""
+
+    shampoo_precondition_frequency: int = 10
+    """Number of optimizer steps between standalone Shampoo preconditioner updates."""
+
     adaptive_muon_moment2_method: str = "adamuon"
     """The method to use for the moment2 update in Adaptive Muon optimizer."""
 

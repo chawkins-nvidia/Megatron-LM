@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 GLOBAL_LAYER_ATTR = "param_global_layer_number"
 
 RATIO_VARS = ("m_N", "m_L", "m_B", "m_D")
+OPTIMIZER_ROLES = ("matrix", "fallback_adam", "router_adam", "tied_adam")
 
 
 # --------------------------------------------------------------------------------------
@@ -94,10 +95,13 @@ class Rule:
     """One row of the rule table: attach multipliers to a set of types and an optional
     GLOBAL depth range [start, end] (inclusive). Multipliers are exponent vectors over the
     ratio variables, e.g. ``{"m_N": -1, "m_L": -0.5}`` -> m_N**-1 * m_L**-0.5. An optional
-    ``const`` key multiplies a scalar. An empty dict => multiplier 1.0 (no override emitted)."""
+    ``const`` key multiplies a scalar. ``optimizer_role`` is one closed-world semantic role
+    compiled to either the selected matrix optimizer or Adam fallback. An empty multiplier
+    dict means 1.0 while an optimizer role still emits a routing override."""
 
     name: str
     types: Tuple[str, ...]
+    optimizer_role: Optional[str] = None
     depth_start: Optional[int] = None
     depth_end: Optional[int] = None
     init_std: Dict[str, float] = field(default_factory=dict)
@@ -186,6 +190,7 @@ class ParametrizationConfig:
             Rule(
                 name=r["name"],
                 types=tuple(r["types"]),
+                optimizer_role=r.get("optimizer_role"),
                 depth_start=(r.get("depth") or {}).get("start"),
                 depth_end=(r.get("depth") or {}).get("end"),
                 init_std=_mult_block(r, "init_std", "init_std_mult"),
@@ -257,10 +262,24 @@ class Parametrization:
         if self.cfg.expected_types and set(self.cfg.expected_types) - type_ids:
             missing = set(self.cfg.expected_types) - type_ids
             raise ValueError(f"[#118 param] expected_types not in type_registry: {sorted(missing)}")
+        rules_with_optimizer_roles = [r.name for r in self.cfg.rules if r.optimizer_role is not None]
+        if rules_with_optimizer_roles and len(rules_with_optimizer_roles) != len(self.cfg.rules):
+            rules_without_optimizer_roles = [
+                r.name for r in self.cfg.rules if r.optimizer_role is None
+            ]
+            raise ValueError(
+                "[#118 param] optimizer_role is closed-world: once any rule declares one, "
+                f"every rule must declare one; missing={rules_without_optimizer_roles}"
+            )
         for r in self.cfg.rules:
             unknown = set(r.types) - type_ids
             if unknown:
                 raise ValueError(f"[#118 param] rule '{r.name}' references unknown types {sorted(unknown)}")
+            if r.optimizer_role is not None and r.optimizer_role not in OPTIMIZER_ROLES:
+                raise ValueError(
+                    f"[#118 param] rule '{r.name}' has unknown optimizer_role "
+                    f"'{r.optimizer_role}'; expected one of {list(OPTIMIZER_ROLES)}"
+                )
 
     # ---- classification -------------------------------------------------------------
     def classify(self, param: "torch.nn.Parameter", name: str) -> str:
@@ -295,8 +314,19 @@ class Parametrization:
         )
 
     # ---- optimizer overrides --------------------------------------------------------
-    def _override_for_rule(self, rule: Rule, base_lr, base_min_lr, base_eps) -> ParamGroupOverride:
+    def _override_for_rule(
+        self, rule: Rule, base_lr, base_min_lr, base_eps, selected_optimizer: Optional[str] = None
+    ) -> ParamGroupOverride:
         ov: ParamGroupOverride = {}
+        if rule.optimizer_role is not None:
+            if selected_optimizer is None:
+                raise ValueError(
+                    f"[#118 param] rule '{rule.name}' declares optimizer_role="
+                    f"'{rule.optimizer_role}', but no selected optimizer was provided"
+                )
+            if selected_optimizer.startswith("dist_"):
+                selected_optimizer = selected_optimizer[len("dist_") :]
+            ov["optimizer"] = selected_optimizer if rule.optimizer_role == "matrix" else "adam"
         if rule.lr:
             lm = _mult(rule.lr, self.cfg.ratios)
             if lm != 1.0:
@@ -314,15 +344,36 @@ class Parametrization:
                 ov["wd_mult"] = wm
         return ov
 
-    def build_config_overrides(self, base_lr, base_min_lr, base_eps) -> "Dict[ParamKey, ParamGroupOverride]":
-        """One ParamKey per rule (empty overrides skipped -> reduce-to-baseline at all-ones)."""
+    def build_config_overrides(
+        self, base_lr, base_min_lr, base_eps, selected_optimizer: Optional[str] = None
+    ) -> "Dict[ParamKey, ParamGroupOverride]":
+        """Build one optimizer override per non-identity rule.
+
+        ``optimizer_role`` is compiled here, alongside CompleteP's numerical overrides, so
+        routing and LR/min-LR/WD/epsilon scaling share the same closed-world classifier.
+        """
         if not self.cfg.enabled:
             return {}
+        normalized_optimizer = selected_optimizer
+        if normalized_optimizer is not None and normalized_optimizer.startswith("dist_"):
+            normalized_optimizer = normalized_optimizer[len("dist_") :]
+        if normalized_optimizer not in (None, "adam", "sgd"):
+            rules_without_optimizer_roles = [
+                rule.name for rule in self.cfg.rules if rule.optimizer_role is None
+            ]
+            if rules_without_optimizer_roles:
+                raise ValueError(
+                    f"[#118 param] emerging optimizer '{normalized_optimizer}' requires an "
+                    "explicit optimizer_role on every rule; "
+                    f"missing={rules_without_optimizer_roles}"
+                )
         from megatron.core.optimizer.optimizer_config import ParamKey, ParamWithNamePredicate
 
         out: "Dict[ParamKey, ParamGroupOverride]" = {}
         for rule in self.cfg.rules:
-            ov = self._override_for_rule(rule, base_lr, base_min_lr, base_eps)
+            ov = self._override_for_rule(
+                rule, base_lr, base_min_lr, base_eps, selected_optimizer=selected_optimizer
+            )
             if not ov:
                 continue
             # Capture rule by value in the closure.
@@ -355,7 +406,14 @@ class Parametrization:
                 realized_types[tid] = realized_types.get(tid, 0) + 1
                 per_rule[rule.name].append(name)
                 d = getattr(param, GLOBAL_LAYER_ATTR, None)
-                param_meta[name] = [tid, rule.name, d, list(param.shape), str(param.dtype)]
+                param_meta[name] = [
+                    tid,
+                    rule.name,
+                    rule.optimizer_role,
+                    d,
+                    list(param.shape),
+                    str(param.dtype),
+                ]
         # Closed world: no realized type outside expected_types.
         if self.cfg.expected_types:
             unknown = set(realized_types) - set(self.cfg.expected_types)
@@ -553,11 +611,29 @@ class Parametrization:
                 "residual_attention_const": self.cfg.residual_attention_const,
                 "residual_mlp_const": self.cfg.residual_mlp_const,
                 "types": [
-                    [t.id, list(t.attr), list(t.name_globs), t.min_dim, t.max_dim] for t in self.cfg.types
+                    [
+                        t.id,
+                        list(t.attr),
+                        list(t.name_globs),
+                        list(t.exclude_globs),
+                        t.min_dim,
+                        t.max_dim,
+                    ]
+                    for t in self.cfg.types
                 ],
                 "expected_types": list(self.cfg.expected_types),
                 "rules": [
-                    [r.name, list(r.types), r.depth_start, r.depth_end, r.init_std, r.lr, r.eps, r.wd]
+                    [
+                        r.name,
+                        list(r.types),
+                        r.optimizer_role,
+                        r.depth_start,
+                        r.depth_end,
+                        r.init_std,
+                        r.lr,
+                        r.eps,
+                        r.wd,
+                    ]
                     for r in self.cfg.rules
                 ],
             },

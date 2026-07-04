@@ -2372,6 +2372,13 @@ def _add_regularization_args(parser):
     group.add_argument('--lion-beta2', type=float, default=0.98,
                        help='Second beta coefficient for Lion optimizer '
                        '(used in momentum EMA update). Default: 0.98.')
+    group.add_argument('--shampoo-eps', type=float, default=1e-12,
+                       help='Numerical stability epsilon for standalone Shampoo.')
+    group.add_argument('--shampoo-block-size', type=int, default=256,
+                       help='Maximum standalone Shampoo preconditioner block size.')
+    group.add_argument('--shampoo-precondition-frequency', type=int, default=10,
+                       help='Number of optimizer steps between standalone Shampoo '
+                            'preconditioner updates.')
 
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
@@ -2588,7 +2595,8 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap',
+                                'shampoo', 'adaptive_muon'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')

@@ -1866,7 +1866,10 @@ def setup_model_and_optimizer(
             )
             assert _par118 is not None
             par_overrides = _par118.build_config_overrides(
-                base_lr=config.lr, base_min_lr=config.min_lr, base_eps=config.adam_eps,
+                base_lr=config.lr,
+                base_min_lr=config.min_lr,
+                base_eps=config.adam_eps,
+                selected_optimizer=config.optimizer,
             )
             if par_overrides:
                 config_overrides = {**(config_overrides or {}), **par_overrides}
