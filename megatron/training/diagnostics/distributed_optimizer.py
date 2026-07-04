@@ -2,18 +2,20 @@
 
 """Authoritative BF16 distributed-optimizer update diagnostics."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from enum import IntEnum
 
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.optimizer.distrib_optimizer import (
     DistributedOptimizer as MegatronDistributedOptimizer,
 )
-from megatron.core.optimizer.distrib_optimizer import ModelMainParamShard
-from megatron.core.optimizer.optimizer import ChainedOptimizer
+from megatron.core.optimizer.distrib_optimizer import ModelMainParamShard, ParamShardRange
+from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params
+from megatron.core.transformer.module import param_is_not_shared
 
 from .accumulator import PackedReducer, PackedSufficientStatistics
 from .registry import MetricRegistry, StatisticKind
@@ -290,84 +292,210 @@ class _FinishScratch:
 MemoryStateProvider = Callable[[torch.device], DeviceMemoryState]
 
 
-def _unwrap_distributed_optimizer(
+SupportedBf16Optimizer = MegatronDistributedOptimizer | Float16OptimizerWithFloat16Params
+
+
+def _unwrap_bf16_optimizers(
     optimizer: object,
-) -> tuple[MegatronDistributedOptimizer | None, tuple[DistributedOptimizerDiagnosticReason, ...]]:
-    if isinstance(optimizer, MegatronDistributedOptimizer):
-        return optimizer, ()
+) -> tuple[tuple[SupportedBf16Optimizer, ...], tuple[DistributedOptimizerDiagnosticReason, ...]]:
+    """Return every BF16 optimizer child represented by one diagnostic root."""
+
+    if isinstance(optimizer, (MegatronDistributedOptimizer, Float16OptimizerWithFloat16Params)):
+        return (optimizer,), ()
     if isinstance(optimizer, ChainedOptimizer):
-        if len(optimizer.chained_optimizers) != 1:
-            return None, (DistributedOptimizerDiagnosticReason.CHAIN_ARITY,)
-        child = optimizer.chained_optimizers[0]
+        children = optimizer.chained_optimizers
+        if not children:
+            return (), (DistributedOptimizerDiagnosticReason.CHAIN_ARITY,)
+        if all(isinstance(child, Float16OptimizerWithFloat16Params) for child in children):
+            return tuple(children), ()
+        if len(children) == 1 and isinstance(children[0], MegatronDistributedOptimizer):
+            return (children[0],), ()
+        if all(
+            isinstance(child, (MegatronDistributedOptimizer, Float16OptimizerWithFloat16Params))
+            for child in children
+        ):
+            return (), (DistributedOptimizerDiagnosticReason.CHAIN_ARITY,)
+    return (), (DistributedOptimizerDiagnosticReason.OPTIMIZER_TYPE,)
+
+
+def diagnostic_optimizer_max_tier(optimizer: object) -> int:
+    """Return the highest update-diagnostic tier supported by ``optimizer``.
+
+    Replicated BF16 optimizer children are sufficient for Tier 0 update moments and
+    Tier 1 replay. Tier 2 remains restricted to distributed owner shards because its
+    midpoint protocol assumes one authoritative parameter owner per DP partition.
+    """
+
+    children, reasons = _unwrap_bf16_optimizers(optimizer)
+    if reasons:
+        return 0
+    if any(isinstance(child, Float16OptimizerWithFloat16Params) for child in children):
+        return 1
+    return 2
+
+
+def _model_parameters(
+    optimizers: tuple[SupportedBf16Optimizer, ...],
+) -> tuple[torch.nn.Parameter, ...]:
+    parameters = []
+    for optimizer in optimizers:
+        group_name = (
+            "model_float16_groups"
+            if isinstance(optimizer, MegatronDistributedOptimizer)
+            else "float16_groups"
+        )
+        parameters.extend(
+            parameter for group in getattr(optimizer, group_name, ()) for parameter in group
+        )
+    return tuple(parameters)
+
+
+def _replicated_model_main_param_shards(
+    optimizer: Float16OptimizerWithFloat16Params,
+    *,
+    child_index: int,
+) -> Iterator[ModelMainParamShard]:
+    """Yield aligned full-parameter BF16/FP32 pairs for a replicated child."""
+
+    model_groups = getattr(optimizer, "float16_groups", ())
+    main_groups = getattr(optimizer, "fp32_from_float16_groups", ())
+    if len(model_groups) != len(main_groups):
+        raise ValueError("replicated optimizer diagnostic groups are not aligned")
+
+    data_parallel_owner = (
+        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
+    )
+    for group_index, (model_group, main_group) in enumerate(zip(model_groups, main_groups)):
+        if len(model_group) != len(main_group):
+            raise ValueError(
+                f"replicated optimizer diagnostic group {group_index} is not aligned"
+            )
+        for group_parameter_index, (model_param, main_param) in enumerate(
+            zip(model_group, main_group)
+        ):
+            if model_param.dtype != torch.bfloat16:
+                raise RuntimeError("diagnostic replicated model parameters must be BF16")
+            if main_param.dtype != torch.float32:
+                raise RuntimeError("diagnostic replicated main parameters must be FP32")
+            if model_param.numel() != main_param.numel():
+                raise ValueError("replicated optimizer diagnostic parameter lengths disagree")
+
+            tensor_parallel_sharded = bool(
+                getattr(model_param, "tensor_model_parallel", False)
+            )
+            tensor_parallel_owner = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                model_param, tp_group=getattr(optimizer, "tp_group", None)
+            )
+            shared = not param_is_not_shared(model_param)
+            tied = bool(getattr(model_param, "shared_embedding", False))
+            tied_owner = tied and not shared
+            full_range = ParamShardRange(0, model_param.numel())
+            yield ModelMainParamShard(
+                model_param=model_param,
+                model_shard=model_param,
+                main_shard=main_param,
+                optimizer_group_index=group_index,
+                group_parameter_index=group_parameter_index,
+                model_chunk_index=0,
+                buffer_index=child_index,
+                bucket_index=group_index,
+                param_range=full_range,
+                gbuf_world_range=full_range,
+                bucket_range=full_range,
+                local_buffer_range=full_range,
+                tensor_parallel_sharded=tensor_parallel_sharded,
+                tensor_parallel_duplicate=not tensor_parallel_owner,
+                shared=shared,
+                tied=tied,
+                tied_owner=tied_owner,
+                logical_owner=data_parallel_owner and tensor_parallel_owner and not shared,
+            )
+
+
+def iter_model_main_param_shards(optimizer: object) -> Iterator[ModelMainParamShard]:
+    """Iterate diagnostic owner views across supported optimizer children."""
+
+    children, reasons = _unwrap_bf16_optimizers(optimizer)
+    if reasons:
+        names = ", ".join(reason.name for reason in reasons)
+        raise RuntimeError(f"unsupported optimizer diagnostic source: {names}")
+    for child_index, child in enumerate(children):
         if isinstance(child, MegatronDistributedOptimizer):
-            return child, ()
-    return None, (DistributedOptimizerDiagnosticReason.OPTIMIZER_TYPE,)
-
-
-def _model_parameters(optimizer: MegatronDistributedOptimizer) -> tuple[torch.nn.Parameter, ...]:
-    groups = getattr(optimizer, "model_float16_groups", ())
-    return tuple(parameter for group in groups for parameter in group)
+            yield from child.iter_model_main_param_shards()
+        else:
+            yield from _replicated_model_main_param_shards(child, child_index=child_index)
 
 
 def _local_capability_reasons(
     optimizer: object,
-) -> tuple[MegatronDistributedOptimizer | None, tuple[DistributedOptimizerDiagnosticReason, ...]]:
-    distributed_optimizer, unwrap_reasons = _unwrap_distributed_optimizer(optimizer)
-    if distributed_optimizer is None:
-        return None, unwrap_reasons
+) -> tuple[tuple[SupportedBf16Optimizer, ...], tuple[DistributedOptimizerDiagnosticReason, ...]]:
+    optimizers, unwrap_reasons = _unwrap_bf16_optimizers(optimizer)
+    if not optimizers:
+        return (), unwrap_reasons
 
     reasons: list[DistributedOptimizerDiagnosticReason] = []
-    config = distributed_optimizer.config
-    ddp_config = distributed_optimizer.ddp_config
-    if distributed_optimizer.is_stub_optimizer:
-        reasons.append(DistributedOptimizerDiagnosticReason.STUB_OPTIMIZER)
-    if not config.bf16 or config.fp16:
-        reasons.append(DistributedOptimizerDiagnosticReason.NOT_BF16)
-    if ddp_config.use_megatron_fsdp:
-        reasons.append(DistributedOptimizerDiagnosticReason.FSDP)
-    if config.use_precision_aware_optimizer:
-        reasons.append(DistributedOptimizerDiagnosticReason.PRECISION_AWARE)
-    if ddp_config.fp8_param_gather or config.fp8_recipe is not None:
-        reasons.append(DistributedOptimizerDiagnosticReason.FP8)
-    if ddp_config.fp4_param_gather:
-        reasons.append(DistributedOptimizerDiagnosticReason.FP4)
-    if any(
-        not getattr(parameter, "allreduce", True)
-        for parameter in _model_parameters(distributed_optimizer)
-    ):
-        reasons.append(DistributedOptimizerDiagnosticReason.MOE)
-    if config.use_layer_wise_distributed_optimizer:
-        reasons.append(DistributedOptimizerDiagnosticReason.LAYERWISE)
-    if config.optimizer_cpu_offload:
-        reasons.append(DistributedOptimizerDiagnosticReason.CPU_OFFLOAD)
-    if (
-        ddp_config.overlap_param_gather
-        or config.overlap_param_gather
-        or config.overlap_param_gather_with_optimizer_step
-    ):
-        reasons.append(DistributedOptimizerDiagnosticReason.OVERLAP_PARAM_GATHER)
+    for child in optimizers:
+        config = child.config
+        if child.is_stub_optimizer:
+            reasons.append(DistributedOptimizerDiagnosticReason.STUB_OPTIMIZER)
+        if not config.bf16 or config.fp16:
+            reasons.append(DistributedOptimizerDiagnosticReason.NOT_BF16)
+        if config.use_precision_aware_optimizer:
+            reasons.append(DistributedOptimizerDiagnosticReason.PRECISION_AWARE)
+        if config.fp8_recipe is not None:
+            reasons.append(DistributedOptimizerDiagnosticReason.FP8)
+        if config.use_layer_wise_distributed_optimizer:
+            reasons.append(DistributedOptimizerDiagnosticReason.LAYERWISE)
+        if config.optimizer_cpu_offload:
+            reasons.append(DistributedOptimizerDiagnosticReason.CPU_OFFLOAD)
+        if config.overlap_param_gather or config.overlap_param_gather_with_optimizer_step:
+            reasons.append(DistributedOptimizerDiagnosticReason.OVERLAP_PARAM_GATHER)
 
-    main_groups = getattr(distributed_optimizer, "shard_fp32_from_float16_groups", ())
-    if any(
-        parameter is None or parameter.dtype != torch.float32
-        for group in main_groups
-        for parameter in group
-    ):
-        reasons.append(DistributedOptimizerDiagnosticReason.NON_FP32_MAIN)
-    model_groups = getattr(distributed_optimizer, "model_float16_groups", ())
-    if any(
-        parameter.dtype != torch.bfloat16 for group in model_groups for parameter in group
-    ) or any(getattr(distributed_optimizer, "model_fp32_groups", ())):
-        reasons.append(DistributedOptimizerDiagnosticReason.NOT_BF16)
-    return distributed_optimizer, tuple(sorted(set(reasons), key=int))
+        if isinstance(child, MegatronDistributedOptimizer):
+            ddp_config = child.ddp_config
+            if ddp_config.use_megatron_fsdp:
+                reasons.append(DistributedOptimizerDiagnosticReason.FSDP)
+            if ddp_config.fp8_param_gather:
+                reasons.append(DistributedOptimizerDiagnosticReason.FP8)
+            if ddp_config.fp4_param_gather:
+                reasons.append(DistributedOptimizerDiagnosticReason.FP4)
+            if ddp_config.overlap_param_gather:
+                reasons.append(DistributedOptimizerDiagnosticReason.OVERLAP_PARAM_GATHER)
+            main_groups = getattr(child, "shard_fp32_from_float16_groups", ())
+            model_groups = getattr(child, "model_float16_groups", ())
+            fp32_model_groups = getattr(child, "model_fp32_groups", ())
+        else:
+            main_groups = getattr(child, "fp32_from_float16_groups", ())
+            model_groups = getattr(child, "float16_groups", ())
+            fp32_model_groups = getattr(child, "fp32_from_fp32_groups", ())
+
+        if any(
+            not getattr(parameter, "allreduce", True)
+            for group in model_groups
+            for parameter in group
+        ):
+            reasons.append(DistributedOptimizerDiagnosticReason.MOE)
+        if any(
+            parameter is None or parameter.dtype != torch.float32
+            for group in main_groups
+            for parameter in group
+        ):
+            reasons.append(DistributedOptimizerDiagnosticReason.NON_FP32_MAIN)
+        if any(
+            parameter.dtype != torch.bfloat16
+            for group in model_groups
+            for parameter in group
+        ) or any(fp32_model_groups):
+            reasons.append(DistributedOptimizerDiagnosticReason.NOT_BF16)
+    return optimizers, tuple(sorted(set(reasons), key=int))
 
 
 def _negotiation_device(
-    optimizer: MegatronDistributedOptimizer | None, process_group: object | None
+    optimizers: tuple[SupportedBf16Optimizer, ...], process_group: object | None
 ) -> torch.device:
     backend = dist.get_backend(process_group) if dist.is_initialized() else None
-    if optimizer is not None:
-        parameters = _model_parameters(optimizer)
+    if optimizers:
+        parameters = _model_parameters(optimizers)
         if parameters:
             device = parameters[0].device
             if backend != "nccl" or device.type == "cuda":
@@ -470,7 +598,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         """Negotiate support and bind typed owner shards without local raises.
 
         Args:
-            optimizer: One real distributed optimizer or a trivial one-child chain.
+            optimizer: One supported BF16 optimizer or a nonempty replicated chain.
             registry: Existing owner-aware metric registry.
             metric_name_by_parameter: Typed parameter-to-update-descriptor bindings.
             diagnostic_max_extra_bytes: Hard complete-event allocation limit.
@@ -504,10 +632,11 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             raise DistributedOptimizerDiagnosticUnsupportedError(
                 f"unsupported BF16 distributed-optimizer diagnostics: {reason_names}"
             )
-        distributed_optimizer, _ = _unwrap_distributed_optimizer(optimizer)
-        assert distributed_optimizer is not None
+        optimizers, _ = _unwrap_bf16_optimizers(optimizer)
+        assert optimizers
 
-        self.optimizer = distributed_optimizer
+        self.optimizer = optimizers[0] if len(optimizers) == 1 else optimizer
+        self._optimizer_root = optimizer
         self.registry = registry
         supplied_metric_names = dict(metric_name_by_parameter)
         self.metric_name_by_parameter: dict[torch.nn.Parameter, str] = {}
@@ -522,7 +651,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         self._finish_scratch: _FinishScratch | None = None
         self._last_memory_reason = SnapshotMemoryReason.NONE
         self._status = torch.zeros(
-            1, dtype=torch.int64, device=_negotiation_device(distributed_optimizer, process_group)
+            1, dtype=torch.int64, device=_negotiation_device(optimizers, process_group)
         )
         self._construction_status = DistributedOptimizerEventStatus.OK
         self._bound_shards: tuple[ModelMainParamShard, ...] = ()
@@ -530,7 +659,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         self._unique_capture_indices: tuple[int, ...] = ()
 
         try:
-            shards = tuple(self.optimizer.iter_model_main_param_shards())
+            shards = tuple(iter_model_main_param_shards(self._optimizer_root))
         except Exception:
             self._record_construction_failure(
                 DistributedOptimizerEventStatus.CONSTRUCTOR_ITERATOR_FAILED
@@ -585,7 +714,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
     ) -> DistributedOptimizerCapabilityReport:
         """Collectively negotiate the narrow first-backend capability contract."""
 
-        distributed_optimizer, local_reasons = _local_capability_reasons(optimizer)
+        optimizers, local_reasons = _local_capability_reasons(optimizer)
         if reducer is not None:
             if world_size is None or world_size <= 0:
                 raise ValueError("an injected capability reducer requires a positive world size")
@@ -599,7 +728,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         flags = torch.zeros(
             reason_count,
             dtype=torch.int64,
-            device=_negotiation_device(distributed_optimizer, process_group),
+            device=_negotiation_device(optimizers, process_group),
         )
         for reason in local_reasons:
             flags[reason.value] = 1
@@ -790,7 +919,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
         self._set_status(DistributedOptimizerEventStatus.OK)
         self._last_memory_reason = SnapshotMemoryReason.NONE
         try:
-            shards = tuple(self.optimizer.iter_model_main_param_shards())
+            shards = tuple(iter_model_main_param_shards(self._optimizer_root))
         except Exception:
             self._set_status(DistributedOptimizerEventStatus.BEGIN_ITERATOR_FAILED)
             return None
@@ -927,7 +1056,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             return None
 
         try:
-            current_shards = tuple(self.optimizer.iter_model_main_param_shards())
+            current_shards = tuple(iter_model_main_param_shards(self._optimizer_root))
             if len(current_shards) != len(snapshot.shards) or any(
                 self._shard_identity(original) != self._shard_identity(current)
                 for original, current in zip(snapshot.shards, current_shards)
@@ -1141,7 +1270,7 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
             return None
 
         try:
-            current_shards = tuple(self.optimizer.iter_model_main_param_shards())
+            current_shards = tuple(iter_model_main_param_shards(self._optimizer_root))
         except Exception:
             self._set_status(DistributedOptimizerEventStatus.FINISH_ITERATOR_FAILED)
             return None
@@ -1784,3 +1913,9 @@ class Bf16DistributedOptimizerDiagnosticAdapter:
     @staticmethod
     def _validate_unique_local_ownership(shards: tuple[ModelMainParamShard, ...]) -> None:
         Bf16DistributedOptimizerDiagnosticAdapter._capture_layout(shards)
+        owners_by_pair: dict[tuple[object, ...], int] = {}
+        for shard in shards:
+            pair = Bf16DistributedOptimizerDiagnosticAdapter._paired_view_key(shard)
+            owners_by_pair[pair] = owners_by_pair.get(pair, 0) + int(shard.logical_owner)
+        if any(owner_count > 1 for owner_count in owners_by_pair.values()):
+            raise ValueError("one physical optimizer view has multiple logical owners")

@@ -14,9 +14,10 @@ import torch
 import torch.distributed as dist
 
 import megatron.training.diagnostics.distributed_optimizer as adapter_module
+from megatron.core import parallel_state
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer, Range
-from megatron.core.optimizer.optimizer import ChainedOptimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params
 from megatron.training.diagnostics.accumulator import (
     PackedSlots,
     PackedSufficientStatistics,
@@ -29,6 +30,7 @@ from megatron.training.diagnostics.distributed_optimizer import (
     DistributedOptimizerDiagnosticUnsupportedError,
     DistributedOptimizerEventStatus,
     SnapshotMemoryReason,
+    diagnostic_optimizer_max_tier,
 )
 from megatron.training.diagnostics.normalization import CanonicalDgradNormalizer
 from megatron.training.diagnostics.registry import (
@@ -132,6 +134,32 @@ def _fake_optimizer(
     optimizer.buffers = [
         SimpleNamespace(buckets=[SimpleNamespace(param_data=bucket_data)])
     ]
+    return optimizer, parameters
+
+
+def _fake_replicated_optimizer(
+    *, parameter_sizes: tuple[int, ...] = (5, 6), tp_rank: int = 0
+) -> tuple[Float16OptimizerWithFloat16Params, tuple[torch.nn.Parameter, ...]]:
+    optimizer = Float16OptimizerWithFloat16Params.__new__(
+        Float16OptimizerWithFloat16Params
+    )
+    optimizer.config = _config()
+    optimizer.is_stub_optimizer = False
+    optimizer.grad_scaler = None
+    optimizer.tp_group = _TensorParallelGroup(tp_rank)
+    parameters = tuple(
+        torch.nn.Parameter(
+            torch.arange(1, size + 1, dtype=torch.float32).to(torch.bfloat16)
+        )
+        for size in parameter_sizes
+    )
+    main_parameters = tuple(
+        torch.nn.Parameter(parameter.detach().float().clone()) for parameter in parameters
+    )
+    optimizer.float16_groups = [list(parameters)]
+    optimizer.fp32_from_float16_groups = [list(main_parameters)]
+    optimizer.fp32_from_fp32_groups = []
+    optimizer.optimizer = SimpleNamespace()
     return optimizer, parameters
 
 
@@ -678,16 +706,67 @@ def test_real_dp_partition_filters_stage_wide_bindings_to_local_owner_shards() -
     )
 
 
-def test_one_child_chain_is_accepted_and_multiple_children_fail_closed() -> None:
+def test_distributed_one_child_chain_remains_supported() -> None:
     optimizer, parameters = _fake_optimizer()
     chain = ChainedOptimizer([optimizer])
     adapter, _ = _adapter(chain, parameters)
     assert adapter.optimizer is optimizer
 
-    multi = ChainedOptimizer([optimizer, optimizer])
-    report = Bf16DistributedOptimizerDiagnosticAdapter.negotiate_capabilities(multi)
+
+def test_replicated_multi_child_chain_captures_every_hybrid_update() -> None:
+    matrix_optimizer, matrix_parameters = _fake_replicated_optimizer(
+        parameter_sizes=(5,)
+    )
+    fallback_optimizer, fallback_parameters = _fake_replicated_optimizer(
+        parameter_sizes=(6,)
+    )
+    parameters = (*matrix_parameters, *fallback_parameters)
+    chain = ChainedOptimizer([matrix_optimizer, fallback_optimizer])
+    adapter, registry = _adapter(chain, parameters)
+
+    assert diagnostic_optimizer_max_tier(chain) == 1
+    assert adapter.local_status.item() == DistributedOptimizerEventStatus.OK
+    assert {shard.model_param for shard in adapter.iter_owner_shards()} == set(parameters)
+    accumulator = registry.new_accumulator("cpu")
+    assert adapter.begin_event() is not None
+    with torch.no_grad():
+        for child in chain.chained_optimizers:
+            for model_group, main_group in zip(
+                child.float16_groups, child.fp32_from_float16_groups
+            ):
+                for model_parameter, main_parameter in zip(model_group, main_group):
+                    main_parameter.add_(0.5)
+                    model_parameter.copy_(main_parameter)
+    assert adapter.finish_event(accumulator, update_successful=True) is not None
+    accumulator.finalize_local_()
+    assert all(
+        accumulator.relative_rms(adapter.metric_name_by_parameter[parameter]).valid
+        for parameter in parameters
+    )
+
+
+def test_replicated_chain_assigns_update_ownership_to_one_data_parallel_rank() -> None:
+    optimizer, _ = _fake_replicated_optimizer(parameter_sizes=(5,))
+    chain = ChainedOptimizer([optimizer])
+
+    with mock.patch.object(parallel_state, "get_data_parallel_rank", return_value=0):
+        owner_shards = tuple(adapter_module.iter_model_main_param_shards(chain))
+    with mock.patch.object(parallel_state, "get_data_parallel_rank", return_value=1):
+        replica_shards = tuple(adapter_module.iter_model_main_param_shards(chain))
+
+    assert owner_shards and all(shard.logical_owner for shard in owner_shards)
+    assert replica_shards and not any(shard.logical_owner for shard in replica_shards)
+
+
+def test_multi_child_distributed_chain_keeps_the_existing_fail_closed_boundary() -> None:
+    first_optimizer, _ = _fake_optimizer(parameter_sizes=(5,))
+    second_optimizer, _ = _fake_optimizer(parameter_sizes=(6,))
+    chain = ChainedOptimizer([first_optimizer, second_optimizer])
+    report = Bf16DistributedOptimizerDiagnosticAdapter.negotiate_capabilities(chain)
+
     assert not report.supported
     assert report.reasons == (DistributedOptimizerDiagnosticReason.CHAIN_ARITY,)
+    assert diagnostic_optimizer_max_tier(chain) == 0
 
 
 @pytest.mark.parametrize(

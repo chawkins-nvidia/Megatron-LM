@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Literal
 
+import numpy as np
 import torch
 import torch.distributed as dist
-import numpy as np
 from torch import nn
 
 from megatron.core import parallel_state
@@ -65,6 +65,8 @@ from .capture import (
 from .distributed_optimizer import (
     Bf16DistributedOptimizerDiagnosticAdapter,
     SnapshotMemoryPreflight,
+    _unwrap_bf16_optimizers,
+    iter_model_main_param_shards,
     snapshot_memory_estimate,
 )
 from .launch_artifact import publish_final_launch_config_from_runtime
@@ -307,6 +309,18 @@ def _distributed_optimizer(optimizer: object) -> DistributedOptimizer | None:
     return child if isinstance(child, DistributedOptimizer) else None
 
 
+def _diagnostic_optimizer_children(optimizer: object) -> tuple[object, ...]:
+    """Return optimizer children admitted by the update adapter."""
+
+    distributed_optimizer = _distributed_optimizer(optimizer)
+    if distributed_optimizer is not None:
+        return (distributed_optimizer,)
+    if not isinstance(optimizer, ChainedOptimizer):
+        return ()
+    children, reasons = _unwrap_bf16_optimizers(optimizer)
+    return () if reasons else children
+
+
 def _register_canonical_gpt_mask_producer(
     forward_step_func: Callable[..., Any],
     *,
@@ -401,20 +415,16 @@ def _local_capability_reasons(
         reasons.append("bf16")
     if not getattr(args, "calculate_per_token_loss", False):
         reasons.append("per_token_loss")
-    distributed_optimizer = _distributed_optimizer(optimizer)
-    if distributed_optimizer is None:
+    optimizer_children = _diagnostic_optimizer_children(optimizer)
+    if not optimizer_children:
         reasons.append("single_distributed_optimizer_chain")
     else:
-        grad_scaler = distributed_optimizer.grad_scaler
-        if isinstance(grad_scaler, DynamicGradScaler) or (
-            grad_scaler is not None and not isinstance(grad_scaler, ConstantGradScaler)
-        ):
-            reasons.append("dynamic_loss_scaling")
-        inner_optimizer = distributed_optimizer.optimizer
-        if not isinstance(inner_optimizer, (torch.optim.Adam, torch.optim.AdamW)) and (
-            type(inner_optimizer).__name__ != "FusedAdam"
-        ):
-            reasons.append("adam_optimizer")
+        for child in optimizer_children:
+            grad_scaler = child.grad_scaler
+            if isinstance(grad_scaler, DynamicGradScaler) or (
+                grad_scaler is not None and not isinstance(grad_scaler, ConstantGradScaler)
+            ):
+                reasons.append("dynamic_loss_scaling")
     if getattr(args, "overlap_param_gather", False):
         reasons.append("param_gather_overlap")
     if getattr(args, "use_megatron_fsdp", False) or getattr(
@@ -503,7 +513,6 @@ def negotiate_tier0_capability(
         num_microbatches=num_microbatches,
     )
     known = (
-        "adam_optimizer",
         "bf16",
         "capability_bounds",
         "canonical_mask_producer",
@@ -935,12 +944,12 @@ class Tier0Heartbeat:
             rejection_reasons.append("invalid_max_extra_bytes")
         if not self.capability.supported:
             rejection_reasons.append("capability=" + ",".join(self.capability.reasons))
-        distributed_optimizer = _distributed_optimizer(self.optimizer)
-        if self.capability.supported and distributed_optimizer is not None:
+        optimizer_children = _diagnostic_optimizer_children(self.optimizer)
+        if self.capability.supported and optimizer_children:
             try:
                 owner_elements = sum(
                     shard.main_shard.numel()
-                    for shard in distributed_optimizer.iter_model_main_param_shards()
+                    for shard in iter_model_main_param_shards(self.optimizer)
                 )
             except Exception as error:
                 calculation_failed = True
@@ -1290,8 +1299,10 @@ class Tier0Heartbeat:
     def _construct_capture_session(self) -> Tier0CaptureSession:
         """Construct dormant hooks against startup-preallocated event state."""
 
+        optimizer_children = _diagnostic_optimizer_children(self.optimizer)
+        grad_scaler = optimizer_children[0].grad_scaler if optimizer_children else None
         normalizer = CanonicalDgradNormalizer.from_grad_scaler(
-            getattr(_distributed_optimizer(self.optimizer), "grad_scaler", None)
+            grad_scaler
         )
         local_sequence_length = int(self.args.seq_length) // max(
             1, parallel_state.get_context_parallel_world_size()

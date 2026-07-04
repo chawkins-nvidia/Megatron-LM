@@ -21,6 +21,7 @@ import torch.distributed as dist
 from torch import nn
 
 from megatron.core.diagnostics import get_diagnostic_microbatch_id
+from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params
 from megatron.core.pipeline_parallel.schedules import forward_step
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config.training_config import LoggerConfig
@@ -232,6 +233,56 @@ def test_qk_layernorm_is_supported_by_capability(
         object(),
         canonical,
     )
+    assert reasons == ()
+
+
+def test_capability_accepts_replicated_bf16_multi_child_optimizer_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def canonical(_iterator, _model, *, diagnostic_heartbeat=None):
+        return diagnostic_heartbeat
+
+    monkeypatch.setattr(tier0_module, "GPTModel", nn.Linear)
+    monkeypatch.setattr(
+        tier0_module,
+        "_canonical_mask_producer",
+        (
+            canonical,
+            tier0_module._MASK_PRODUCER_IDENTITY,
+            tier0_module._NONINTERLEAVED_SCHEDULE_ADAPTER,
+        ),
+    )
+
+    def child(parameter: nn.Parameter) -> Float16OptimizerWithFloat16Params:
+        optimizer = Float16OptimizerWithFloat16Params.__new__(
+            Float16OptimizerWithFloat16Params
+        )
+        optimizer.config = SimpleNamespace(
+            bf16=True,
+            fp16=False,
+            fp8_recipe=None,
+            use_precision_aware_optimizer=False,
+            use_layer_wise_distributed_optimizer=False,
+            optimizer_cpu_offload=False,
+            overlap_param_gather=False,
+            overlap_param_gather_with_optimizer_step=False,
+        )
+        optimizer.is_stub_optimizer = False
+        optimizer.grad_scaler = None
+        optimizer.float16_groups = [[parameter]]
+        optimizer.fp32_from_float16_groups = [
+            [nn.Parameter(parameter.detach().float().clone())]
+        ]
+        optimizer.fp32_from_fp32_groups = []
+        return optimizer
+
+    matrix = nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    fallback = nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
+    chain = ChainedOptimizer([child(matrix), child(fallback)])
+    reasons = tier0_module._local_capability_reasons(
+        _capability_args(), [nn.Linear(1, 1)], chain, canonical
+    )
+
     assert reasons == ()
 
 

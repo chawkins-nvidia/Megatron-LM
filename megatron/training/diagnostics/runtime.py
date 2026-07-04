@@ -3,9 +3,11 @@
 """Tier-1/2 runtime bound to the successful-update diagnostic heartbeat.
 
 The first production slice is intentionally narrow and fail closed: dense local
-MCore GPT, CP=1, PP<=2, BF16 distributed Adam, and arbitrary TP/DP. Tier 0
-remains available outside that surface. The replay and secant payloads use
-rank-independent global registries and one shared packed reduction sequence.
+MCore GPT, CP=1, PP<=2, BF16 optimizers with FP32 main parameters, and arbitrary
+TP/DP. Tier 0 remains available outside that surface. Replicated optimizers are
+limited to Tier 1; Tier 2 retains its distributed-owner requirement. The replay
+and secant payloads use rank-independent global registries and one shared packed
+reduction sequence.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from .diagnostic_replay import (
 from .distributed_optimizer import (
     Bf16DistributedOptimizerDiagnosticAdapter,
     DistributedOptimizerEventStatus,
+    diagnostic_optimizer_max_tier,
 )
 from .function_response import (
     RESPONSE_FAMILIES,
@@ -124,6 +127,7 @@ class TieredDiagnosticRuntime:
         self.forward_backward_func = forward_backward_func
         self.reduction_binding = reduction_binding
         self.tier = diagnostics_requested_tier(args)
+        self.tier = min(self.tier, diagnostic_optimizer_max_tier(optimizer))
         self.layerwise_scalars = is_layerwise_scalar_pattern(
             getattr(args, "diagnostic_layer_pattern", None)
         )
