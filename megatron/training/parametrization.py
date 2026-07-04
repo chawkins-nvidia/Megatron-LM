@@ -132,9 +132,10 @@ def _as_plain_config(value: Any) -> Any:
 def _mult_block(rule: dict, old_key: str, new_key: str) -> Dict[str, float]:
     """Read a multiplier block, accepting old internal names and new explicit names.
 
-    Candidate files historically used ``init_std`` and ``lr`` for multiplier
-    blocks. Hydra-facing configs should use ``init_std_mult`` and ``lr_mult`` so
-    the value is visibly a multiplier, not a resolved LR/init value.
+    Candidate files historically used ``init_std``, ``lr``, ``eps``, and ``wd``
+    for multiplier blocks. Hydra-facing configs should use the explicit
+    ``*_mult`` names so the values cannot be mistaken for resolved optimizer or
+    initialization values.
     """
     old_value = rule.get(old_key)
     new_value = rule.get(new_key)
@@ -189,8 +190,8 @@ class ParametrizationConfig:
                 depth_end=(r.get("depth") or {}).get("end"),
                 init_std=_mult_block(r, "init_std", "init_std_mult"),
                 lr=_mult_block(r, "lr", "lr_mult"),
-                eps=dict(r.get("eps", {}) or {}),
-                wd=dict(r.get("wd", {}) or {}),
+                eps=_mult_block(r, "eps", "eps_mult"),
+                wd=_mult_block(r, "wd", "wd_mult"),
             )
             for r in (d.get("rules", []) or [])
         )

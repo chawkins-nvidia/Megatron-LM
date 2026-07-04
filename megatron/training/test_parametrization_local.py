@@ -186,10 +186,14 @@ def test_explicit_multiplier_aliases_and_inline_loader():
     hidden = next(r for r in cfg["rules"] if r["name"] == "hidden")
     hidden["init_std_mult"] = hidden.pop("init_std")
     hidden["lr_mult"] = hidden.pop("lr")
+    hidden["eps_mult"] = hidden.pop("eps")
+    hidden["wd_mult"] = hidden.pop("wd")
     par = P.load_parametrization_block(types.SimpleNamespace(**cfg))
     hid = next(r for r in par.cfg.rules if r.name == "hidden")
     ov = par._override_for_rule(hid, 3e-3, 3e-5, 1e-15)
     assert approx(ov["max_lr"], 3e-3 * 0.5), ov
+    assert approx(ov["eps"], 1e-15 * 0.5), ov
+    assert approx(ov["wd_mult"], 2.0), ov
     assert approx(par.init_std_mult("hidden"), 2.0 ** -0.5)
 
 
