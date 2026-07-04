@@ -1,7 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import random
+import struct
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from emerging_optimizers.shampoo import Shampoo
@@ -19,6 +23,78 @@ from megatron.core.optimizer.optimizer import (
     FP32Optimizer,
     MegatronOptimizer,
 )
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+
+def _frame_state_bytes(tag: bytes, payload: bytes) -> bytes:
+    """Length-prefix one canonical state component."""
+
+    return tag + len(payload).to_bytes(8, byteorder="big") + payload
+
+
+def _canonical_state_bytes(value) -> bytes:
+    """Encode checkpoint state without losing dtype or floating-point bit patterns."""
+
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu().contiguous()
+        raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        metadata = _canonical_state_bytes(
+            (str(tensor.dtype), str(tensor.layout), tuple(tensor.shape))
+        )
+        return _frame_state_bytes(b"T", metadata + raw)
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        metadata = _canonical_state_bytes((array.dtype.str, tuple(array.shape)))
+        return _frame_state_bytes(b"A", metadata + array.tobytes(order="C"))
+    if isinstance(value, np.generic):
+        return _frame_state_bytes(b"G", _canonical_state_bytes(value.dtype.str) + value.tobytes())
+    if value is None:
+        return _frame_state_bytes(b"N", b"")
+    if isinstance(value, bool):
+        return _frame_state_bytes(b"B", b"1" if value else b"0")
+    if isinstance(value, int):
+        return _frame_state_bytes(b"I", str(value).encode("ascii"))
+    if isinstance(value, float):
+        return _frame_state_bytes(b"F", struct.pack(">d", value))
+    if isinstance(value, str):
+        return _frame_state_bytes(b"S", value.encode("utf-8"))
+    if isinstance(value, bytes):
+        return _frame_state_bytes(b"Y", value)
+    if isinstance(value, tuple):
+        return _frame_state_bytes(b"U", b"".join(_canonical_state_bytes(item) for item in value))
+    if isinstance(value, list):
+        return _frame_state_bytes(b"L", b"".join(_canonical_state_bytes(item) for item in value))
+    if isinstance(value, dict):
+        items = [
+            (_canonical_state_bytes(key), _canonical_state_bytes(item))
+            for key, item in value.items()
+        ]
+        items.sort(key=lambda pair: pair[0])
+        return _frame_state_bytes(
+            b"D",
+            b"".join(
+                _frame_state_bytes(b"K", key) + _frame_state_bytes(b"V", item)
+                for key, item in items
+            ),
+        )
+    raise TypeError(f"unsupported state value for bitwise comparison: {type(value).__name__}")
+
+
+def _assert_tensor_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Compare logical tensor bytes, distinguishing signed zero and NaN payloads."""
+
+    assert actual.dtype == expected.dtype
+    assert actual.layout == expected.layout
+    assert tuple(actual.shape) == tuple(expected.shape)
+    actual_bytes = actual.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    expected_bytes = expected.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    assert torch.equal(actual_bytes, expected_bytes)
+
+
+def _assert_state_bitwise_equal(actual, expected) -> None:
+    """Compare nested checkpoint state through a type-preserving byte encoding."""
+
+    assert _canonical_state_bytes(actual) == _canonical_state_bytes(expected)
 
 
 def _param_group(param: torch.nn.Parameter) -> dict:
@@ -198,13 +274,81 @@ def test_raw_torch_state_dict_round_trip_preserves_next_update(
     first_optimizer.step()
     second_optimizer.step()
 
-    torch.testing.assert_close(second_param, first_param, rtol=0.0, atol=0.0)
-    for key, first_value in first_optimizer.state[first_param].items():
-        second_value = second_optimizer.state[second_param][key]
-        if torch.is_tensor(first_value):
-            torch.testing.assert_close(second_value, first_value, rtol=0.0, atol=0.0)
-        else:
-            assert second_value == first_value
+    _assert_tensor_bitwise_equal(second_param, first_param)
+    _assert_state_bitwise_equal(second_optimizer.state_dict(), first_optimizer.state_dict())
+
+
+def test_bitwise_state_comparison_covers_scheduler_rng_and_scalar_encodings() -> None:
+    """The exactness helper covers checkpoint-adjacent state omitted by the optimizer adapter."""
+
+    def new_scheduler():
+        optimizer = SimpleNamespace(
+            param_groups=[
+                {
+                    "params": [],
+                    "default_config": True,
+                    "max_lr": 1.0e-3,
+                    "min_lr": 1.0e-5,
+                    "wd_mult": 1.0,
+                }
+            ]
+        )
+        scheduler = OptimizerParamScheduler(
+            optimizer=optimizer,
+            init_lr=0.0,
+            max_lr=1.0e-3,
+            min_lr=1.0e-5,
+            lr_warmup_steps=4,
+            lr_decay_steps=40,
+            lr_decay_style="cosine",
+            start_wd=0.01,
+            end_wd=0.01,
+            wd_incr_steps=40,
+            wd_incr_style="constant",
+        )
+        return optimizer, scheduler
+
+    source_optimizer, source_scheduler = new_scheduler()
+    source_scheduler.step(7)
+    destination_optimizer, destination_scheduler = new_scheduler()
+    destination_scheduler.load_state_dict(copy.deepcopy(source_scheduler.state_dict()))
+
+    _assert_state_bitwise_equal(destination_scheduler.state_dict(), source_scheduler.state_dict())
+    _assert_state_bitwise_equal(destination_optimizer.param_groups, source_optimizer.param_groups)
+
+    original_rng = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    try:
+        random.seed(1234)
+        np.random.seed(1234)
+        torch.manual_seed(1234)
+        source_rng = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+
+        random.random()
+        np.random.random()
+        torch.rand(1)
+        random.setstate(source_rng["python"])
+        np.random.set_state(source_rng["numpy"])
+        torch.set_rng_state(source_rng["torch"])
+        restored_rng = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+        _assert_state_bitwise_equal(restored_rng, source_rng)
+    finally:
+        random.setstate(original_rng["python"])
+        np.random.set_state(original_rng["numpy"])
+        torch.set_rng_state(original_rng["torch"])
+
+    assert _canonical_state_bytes(0.0) != _canonical_state_bytes(-0.0)
 
 
 def test_fingerprint_rejects_optimizer_layout_change() -> None:
@@ -262,12 +406,7 @@ def test_chained_fallback_adam_preserves_duplicate_param_groups_on_load() -> Non
         2.4e-3,
         6.1e-3,
     ]
-    source_state = source_fallback.optimizer.state_dict()["state"]
-    destination_state = destination_fallback.optimizer.state_dict()["state"]
-    assert source_state.keys() == destination_state.keys()
-    for param_id, param_state in source_state.items():
-        for state_key, value in param_state.items():
-            torch.testing.assert_close(destination_state[param_id][state_key], value)
+    _assert_state_bitwise_equal(destination.state_dict(), source.state_dict())
 
 
 @pytest.mark.parametrize("optimizer_name", ("soap", "shampoo"))
@@ -313,15 +452,9 @@ def test_one_rank_torch_dist_round_trip(
         )
         second_wrapper.load_state_dict(load(load_template, checkpoint_dir))
 
-        first_loaded_state = first_wrapper.optimizer.state_dict()["state"][0]
-        second_loaded_state = second_wrapper.optimizer.state_dict()["state"][0]
-        assert first_loaded_state.keys() == second_loaded_state.keys()
-        for state_key, first_value in first_loaded_state.items():
-            second_value = second_loaded_state[state_key]
-            if torch.is_tensor(first_value):
-                torch.testing.assert_close(second_value, first_value, rtol=0.0, atol=0.0)
-            else:
-                assert second_value == first_value
+        _assert_state_bitwise_equal(
+            second_wrapper.optimizer.state_dict(), first_wrapper.optimizer.state_dict()
+        )
     finally:
         parallel_state.destroy_model_parallel()
         torch.distributed.destroy_process_group()

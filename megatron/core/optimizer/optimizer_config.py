@@ -327,6 +327,15 @@ class OptimizerConfig:
     shampoo_start_preconditioning_step: int = 1
     """First one-based step at which Adam-grafted Shampoo uses its preconditioner."""
 
+    shampoo_rank_deficient_stability: str = "perturbation"
+    """How standalone Shampoo handles null factor directions: perturbation or pseudoinverse."""
+
+    shampoo_rank_atol: float = 0.0
+    """Absolute eigenvalue cutoff used by standalone Shampoo pseudoinverse mode."""
+
+    shampoo_rank_rtol: Optional[float] = 0.0
+    """Relative pseudoinverse cutoff; None uses a factor-dimension-scaled dtype epsilon."""
+
     adaptive_muon_moment2_method: str = "adamuon"
     """The method to use for the moment2 update in Adaptive Muon optimizer."""
 

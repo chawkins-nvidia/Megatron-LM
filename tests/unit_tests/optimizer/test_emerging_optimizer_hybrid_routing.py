@@ -47,6 +47,27 @@ class CompiledRoleModel(nn.Module):
         self.norm = nn.Parameter(torch.ones(4))
 
 
+class RankLocalRoleModel(nn.Module):
+    """Model whose only parameter routes differently on each test rank."""
+
+    def __init__(self, rank: int) -> None:
+        super().__init__()
+        shape = (4, 4) if rank == 0 else (4,)
+        self.local = nn.Parameter(torch.ones(shape))
+
+
+@pytest.fixture
+def single_rank_param_group_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the production synchronization path in single-process unit tests."""
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+
+    def all_gather_object(output: list, local: object) -> None:
+        output[0] = local
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+
+
 def _groups_by_parameter(param_groups: list[dict]) -> dict[nn.Parameter, dict]:
     result = {}
     for group in param_groups:
@@ -56,12 +77,58 @@ def _groups_by_parameter(param_groups: list[dict]) -> dict[nn.Parameter, dict]:
     return result
 
 
+def _distributed_param_group_sync_worker(
+    rank: int, world_size: int, rendezvous_path: str, selected_optimizer: str
+) -> None:
+    """Prove WORLD synchronization retains rank-local empty optimizer groups."""
+
+    torch.distributed.init_process_group(
+        backend="gloo", init_method=f"file://{rendezvous_path}", rank=rank, world_size=world_size
+    )
+    try:
+        groups = _get_param_groups(
+            [RankLocalRoleModel(rank)],
+            OptimizerConfig(optimizer=selected_optimizer, lr=0.1, min_lr=0.01),
+            {},
+            hybrid_optimizer=selected_optimizer,
+        )
+        schema = [
+            {key: value for key, value in group.items() if key != "params"} for group in groups
+        ]
+        local_counts = [len(group["params"]) for group in groups]
+
+        gathered_schemas = [None] * world_size
+        gathered_counts = [None] * world_size
+        torch.distributed.all_gather_object(gathered_schemas, schema)
+        torch.distributed.all_gather_object(gathered_counts, local_counts)
+
+        assert gathered_schemas == [schema] * world_size
+        assert [group["optimizer"] for group in schema] == ["adam", selected_optimizer]
+        assert gathered_counts == [[0, 1], [1, 0]]
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("selected_optimizer", ["soap", "shampoo"])
+def test_hybrid_group_schemas_are_synchronized_with_empty_local_groups(
+    tmp_path, selected_optimizer: str
+) -> None:
+    """Every rank creates the same ordered hybrid buckets even when one is empty."""
+
+    rendezvous_path = tmp_path / f"{selected_optimizer}_param_group_sync"
+    torch.multiprocessing.spawn(
+        _distributed_param_group_sync_worker,
+        args=(2, str(rendezvous_path), selected_optimizer),
+        nprocs=2,
+        join=True,
+    )
+
+
 @pytest.mark.parametrize("selected_optimizer", ["muon", "soap", "shampoo"])
 def test_hybrid_group_routing_is_exhaustive_and_preserves_completep_overrides(
-    monkeypatch: pytest.MonkeyPatch, selected_optimizer: str
+    monkeypatch: pytest.MonkeyPatch, single_rank_param_group_sync: None, selected_optimizer: str
 ) -> None:
     """Matrix roles and numerical CompleteP overrides compose without losing fallback safety."""
-    monkeypatch.setenv("MEGATRON_SKIP_OPTIMIZER_PARAM_GROUP_SYNC", "1")
     monkeypatch.setenv("MEGATRON_LOG_OPTIMIZER_PARAM_GROUPS", "0")
     model = HybridRoleModel()
     config = OptimizerConfig(optimizer=selected_optimizer, lr=0.1, min_lr=0.01)
@@ -103,10 +170,9 @@ def test_hybrid_group_routing_is_exhaustive_and_preserves_completep_overrides(
 
 @pytest.mark.parametrize("selected_optimizer", ["muon", "soap", "shampoo"])
 def test_parametrization_compiles_closed_world_optimizer_roles(
-    monkeypatch: pytest.MonkeyPatch, selected_optimizer: str
+    monkeypatch: pytest.MonkeyPatch, single_rank_param_group_sync: None, selected_optimizer: str
 ) -> None:
     """A 2-D router stays on Adam because the trusted rule role is compiled explicitly."""
-    monkeypatch.setenv("MEGATRON_SKIP_OPTIMIZER_PARAM_GROUP_SYNC", "1")
     monkeypatch.setenv("MEGATRON_LOG_OPTIMIZER_PARAM_GROUPS", "0")
     model = CompiledRoleModel()
     parametrization = Parametrization(
@@ -159,10 +225,9 @@ def test_parametrization_compiles_closed_world_optimizer_roles(
 
 
 def test_hybrid_supported_matrix_optimizer_conflicts_remain_strict(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, single_rank_param_group_sync: None
 ) -> None:
     """Two contradictory explicit roles on a supported matrix are rejected."""
-    monkeypatch.setenv("MEGATRON_SKIP_OPTIMIZER_PARAM_GROUP_SYNC", "1")
     monkeypatch.setenv("MEGATRON_LOG_OPTIMIZER_PARAM_GROUPS", "0")
     model = HybridRoleModel()
     overrides = {
@@ -179,10 +244,9 @@ def test_hybrid_supported_matrix_optimizer_conflicts_remain_strict(
 
 
 def test_hybrid_unsupported_shape_rejects_contradictory_compiled_role(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, single_rank_param_group_sync: None
 ) -> None:
     """An explicit matrix role on a fallback-only parameter is a startup error."""
-    monkeypatch.setenv("MEGATRON_SKIP_OPTIMIZER_PARAM_GROUP_SYNC", "1")
     monkeypatch.setenv("MEGATRON_LOG_OPTIMIZER_PARAM_GROUPS", "0")
     model = HybridRoleModel()
 
@@ -196,10 +260,9 @@ def test_hybrid_unsupported_shape_rejects_contradictory_compiled_role(
 
 
 def test_hybrid_compiled_role_must_agree_with_package_fallback(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, single_rank_param_group_sync: None
 ) -> None:
     """Package fallback declarations cannot silently replace a trusted compiled role."""
-    monkeypatch.setenv("MEGATRON_SKIP_OPTIMIZER_PARAM_GROUP_SYNC", "1")
     monkeypatch.setenv("MEGATRON_LOG_OPTIMIZER_PARAM_GROUPS", "0")
     model = HybridRoleModel()
 
@@ -254,6 +317,9 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
             graft_beta2=0.999,
             graft_eps=1e-8,
             start_preconditioning_step=1,
+            rank_deficient_stability="perturbation",
+            rank_atol=0.0,
+            rank_rtol=0.0,
         ) -> None:
             self.params = params
             self.kwargs = {
@@ -267,6 +333,9 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
                 "graft_beta2": graft_beta2,
                 "graft_eps": graft_eps,
                 "start_preconditioning_step": start_preconditioning_step,
+                "rank_deficient_stability": rank_deficient_stability,
+                "rank_atol": rank_atol,
+                "rank_rtol": rank_rtol,
             }
 
     registry = Mock()
@@ -285,6 +354,9 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
         shampoo_graft_beta2=0.96,
         shampoo_graft_eps=4e-9,
         shampoo_start_preconditioning_step=11,
+        shampoo_rank_deficient_stability="pseudoinverse",
+        shampoo_rank_atol=5e-12,
+        shampoo_rank_rtol=None,
     )
 
     kwargs = emerging._shampoo_config_to_kwargs(config, model_chunks=[], pg_collection=None)
@@ -301,6 +373,9 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
         "graft_beta2": pytest.approx(0.96),
         "graft_eps": pytest.approx(4e-9),
         "start_preconditioning_step": 11,
+        "rank_deficient_stability": "pseudoinverse",
+        "rank_atol": pytest.approx(5e-12),
+        "rank_rtol": None,
     }
 
     registry.reset_mock()
@@ -329,6 +404,9 @@ def test_standalone_shampoo_constructor_uses_prefixed_config_and_global_adam_val
         "graft_beta2": pytest.approx(0.96),
         "graft_eps": pytest.approx(4e-9),
         "start_preconditioning_step": 11,
+        "rank_deficient_stability": "pseudoinverse",
+        "rank_atol": pytest.approx(5e-12),
+        "rank_rtol": None,
     }
     assert init_state_fn is emerging._eopt_init_state_fn
 

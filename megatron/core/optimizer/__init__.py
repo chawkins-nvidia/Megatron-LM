@@ -457,16 +457,15 @@ def _get_param_groups(
             param_names_map[key].append(name)
 
     params_key = list(params_map.keys())
-    if os.environ.get('MEGATRON_SKIP_OPTIMIZER_PARAM_GROUP_SYNC') != '1':
-        # Distributed checkpoint requires all ranks to have the same param groups,
-        # so we need to align the param groups across ranks, otherwise we may have
-        # runtime error when loading the checkpoint or numerical error when resuming training.
-        gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
-        torch.distributed.all_gather_object(gathered_params_key, params_key)
-        for keys in gathered_params_key:
-            for key in keys:
-                if key not in params_key:
-                    params_key.append(key)
+    # Distributed checkpoint requires all ranks to have the same param groups,
+    # so we need to align the param groups across ranks, otherwise we may have
+    # runtime error when loading the checkpoint or numerical error when resuming training.
+    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_params_key, params_key)
+    for keys in gathered_params_key:
+        for key in keys:
+            if key not in params_key:
+                params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
     # Sort keys, None first.
