@@ -188,21 +188,21 @@ class LocalAuxStateCheckpointAdapter:
         """Convert one non-parameter-shaped state value for ``torch_dist``."""
         model_data = model_param.data
         if torch.is_tensor(value) and torch.is_tensor(model_data):
-            if tuple(value.shape) == tuple(model_data.shape):
-                return None
-            if not self._is_aux_tensor_key(state_key):
+            if self._is_aux_tensor_key(state_key):
+                _local_aux_checkpoint_topology()
+                return ShardedTensor.from_rank_offsets(
+                    f"optimizer.state.{self.optimizer_identity}.{state_key}.param_{param_id}."
+                    f"{model_param.key}",
+                    value,
+                    replica_id=model_param.replica_id,
+                )
+            if tuple(value.shape) != tuple(model_data.shape):
                 raise RuntimeError(
                     f"unsupported {self.optimizer_identity} state tensor {state_key!r} for "
                     f"param {param_id}: state shape {tuple(value.shape)} differs from model "
                     f"shape {tuple(model_data.shape)}"
                 )
-            _local_aux_checkpoint_topology()
-            return ShardedTensor.from_rank_offsets(
-                f"optimizer.state.{self.optimizer_identity}.{state_key}.param_{param_id}."
-                f"{model_param.key}",
-                value,
-                replica_id=model_param.replica_id,
-            )
+            return None
         if self.optimizer_identity == "shampoo" and state_key == "block_ranges":
             return LocalNonpersistentObject(value)
         raise RuntimeError(

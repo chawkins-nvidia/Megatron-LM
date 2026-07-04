@@ -14,6 +14,7 @@ from megatron.core.dist_checkpointing.strategies import filesystem_async
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer import emerging_optimizers as emerging
 from megatron.core.optimizer.optimizer import (
+    ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
@@ -52,17 +53,17 @@ def _raw_optimizer(
 
 
 def _wrapper(
-    wrapper_kind: str, optimizer_name: str
+    wrapper_kind: str, optimizer_name: str, shape: tuple[int, ...] = (2, 3)
 ) -> tuple[MegatronOptimizer, torch.nn.Parameter]:
     config = OptimizerConfig()
     if wrapper_kind == "fp32":
-        model_param = torch.nn.Parameter(torch.ones(2, 3, dtype=torch.float32))
+        model_param = torch.nn.Parameter(torch.ones(shape, dtype=torch.float32))
         optimizer, _ = _raw_optimizer(optimizer_name, model_param)
         wrapper = object.__new__(FP32Optimizer)
         MegatronOptimizer.__init__(wrapper, optimizer, config, lambda *_: None)
         wrapper.is_stub_optimizer = False
     elif wrapper_kind == "bf16":
-        model_param = torch.nn.Parameter(torch.ones(2, 3, dtype=torch.bfloat16))
+        model_param = torch.nn.Parameter(torch.ones(shape, dtype=torch.bfloat16))
         main_param = torch.nn.Parameter(model_param.detach().float())
         optimizer, _ = _raw_optimizer(optimizer_name, main_param)
         wrapper = object.__new__(Float16OptimizerWithFloat16Params)
@@ -76,12 +77,56 @@ def _wrapper(
     return wrapper, model_param
 
 
+def _fallback_adam_wrapper() -> Float16OptimizerWithFloat16Params:
+    config = OptimizerConfig()
+    model_groups = []
+    main_groups = []
+    optimizer_groups = []
+    group_specs = ((1, 1.0, 4.4e-3), (1, 1.0 / 3.0, 1.7e-3), (8, 0.0, 2.4e-3), (9, 0.0, 6.1e-3))
+    for size, wd_mult, max_lr in group_specs:
+        model_group = [torch.nn.Parameter(torch.ones(3, dtype=torch.bfloat16)) for _ in range(size)]
+        main_group = [torch.nn.Parameter(param.detach().float()) for param in model_group]
+        optimizer_groups.append(
+            {
+                "params": main_group,
+                "wd_mult": wd_mult,
+                "lr_mult": 1.0,
+                "is_expert_parallel": False,
+                "is_decoupled_lr": False,
+                "max_lr": max_lr,
+                "min_lr": max_lr / 100.0,
+                "optimizer": "adam",
+            }
+        )
+        model_groups.append(model_group)
+        main_groups.append(main_group)
+
+    optimizer = torch.optim.AdamW(optimizer_groups, lr=1.0e-3)
+
+    def init_state_fn(opt, config=None):
+        for group in opt.param_groups:
+            for param in group["params"]:
+                opt.state[param]["step"] = torch.tensor(0.0)
+                opt.state[param]["exp_avg"] = torch.zeros_like(param)
+                opt.state[param]["exp_avg_sq"] = torch.zeros_like(param)
+
+    init_state_fn(optimizer)
+    wrapper = object.__new__(Float16OptimizerWithFloat16Params)
+    MegatronOptimizer.__init__(wrapper, optimizer, config, init_state_fn)
+    wrapper.grad_scaler = None
+    wrapper.float16_groups = model_groups
+    wrapper.fp32_from_float16_groups = main_groups
+    wrapper.fp32_from_fp32_groups = []
+    return wrapper
+
+
 @pytest.mark.parametrize("optimizer_name", ("soap", "shampoo"))
 @pytest.mark.parametrize("wrapper_kind", ("fp32", "bf16"))
+@pytest.mark.parametrize("shape", ((2, 3), (2, 2)))
 def test_auxiliary_state_uses_independent_tensors_in_both_wrapper_paths(
-    optimizer_name: str, wrapper_kind: str
+    optimizer_name: str, wrapper_kind: str, shape: tuple[int, ...]
 ) -> None:
-    wrapper, model_param = _wrapper(wrapper_kind, optimizer_name)
+    wrapper, model_param = _wrapper(wrapper_kind, optimizer_name, shape)
     model_shard = ShardedTensor.from_rank_offsets("model.weight", model_param)
 
     state_dict = wrapper.sharded_state_dict({"weight": model_shard})
@@ -192,6 +237,37 @@ def test_fingerprint_ignores_scheduler_owned_live_values() -> None:
     fresh_optimizer, fresh_adapter = _raw_optimizer("soap", fresh_param)
 
     fresh_adapter.validate_fingerprint(loaded, fresh_optimizer, fresh_optimizer.state_dict())
+
+
+def test_chained_fallback_adam_preserves_duplicate_param_groups_on_load() -> None:
+    source_fallback = _fallback_adam_wrapper()
+    source_soap, _ = _wrapper("bf16", "soap")
+    source = ChainedOptimizer([source_fallback, source_soap])
+
+    destination_fallback = _fallback_adam_wrapper()
+    destination_soap, _ = _wrapper("bf16", "soap")
+    destination = ChainedOptimizer([destination_fallback, destination_soap])
+
+    destination.load_state_dict(copy.deepcopy(source.state_dict()))
+
+    assert [len(group["params"]) for group in destination_fallback.optimizer.param_groups] == [
+        1,
+        1,
+        8,
+        9,
+    ]
+    assert [group["max_lr"] for group in destination_fallback.optimizer.param_groups] == [
+        4.4e-3,
+        1.7e-3,
+        2.4e-3,
+        6.1e-3,
+    ]
+    source_state = source_fallback.optimizer.state_dict()["state"]
+    destination_state = destination_fallback.optimizer.state_dict()["state"]
+    assert source_state.keys() == destination_state.keys()
+    for param_id, param_state in source_state.items():
+        for state_key, value in param_state.items():
+            torch.testing.assert_close(destination_state[param_id][state_key], value)
 
 
 @pytest.mark.parametrize("optimizer_name", ("soap", "shampoo"))

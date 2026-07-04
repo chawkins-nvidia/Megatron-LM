@@ -473,18 +473,19 @@ class MegatronOptimizer(ABC):
         # Keep state_dict param group order since groups are LocalNonpersistentObject
         # and their order is determined at runtime, not from the checkpoint.
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
-        loaded_groups_map = {
-            tuple(
+        loaded_groups_map = {}
+        for group in state_dict_groups:
+            key = tuple(
                 # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
                 group[key] if key in group else group[f"pre_{key}"]
                 for key in param_group_identifier_keys
-            ): group
-            for group in state_dict_groups
-        }
+            )
+            loaded_groups_map.setdefault(key, []).append(group)
 
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
-            if key not in loaded_groups_map:
+            matching_groups = loaded_groups_map.get(key)
+            if not matching_groups:
                 available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
                 raise ValueError(
                     f"Could not find parameter group with key {key} in loaded checkpoint.\n"
@@ -493,7 +494,9 @@ class MegatronOptimizer(ABC):
                 )
 
             # Update group's parameters to preserve state dict ordering
-            group = loaded_groups_map[key]
+            # while retaining the multiplicity and relative order of groups that share
+            # the legacy identifier tuple but differ in schedule fields such as max_lr.
+            group = matching_groups.pop(0)
             group['params'] = params
             final_groups.append(group)
 
