@@ -77,10 +77,13 @@ def test_streaming_finite_summary_bounds_noncontiguous_copy():
 def test_streaming_finite_summary_std_is_stable_for_large_offset():
     tensor = torch.tensor([10_000_000.0, 10_000_001.0, 10_000_002.0])
 
-    actual = activation_logging._streaming_finite_summary(tensor, "std", chunk_numel=1)
     expected = tensor.double().std(correction=0).float()
 
-    assert torch.isclose(actual, expected)
+    for chunk_numel in (1, 2, 3):
+        actual = activation_logging._streaming_finite_summary(
+            tensor, "std", chunk_numel=chunk_numel
+        )
+        assert torch.isclose(actual, expected)
 
 
 @pytest.fixture()

@@ -260,11 +260,16 @@ def _streaming_finite_summary(
             chunk_count = values.numel()
             if chunk_count == 0:
                 continue
-            chunk_variance, chunk_mean = torch.var_mean(values, correction=0)
+            # Preserve the chunk mean in fp64 before composing chunk moments;
+            # a rounded fp32 mean makes std depend on chunk boundaries for
+            # large-offset activations.
+            chunk_variance, chunk_mean = torch.var_mean(
+                values.to(dtype=torch.float64), correction=0
+            )
             old_count = count.to(dtype=torch.float64)
             added_count = torch.tensor(chunk_count, dtype=torch.float64, device=device)
             new_count = old_count + added_count
-            delta = chunk_mean.to(dtype=torch.float64) - mean
+            delta = chunk_mean - mean
             m2 += (
                 chunk_variance.to(dtype=torch.float64) * added_count
                 + delta.square() * old_count * added_count / new_count
