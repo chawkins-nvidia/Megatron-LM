@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import builtins
 import contextlib
 import math
 import os
@@ -63,9 +62,6 @@ from megatron.training.diagnostics.diagnostic_replay import (
     _ModelGraphFacts,
     _ReplayPlanFacts,
     _systematic_positions,
-    _te_flash_attention_type,
-    _te_fused_attention_type,
-    _te_unfused_dot_product_attention_type,
     _validate_dense_gpt_models,
     broadcast_replay_plan,
     build_distributed_source_plan,
@@ -1172,15 +1168,7 @@ class _FakeTEDotProductAttention(torch.nn.Module):
     pass
 
 
-class _FakeTEFlashAttention(torch.nn.Module):
-    pass
-
-
-class _FakeTEFusedAttention(torch.nn.Module):
-    pass
-
-
-class _FakeTEUnfusedDotProductAttention(torch.nn.Module):
+class _FakeTEHelper(torch.nn.Module):
     pass
 
 
@@ -1194,27 +1182,14 @@ def _enable_local_flash_attention(model: GPTModel, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         gpt_layer_specs, "TEDotProductAttention", _FakeTEDotProductAttention
     )
-    monkeypatch.setattr(
-        "megatron.training.diagnostics.diagnostic_replay._te_flash_attention_type",
-        lambda: _FakeTEFlashAttention,
-    )
-    monkeypatch.setattr(
-        "megatron.training.diagnostics.diagnostic_replay._te_fused_attention_type",
-        lambda: _FakeTEFusedAttention,
-    )
-    monkeypatch.setattr(
-        "megatron.training.diagnostics.diagnostic_replay._te_unfused_dot_product_attention_type",
-        lambda: _FakeTEUnfusedDotProductAttention,
-    )
     model.config.use_flash_attn = True
     model.config.attention_backend = AttnBackend.flash
     model.transformer_layer_spec = get_gpt_layer_local_spec(
         use_flash_attn=True, attention_backend=AttnBackend.flash
     )
     core_attention = _FakeTEDotProductAttention()
-    core_attention.flash_attention = _FakeTEFlashAttention()
-    core_attention.fused_attention = _FakeTEFusedAttention()
-    core_attention.unfused_attention = _FakeTEUnfusedDotProductAttention()
+    core_attention.helper = _FakeTEHelper()
+    core_attention.helper.nested_helper = _FakeTEHelper()
     model.decoder_layer.self_attention.core_attention = core_attention
 
 
@@ -1227,49 +1202,26 @@ def test_dense_gpt_validator_accepts_local_flash_attention(
     _validate_dense_gpt_models((model,))
 
 
-def test_te_flash_attention_type_fails_closed_when_te_is_unavailable(
+def test_dense_gpt_validator_rejects_same_helper_outside_local_flash_subtree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_import = builtins.__import__
-
-    def reject_te_backends(name, *args, **kwargs):
-        if name == "transformer_engine.pytorch.attention.dot_product_attention.backends":
-            raise ImportError("test unavailable TE backend")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", reject_te_backends)
-    assert _te_flash_attention_type() is None
-    assert _te_fused_attention_type() is None
-    assert _te_unfused_dot_product_attention_type() is None
-
-
-def test_dense_gpt_validator_rejects_te_flash_child_without_local_flash_gate() -> None:
     _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
-    model.decoder_layer.self_attention.core_attention.flash_attention = (
-        _FakeTEFlashAttention()
-    )
+    _enable_local_flash_attention(model, monkeypatch)
+    model.helper_outside_core_attention = _FakeTEHelper()
 
-    with pytest.raises(TypeError, match="_FakeTEFlashAttention"):
+    with pytest.raises(TypeError, match="_FakeTEHelper"):
         _validate_dense_gpt_models((model,))
 
 
-def test_dense_gpt_validator_rejects_te_fused_child_without_local_flash_gate() -> None:
+def test_dense_gpt_validator_rejects_local_flash_subtree_without_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
-    model.decoder_layer.self_attention.core_attention.fused_attention = (
-        _FakeTEFusedAttention()
-    )
+    _enable_local_flash_attention(model, monkeypatch)
+    del model.transformer_layer_spec
+    model.config.use_flash_attn = False
 
-    with pytest.raises(TypeError, match="_FakeTEFusedAttention"):
-        _validate_dense_gpt_models((model,))
-
-
-def test_dense_gpt_validator_rejects_te_unfused_child_without_local_flash_gate() -> None:
-    _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
-    model.decoder_layer.self_attention.core_attention.unfused_attention = (
-        _FakeTEUnfusedDotProductAttention()
-    )
-
-    with pytest.raises(TypeError, match="_FakeTEUnfusedDotProductAttention"):
+    with pytest.raises(TypeError, match="requires exact local"):
         _validate_dense_gpt_models((model,))
 
 

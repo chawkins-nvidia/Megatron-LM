@@ -3281,42 +3281,6 @@ class TransactionState(StrEnum):
     CLOSED = "closed"
 
 
-def _te_flash_attention_type() -> type | None:
-    """Resolve TE's internal FlashAttention module without widening validator prefixes."""
-
-    try:
-        from transformer_engine.pytorch.attention.dot_product_attention.backends import (
-            FlashAttention,
-        )
-    except (AttributeError, ImportError):
-        return None
-    return FlashAttention if isinstance(FlashAttention, type) else None
-
-
-def _te_fused_attention_type() -> type | None:
-    """Resolve TE's internal FusedAttention module without widening validator prefixes."""
-
-    try:
-        from transformer_engine.pytorch.attention.dot_product_attention.backends import (
-            FusedAttention,
-        )
-    except (AttributeError, ImportError):
-        return None
-    return FusedAttention if isinstance(FusedAttention, type) else None
-
-
-def _te_unfused_dot_product_attention_type() -> type | None:
-    """Resolve TE's unfused DPA module without widening validator prefixes."""
-
-    try:
-        from transformer_engine.pytorch.attention.dot_product_attention.backends import (
-            UnfusedDotProductAttention,
-        )
-    except (AttributeError, ImportError):
-        return None
-    return UnfusedDotProductAttention if isinstance(UnfusedDotProductAttention, type) else None
-
-
 def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
     """Admit only the explicitly inspected dense local-MCore GPT surface."""
 
@@ -3413,23 +3377,6 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
             and isinstance(TEDotProductAttention, type)
         )
         allowed_spec_builders = (TEDotProductAttention,) if local_flash_attention else ()
-        te_flash_attention = _te_flash_attention_type() if local_flash_attention else None
-        te_fused_attention = _te_fused_attention_type() if local_flash_attention else None
-        te_unfused_attention = (
-            _te_unfused_dot_product_attention_type() if local_flash_attention else None
-        )
-        allowed_te_attention_children = tuple(
-            backend_type
-            for backend_type in (
-                te_flash_attention,
-                te_fused_attention,
-                te_unfused_attention,
-            )
-            if backend_type is not None
-        )
-        model_allowed_child_types = (
-            allowed_child_types + allowed_spec_builders + allowed_te_attention_children
-        )
         # Selective MCore checkpoints only rerun during backward; replay is forward-only.
         unsupported = {
             "transformer_engine": config.transformer_impl != "local",
@@ -3451,9 +3398,23 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
             raise ValueError("Tier-1 replay requires the dense GPT model type")
         if hasattr(model, "transformer_layer_spec"):
             validate_spec_value(model.transformer_layer_spec)
+        allowed_te_attention_module_ids: set[int] = set()
+        if local_flash_attention:
+            for layer in model.modules():
+                if type(layer) is not TransformerLayer:
+                    continue
+                self_attention = getattr(layer, "self_attention", None)
+                if type(self_attention) is not SelfAttention:
+                    continue
+                core_attention = getattr(self_attention, "core_attention", None)
+                if type(core_attention) is TEDotProductAttention:
+                    allowed_te_attention_module_ids.update(
+                        id(descendant) for descendant in core_attention.modules()
+                    )
         for module in model.modules():
             if (
-                type(module) not in model_allowed_child_types
+                id(module) not in allowed_te_attention_module_ids
+                and type(module) not in allowed_child_types
                 and not type(module).__module__.startswith(allowed_prefixes)
             ):
                 raise TypeError(
