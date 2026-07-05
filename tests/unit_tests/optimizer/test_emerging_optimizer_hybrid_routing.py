@@ -56,6 +56,15 @@ class RankLocalRoleModel(nn.Module):
         self.local = nn.Parameter(torch.ones(shape))
 
 
+class RankLocalExpertModel(nn.Module):
+    """Model whose identical parameter is dense on one rank and expert on the other."""
+
+    def __init__(self, rank: int) -> None:
+        super().__init__()
+        self.local = nn.Parameter(torch.ones(4, 4))
+        self.local.allreduce = rank == 0
+
+
 @pytest.fixture
 def single_rank_param_group_sync(monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise the production synchronization path in single-process unit tests."""
@@ -109,7 +118,7 @@ def _distributed_param_group_sync_worker(
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("selected_optimizer", ["soap", "shampoo"])
+@pytest.mark.parametrize("selected_optimizer", ["muon", "soap", "shampoo"])
 def test_hybrid_group_schemas_are_synchronized_with_empty_local_groups(
     tmp_path, selected_optimizer: str
 ) -> None:
@@ -119,6 +128,51 @@ def test_hybrid_group_schemas_are_synchronized_with_empty_local_groups(
     torch.multiprocessing.spawn(
         _distributed_param_group_sync_worker,
         args=(2, str(rendezvous_path), selected_optimizer),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _distributed_expert_group_order_worker(
+    rank: int, world_size: int, rendezvous_path: str
+) -> None:
+    """Prove identical overrides are ordered globally across dense and expert groups."""
+
+    torch.distributed.init_process_group(
+        backend="gloo", init_method=f"file://{rendezvous_path}", rank=rank, world_size=world_size
+    )
+    try:
+        groups = _get_param_groups(
+            [RankLocalExpertModel(rank)],
+            OptimizerConfig(optimizer="soap", lr=0.1, min_lr=0.01),
+            {},
+            hybrid_optimizer="soap",
+        )
+        schema = [
+            {key: value for key, value in group.items() if key != "params"} for group in groups
+        ]
+        local_counts = [len(group["params"]) for group in groups]
+
+        gathered_schemas = [None] * world_size
+        gathered_counts = [None] * world_size
+        torch.distributed.all_gather_object(gathered_schemas, schema)
+        torch.distributed.all_gather_object(gathered_counts, local_counts)
+
+        assert gathered_schemas == [schema] * world_size
+        assert [group["optimizer"] for group in schema] == ["soap", "soap"]
+        assert [group["is_expert_parallel"] for group in schema] == [False, True]
+        assert gathered_counts == [[1, 0], [0, 1]]
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_identical_override_groups_have_global_dense_expert_order(tmp_path) -> None:
+    """Dense/expert keys with identical overrides have a deterministic total order."""
+
+    rendezvous_path = tmp_path / "dense_expert_param_group_order"
+    torch.multiprocessing.spawn(
+        _distributed_expert_group_order_worker,
+        args=(2, str(rendezvous_path)),
         nprocs=2,
         join=True,
     )
