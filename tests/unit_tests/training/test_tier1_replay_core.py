@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import logging
 import math
 import os
 import random
@@ -18,6 +19,7 @@ from megatron.core.models.gpt import gpt_layer_specs
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.tensor_parallel.random import CudaRNGStatesTracker
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
@@ -672,6 +674,32 @@ def test_mutable_bytearray_cache_is_rejected_even_with_zero_snapshot_cap() -> No
         ).prepare()
 
     assert model.custom_cache == bytearray(b"abc")
+
+
+def test_logger_and_cuda_rng_tracker_are_identity_guarded() -> None:
+    model = torch.nn.Identity()
+    logger = logging.getLogger("tier1-replay-test")
+    tracker = CudaRNGStatesTracker()
+    tracker.set_states({"model-parallel-rng": torch.tensor([1, 2, 3], dtype=torch.uint8)})
+    tracker._current_state_name = "model-parallel-rng"
+    model.logger = logger
+    model.rng_states_tracker = tracker
+    guard = ReplayStateGuard((model,), tracker_getter=lambda: tracker)
+
+    guard.prepare()
+    with guard:
+        model.logger = logging.Logger("replacement")
+        model.rng_states_tracker = CudaRNGStatesTracker()
+        tracker.set_states(
+            {"model-parallel-rng": torch.tensor([9, 9, 9], dtype=torch.uint8)}
+        )
+
+    assert model.logger is logger
+    assert model.rng_states_tracker is tracker
+    torch.testing.assert_close(
+        tracker.get_states()["model-parallel-rng"],
+        torch.tensor([1, 2, 3], dtype=torch.uint8),
+    )
 
 
 def test_transformer_block_nullcontext_state_is_restored() -> None:

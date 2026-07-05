@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import functools
 import hashlib
+import logging
 import math
 import os
 import random
@@ -29,6 +30,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.tensor_parallel.random import CudaRNGStatesTracker
 from megatron.training.datasets.data_samplers import SamplerIssuedIndex
 
 from .accumulator import PackedSlots, PackedSufficientStatistics
@@ -1565,6 +1567,13 @@ def _is_snapshot_leaf(value: Any) -> bool:
     return (
         _is_snapshot_key(value)
         or isinstance(value, (Enum, torch.dtype, torch.device))
+        # Loggers are process services, not replay-owned mutable state. Keep
+        # their identity stable without traversing logging's global graph.
+        or isinstance(value, logging.Logger)
+        # ReplayRngState separately validates, captures, restores, and verifies
+        # the exact Megatron tracker contents. Model attributes only need to
+        # retain the identity of that process-scoped tracker object.
+        or type(value) is CudaRNGStatesTracker
         or callable(value)
     )
 
