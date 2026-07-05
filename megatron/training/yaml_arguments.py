@@ -7,16 +7,15 @@ import dataclasses
 import json
 import os
 import re
-import torch
 import types
-import yaml
-
 from itertools import chain, starmap
 from types import SimpleNamespace
 
+import torch
 import torch.nn.functional as F
+import yaml
 
-from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, init_method_normal, is_torch_min_version
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
@@ -406,6 +405,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
         "qk_clip",
         "qk_clip_alpha",
         "qk_clip_threshold",
+        "use_flash_attn",
     ):
         if not hasattr(args, name) and hasattr(root_args, name):
             setattr(args, name, getattr(root_args, name))

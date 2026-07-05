@@ -12,7 +12,7 @@ from megatron.core.models.backends import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -44,10 +44,14 @@ from megatron.core.typed_torch import copy_signature, not_none
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
+    from megatron.core.extensions.transformer_engine import (
+        TEDotProductAttention,
+        TEFusedMLP,
+        TENorm,
+    )
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 else:
-    TEFusedMLP, TENorm, TESpecProvider = None, None, None
+    TEDotProductAttention, TEFusedMLP, TENorm, TESpecProvider = None, None, None, None
 
 try:
     from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
@@ -361,6 +365,8 @@ def get_gpt_layer_local_submodules(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    use_flash_attn: bool = False,
+    attention_backend: Union[AttnBackend, str] = AttnBackend.auto,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -372,6 +378,10 @@ def get_gpt_layer_local_submodules(
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_flash_attn (bool, optional): Replace only local core attention with Transformer
+            Engine dot-product attention. Defaults to False.
+        attention_backend (AttnBackend or str, optional): Backend requested from Transformer
+            Engine. Flash and auto are compatible with ``use_flash_attn``.
 
     Returns:
         TransformerLayerSubmodules: Megatron-Core modules to construct a TransformerLayer
@@ -386,6 +396,25 @@ def get_gpt_layer_local_submodules(
         )
     else:
         backend = LocalSpecProvider()
+
+    core_attention = backend.core_attention()
+    if use_flash_attn:
+        if not HAVE_TE or TEDotProductAttention is None:
+            raise ImportError(
+                "--use-flash-attn with a local GPT spec requires Transformer Engine."
+            )
+        backend_name = (
+            attention_backend.name
+            if isinstance(attention_backend, AttnBackend)
+            else attention_backend
+        )
+        if backend_name not in {"flash", "auto"}:
+            raise ValueError(
+                "--use-flash-attn with a local GPT spec requires "
+                "--attention-backend flash or auto; "
+                f"got {backend_name!r}."
+            )
+        core_attention = TEDotProductAttention
     # Adjust for RMS norm.
     if normalization == "RMSNorm":
         layer_norm = backend.layer_norm(rms_norm=True, for_qk=False, has_residual=True)
@@ -417,7 +446,7 @@ def get_gpt_layer_local_submodules(
                     linear_q_up_proj=backend.column_parallel_linear(),
                     linear_kv_down_proj=backend.column_parallel_linear(),
                     linear_kv_up_proj=backend.column_parallel_linear(),
-                    core_attention=backend.core_attention(),
+                    core_attention=core_attention,
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     kv_layernorm=qk_norm if qk_layernorm else IdentityOp,
@@ -436,7 +465,7 @@ def get_gpt_layer_local_submodules(
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_linear(),
-                    core_attention=backend.core_attention(),
+                    core_attention=core_attention,
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=(
                         L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
@@ -610,6 +639,8 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_flash_attn=config.use_flash_attn,
+            attention_backend=config.attention_backend,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -621,6 +652,8 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_flash_attn=config.use_flash_attn,
+            attention_backend=config.attention_backend,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

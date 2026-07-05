@@ -141,6 +141,9 @@ class TransformerConfig(ModelParallelConfig):
     If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
 
+    use_flash_attn: bool = False
+    """Use Transformer Engine dot-product attention in an otherwise-local GPT layer spec."""
+
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
