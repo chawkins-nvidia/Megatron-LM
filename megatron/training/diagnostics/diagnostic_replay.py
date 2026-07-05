@@ -3285,10 +3285,12 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
     """Admit only the explicitly inspected dense local-MCore GPT surface."""
 
     from megatron.core.enums import ModelType
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.dot_product_attention import DotProductAttention
+    from megatron.core.transformer.enums import AttnBackend
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.spec_utils import ModuleSpec
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -3310,6 +3312,8 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
         "megatron.core.fusions.",
         "torch.nn.modules.",
     )
+
+    allowed_spec_builders: tuple[type, ...] = ()
 
     def validate_spec_value(value: Any) -> None:
         if value is None or type(value) in (bool, int, float, str, bytes):
@@ -3340,6 +3344,8 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
             validate_spec_value(value.keywords or {})
             return
         if isinstance(value, type) or callable(value):
+            if isinstance(value, type) and value in allowed_spec_builders:
+                return
             module_name = getattr(value, "__module__", "")
             if not module_name.startswith(allowed_prefixes):
                 builder_name = getattr(value, "__qualname__", type(value).__qualname__)
@@ -3361,6 +3367,17 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
         config = getattr(model, "config", None)
         if type(config) is not TransformerConfig:
             raise TypeError("Tier-1 replay requires an exact TransformerConfig")
+        attention_backend = config.attention_backend
+        if isinstance(attention_backend, AttnBackend):
+            attention_backend = attention_backend.name
+        local_flash_attention = (
+            config.transformer_impl == "local"
+            and config.use_flash_attn
+            and attention_backend in {"flash", "auto"}
+            and isinstance(TEDotProductAttention, type)
+        )
+        allowed_spec_builders = (TEDotProductAttention,) if local_flash_attention else ()
+        model_allowed_child_types = allowed_child_types + allowed_spec_builders
         # Selective MCore checkpoints only rerun during backward; replay is forward-only.
         unsupported = {
             "transformer_engine": config.transformer_impl != "local",
@@ -3383,8 +3400,9 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
         if hasattr(model, "transformer_layer_spec"):
             validate_spec_value(model.transformer_layer_spec)
         for module in model.modules():
-            if type(module) not in allowed_child_types and not type(module).__module__.startswith(
-                allowed_prefixes
+            if (
+                type(module) not in model_allowed_child_types
+                and not type(module).__module__.startswith(allowed_prefixes)
             ):
                 raise TypeError(
                     "Tier-1 replay rejects unsupported child module "
@@ -3405,8 +3423,14 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
                     or type(module.mlp.linear_fc2) is not RowParallelLinear
                 ):
                     raise TypeError("Tier-1 replay requires exact local row-parallel linears")
-                if type(module.self_attention.core_attention) is not DotProductAttention:
-                    raise TypeError("Tier-1 replay requires exact local dot-product attention")
+                expected_core_attention = (
+                    TEDotProductAttention if local_flash_attention else DotProductAttention
+                )
+                if type(module.self_attention.core_attention) is not expected_core_attention:
+                    raise TypeError(
+                        "Tier-1 replay requires exact local or explicitly enabled "
+                        "local-flash dot-product attention"
+                    )
 
 
 class Tier1ReplayTransaction:

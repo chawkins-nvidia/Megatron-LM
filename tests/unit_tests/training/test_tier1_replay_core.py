@@ -12,22 +12,20 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from megatron.core.enums import ModelType
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.gpt import gpt_layer_specs
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
-from megatron.core.enums import ModelType
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import (
-    TransformerLayer,
-    TransformerLayerSubmodules,
-)
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.training.datasets.data_samplers import (
     MegatronPretrainingRandomSampler,
     MegatronPretrainingSampler,
@@ -60,11 +58,11 @@ from megatron.training.diagnostics.diagnostic_replay import (
     StableSampleDataset,
     Tier1ReplayEngine,
     TokenId,
+    _local_qkv_response_width,
     _ModelGraphFacts,
     _ReplayPlanFacts,
-    _local_qkv_response_width,
-    _validate_dense_gpt_models,
     _systematic_positions,
+    _validate_dense_gpt_models,
     broadcast_replay_plan,
     build_distributed_source_plan,
     build_local_replay_plan,
@@ -1164,6 +1162,66 @@ def _dense_engine_fixture(*, gated: bool = False, scratch_capacity: int = 2):
         ),
     )
     return engine, model, plan, probe, schedule
+
+
+class _FakeTEDotProductAttention(torch.nn.Module):
+    pass
+
+
+def _enable_local_flash_attention(model: GPTModel, monkeypatch: pytest.MonkeyPatch) -> None:
+    from megatron.core.extensions import transformer_engine
+
+    monkeypatch.setattr(
+        transformer_engine, "TEDotProductAttention", _FakeTEDotProductAttention
+    )
+    monkeypatch.setattr(gpt_layer_specs, "HAVE_TE", True)
+    monkeypatch.setattr(
+        gpt_layer_specs, "TEDotProductAttention", _FakeTEDotProductAttention
+    )
+    model.config.use_flash_attn = True
+    model.config.attention_backend = AttnBackend.flash
+    model.transformer_layer_spec = get_gpt_layer_local_spec(
+        use_flash_attn=True, attention_backend=AttnBackend.flash
+    )
+    model.decoder_layer.self_attention.core_attention = _FakeTEDotProductAttention()
+
+
+def test_dense_gpt_validator_accepts_local_flash_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
+    _enable_local_flash_attention(model, monkeypatch)
+
+    _validate_dense_gpt_models((model,))
+
+
+def test_dense_gpt_validator_rejects_full_transformer_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
+    _enable_local_flash_attention(model, monkeypatch)
+    model.config.transformer_impl = "transformer_engine"
+
+    with pytest.raises(ValueError, match="transformer_engine"):
+        _validate_dense_gpt_models((model,))
+
+
+@pytest.mark.parametrize(
+    ("use_flash_attn", "attention_backend"),
+    ((False, AttnBackend.flash), (True, AttnBackend.unfused)),
+)
+def test_dense_gpt_validator_rejects_unconfigured_te_core_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    use_flash_attn: bool,
+    attention_backend: AttnBackend,
+) -> None:
+    _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
+    _enable_local_flash_attention(model, monkeypatch)
+    model.config.use_flash_attn = use_flash_attn
+    model.config.attention_backend = attention_backend
+
+    with pytest.raises(TypeError, match="unsupported builder"):
+        _validate_dense_gpt_models((model,))
 
 
 def _prepare_fixture(engine, plan, probe, schedule, *, maximum_extra_bytes: int = 2**40):
