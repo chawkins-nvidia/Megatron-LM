@@ -64,6 +64,7 @@ from megatron.training.diagnostics.diagnostic_replay import (
     _ReplayPlanFacts,
     _systematic_positions,
     _te_flash_attention_type,
+    _te_fused_attention_type,
     _validate_dense_gpt_models,
     broadcast_replay_plan,
     build_distributed_source_plan,
@@ -1174,6 +1175,10 @@ class _FakeTEFlashAttention(torch.nn.Module):
     pass
 
 
+class _FakeTEFusedAttention(torch.nn.Module):
+    pass
+
+
 def _enable_local_flash_attention(model: GPTModel, monkeypatch: pytest.MonkeyPatch) -> None:
     from megatron.core.extensions import transformer_engine
 
@@ -1188,6 +1193,10 @@ def _enable_local_flash_attention(model: GPTModel, monkeypatch: pytest.MonkeyPat
         "megatron.training.diagnostics.diagnostic_replay._te_flash_attention_type",
         lambda: _FakeTEFlashAttention,
     )
+    monkeypatch.setattr(
+        "megatron.training.diagnostics.diagnostic_replay._te_fused_attention_type",
+        lambda: _FakeTEFusedAttention,
+    )
     model.config.use_flash_attn = True
     model.config.attention_backend = AttnBackend.flash
     model.transformer_layer_spec = get_gpt_layer_local_spec(
@@ -1195,6 +1204,7 @@ def _enable_local_flash_attention(model: GPTModel, monkeypatch: pytest.MonkeyPat
     )
     core_attention = _FakeTEDotProductAttention()
     core_attention.flash_attention = _FakeTEFlashAttention()
+    core_attention.fused_attention = _FakeTEFusedAttention()
     model.decoder_layer.self_attention.core_attention = core_attention
 
 
@@ -1219,6 +1229,7 @@ def test_te_flash_attention_type_fails_closed_when_te_is_unavailable(
 
     monkeypatch.setattr(builtins, "__import__", reject_te_backends)
     assert _te_flash_attention_type() is None
+    assert _te_fused_attention_type() is None
 
 
 def test_dense_gpt_validator_rejects_te_flash_child_without_local_flash_gate() -> None:
@@ -1228,6 +1239,16 @@ def test_dense_gpt_validator_rejects_te_flash_child_without_local_flash_gate() -
     )
 
     with pytest.raises(TypeError, match="_FakeTEFlashAttention"):
+        _validate_dense_gpt_models((model,))
+
+
+def test_dense_gpt_validator_rejects_te_fused_child_without_local_flash_gate() -> None:
+    _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
+    model.decoder_layer.self_attention.core_attention.fused_attention = (
+        _FakeTEFusedAttention()
+    )
+
+    with pytest.raises(TypeError, match="_FakeTEFusedAttention"):
         _validate_dense_gpt_models((model,))
 
 

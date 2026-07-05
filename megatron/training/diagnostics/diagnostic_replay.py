@@ -3293,6 +3293,18 @@ def _te_flash_attention_type() -> type | None:
     return FlashAttention if isinstance(FlashAttention, type) else None
 
 
+def _te_fused_attention_type() -> type | None:
+    """Resolve TE's internal FusedAttention module without widening validator prefixes."""
+
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.backends import (
+            FusedAttention,
+        )
+    except (AttributeError, ImportError):
+        return None
+    return FusedAttention if isinstance(FusedAttention, type) else None
+
+
 def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
     """Admit only the explicitly inspected dense local-MCore GPT surface."""
 
@@ -3390,8 +3402,11 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
         )
         allowed_spec_builders = (TEDotProductAttention,) if local_flash_attention else ()
         te_flash_attention = _te_flash_attention_type() if local_flash_attention else None
-        allowed_te_attention_children = (
-            (te_flash_attention,) if te_flash_attention is not None else ()
+        te_fused_attention = _te_fused_attention_type() if local_flash_attention else None
+        allowed_te_attention_children = tuple(
+            backend_type
+            for backend_type in (te_flash_attention, te_fused_attention)
+            if backend_type is not None
         )
         model_allowed_child_types = (
             allowed_child_types + allowed_spec_builders + allowed_te_attention_children
