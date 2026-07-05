@@ -2852,6 +2852,11 @@ class _FactNormalizer:
             return ("enum", type(value), value.name, self.freeze(value.value, f"{path}.value"))
         if isinstance(value, (torch.dtype, torch.device, torch.layout)):
             return ("torch_value", type(value), str(value))
+        if isinstance(value, logging.Logger) or type(value) is CudaRNGStatesTracker:
+            # These process services are guarded by identity. Logger internals
+            # are outside model execution state; tracker contents are covered
+            # independently by ReplayRngState.
+            return ("process_service", *_identity_facts(value))
         if isinstance(value, torch.Tensor):
             if not self.allow_tensors:
                 raise TypeError(

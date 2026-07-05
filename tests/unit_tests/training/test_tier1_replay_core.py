@@ -1398,6 +1398,22 @@ def test_execution_facts_bind_diagnostic_heartbeat_identity_not_mutable_internal
         _ModelGraphFacts.observe((model,))
 
 
+def test_execution_facts_bind_logger_and_rng_tracker_identity() -> None:
+    model = torch.nn.Identity()
+    logger = logging.getLogger("tier1-execution-facts")
+    tracker = CudaRNGStatesTracker()
+    tracker.set_states({"model-parallel-rng": torch.tensor([1], dtype=torch.uint8)})
+    model.logger = logger
+    model.rng_states_tracker = tracker
+
+    facts = _ModelGraphFacts.observe((model,))
+    tracker.set_states({"model-parallel-rng": torch.tensor([2], dtype=torch.uint8)})
+    assert _ModelGraphFacts.observe((model,)) == facts
+
+    model.logger = logging.Logger("replacement")
+    assert _ModelGraphFacts.observe((model,)) != facts
+
+
 def test_execution_facts_report_every_unsupported_module_tensor_path() -> None:
     _engine, model, _plan, _probe, _schedule = _dense_engine_fixture()
     model.decoder_layer.first_runtime_tensor = torch.ones(1)
