@@ -3281,6 +3281,18 @@ class TransactionState(StrEnum):
     CLOSED = "closed"
 
 
+def _te_flash_attention_type() -> type | None:
+    """Resolve TE's internal FlashAttention module without widening validator prefixes."""
+
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.backends import (
+            FlashAttention,
+        )
+    except (AttributeError, ImportError):
+        return None
+    return FlashAttention if isinstance(FlashAttention, type) else None
+
+
 def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
     """Admit only the explicitly inspected dense local-MCore GPT surface."""
 
@@ -3377,7 +3389,13 @@ def _validate_dense_gpt_models(models: Sequence[torch.nn.Module]) -> None:
             and isinstance(TEDotProductAttention, type)
         )
         allowed_spec_builders = (TEDotProductAttention,) if local_flash_attention else ()
-        model_allowed_child_types = allowed_child_types + allowed_spec_builders
+        te_flash_attention = _te_flash_attention_type() if local_flash_attention else None
+        allowed_te_attention_children = (
+            (te_flash_attention,) if te_flash_attention is not None else ()
+        )
+        model_allowed_child_types = (
+            allowed_child_types + allowed_spec_builders + allowed_te_attention_children
+        )
         # Selective MCore checkpoints only rerun during backward; replay is forward-only.
         unsupported = {
             "transformer_engine": config.transformer_impl != "local",
