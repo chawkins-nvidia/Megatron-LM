@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from megatron.training import activation_logging
 from megatron.training.activation_logging import ActivationLogger
 
 
@@ -24,13 +25,43 @@ class TinyDecoderModel(nn.Module):
     def __init__(self, num_layers: int):
         super().__init__()
         self.decoder = nn.Module()
-        self.decoder.layers = nn.ModuleList([TinyDecoderBlock() for _ in range(num_layers)])
+        self.decoder.layers = nn.ModuleList(
+            [TinyDecoderBlock() for _ in range(num_layers)]
+        )
         self.output_layer = nn.Linear(16, 8)
 
     def forward(self, x):
         for layer in self.decoder.layers:
             x = layer(x)
         return self.output_layer(x)
+
+
+@pytest.mark.parametrize(
+    ("statistic", "expected"),
+    (
+        ("rms", torch.sqrt(torch.tensor(169.0 / 3.0))),
+        ("abs_mean", torch.tensor(19.0 / 3.0)),
+        ("std", torch.tensor([3.0, 4.0, -12.0]).std(unbiased=False)),
+        ("abs_max", torch.tensor(12.0)),
+        ("abs_min", torch.tensor(3.0)),
+    ),
+)
+def test_streaming_finite_summary_matches_reference(statistic, expected):
+    tensor = torch.tensor([3.0, float("nan"), 4.0, float("inf"), -12.0])
+
+    actual = activation_logging._streaming_finite_summary(
+        tensor, statistic, chunk_numel=2
+    )
+
+    assert torch.isclose(actual, expected)
+
+
+def test_streaming_finite_summary_all_nonfinite_is_nan():
+    actual = activation_logging._streaming_finite_summary(
+        torch.tensor([float("nan"), float("inf")]), "rms", chunk_numel=1
+    )
+
+    assert torch.isnan(actual)
 
 
 @pytest.fixture()
@@ -48,7 +79,9 @@ class TestMakeTpeHook:
     """Tests for _make_tpe_hook regex layer extraction."""
 
     def test_extracts_decoder_layer_number(self, logger):
-        hook = logger._make_tpe_hook("chunk0", "decoder.layers.3.mlp.experts.linear_fc1")
+        hook = logger._make_tpe_hook(
+            "chunk0", "decoder.layers.3.mlp.experts.linear_fc1"
+        )
         assert hook is not None
         fake_tpe = [128, 64, 96, 80]
         hook(None, (torch.zeros(1), fake_tpe), {}, torch.zeros(1))
@@ -85,7 +118,9 @@ class TestSaveTpe:
         filepath = tmp_path / "tokens_per_expert" / f"rank{rank}.jsonl"
         assert filepath.exists()
 
-        records = [json.loads(line) for line in filepath.read_text().strip().split("\n")]
+        records = [
+            json.loads(line) for line in filepath.read_text().strip().split("\n")
+        ]
         assert records == [
             {"iter": 100, "block": "decoder", "layer": 3, "tpe": [[10, 20], [30, 40]]},
             {"iter": 100, "block": "decoder", "layer": 7, "tpe": [[50, 60]]},
@@ -101,7 +136,9 @@ class TestSaveTpe:
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         filepath = tmp_path / "tokens_per_expert" / f"rank{rank}.jsonl"
-        records = [json.loads(line) for line in filepath.read_text().strip().split("\n")]
+        records = [
+            json.loads(line) for line in filepath.read_text().strip().split("\n")
+        ]
         assert len(records) == 2
         assert records[0]["iter"] == 100
         assert records[1]["iter"] == 200

@@ -39,8 +39,16 @@ def _discover_te_types():
             TERowParallelLinear,
             TELayerNormColumnParallelLinear,
         )
-        all_types.extend([TELinear, TENorm, TEColumnParallelLinear, TERowParallelLinear,
-                          TELayerNormColumnParallelLinear])
+
+        all_types.extend(
+            [
+                TELinear,
+                TENorm,
+                TEColumnParallelLinear,
+                TERowParallelLinear,
+                TELayerNormColumnParallelLinear,
+            ]
+        )
     except ImportError:
         pass
 
@@ -50,9 +58,13 @@ def _discover_te_types():
             TEColumnParallelGroupedLinear,
             TERowParallelGroupedLinear,
         )
+
         if TEGroupedLinear is not None:
-            grouped = [TEGroupedLinear, TEColumnParallelGroupedLinear,
-                       TERowParallelGroupedLinear]
+            grouped = [
+                TEGroupedLinear,
+                TEColumnParallelGroupedLinear,
+                TERowParallelGroupedLinear,
+            ]
             all_types.extend(grouped)
             grouped_types.extend(grouped)
     except ImportError:
@@ -63,6 +75,7 @@ def _discover_te_types():
 
 _TE_TYPES, _GROUPED_LINEAR_TYPES = _discover_te_types()
 
+
 def _discover_norm_and_layer_types():
     types = [nn.LayerNorm]
     rms_norm = getattr(nn, "RMSNorm", None)
@@ -71,12 +84,14 @@ def _discover_norm_and_layer_types():
 
     try:
         from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
         types.append(FusedLayerNorm)
     except ImportError:
         pass
 
     try:
         from megatron.core.extensions.transformer_engine import TENorm
+
         types.append(TENorm)
     except ImportError:
         pass
@@ -93,12 +108,14 @@ def _discover_norm_and_layer_types():
 
     try:
         from megatron.core.transformer.transformer_layer import TransformerLayer
+
         types.append(TransformerLayer)
     except ImportError:
         pass
 
     try:
         from megatron.core.ssm.mamba_layer import MambaLayer
+
         types.append(MambaLayer)
     except ImportError:
         pass
@@ -171,13 +188,87 @@ def _resolve_stat_fn():
     if fn is None:
         logger.warning(
             "MEGATRON_RESIDUAL_LOG_STAT=%r is not recognized; supported: %s. Falling back to rms.",
-            name, ", ".join(sorted(_STAT_FNS)),
+            name,
+            ", ".join(sorted(_STAT_FNS)),
         )
+        name = "rms"
         fn = _rms
-    return fn
+    return name, fn
 
 
-_STAT_FN = _resolve_stat_fn()
+_STAT_NAME, _STAT_FN = _resolve_stat_fn()
+_SUMMARY_CHUNK_NUMEL = 16 * 1024 * 1024
+
+
+def _streaming_finite_summary(
+    tensor: torch.Tensor,
+    statistic: str,
+    chunk_numel: int = _SUMMARY_CHUNK_NUMEL,
+) -> torch.Tensor:
+    """Compute a finite-only statistic without materializing a full-size copy.
+
+    Activation tensors can contain billions of elements.  Casting the whole
+    tensor to fp32 and boolean-indexing all finite values can require multiple
+    additional GiB at a diagnostic boundary.  Reduce bounded fp32 views into
+    scalar fp64 accumulators instead.
+    """
+    if chunk_numel < 1:
+        raise ValueError("chunk_numel must be positive")
+
+    flat = tensor.detach().reshape(-1)
+    device = flat.device
+    count = torch.zeros((), dtype=torch.int64, device=device)
+    total = torch.zeros((), dtype=torch.float64, device=device)
+    total_abs = torch.zeros((), dtype=torch.float64, device=device)
+    total_sq = torch.zeros((), dtype=torch.float64, device=device)
+    maximum = torch.full((), -torch.inf, dtype=torch.float32, device=device)
+    minimum = torch.full((), torch.inf, dtype=torch.float32, device=device)
+
+    for start in range(0, flat.numel(), chunk_numel):
+        chunk = flat[start : start + chunk_numel].float()
+        finite = torch.isfinite(chunk)
+        count += finite.sum(dtype=torch.int64)
+        safe = torch.where(finite, chunk, 0.0)
+
+        if statistic in {"rms", "std"}:
+            total_sq += (safe * safe).sum(dtype=torch.float64)
+        if statistic == "std":
+            total += safe.sum(dtype=torch.float64)
+        elif statistic == "abs_mean":
+            total_abs += safe.abs().sum(dtype=torch.float64)
+        elif statistic == "abs_max":
+            maximum = torch.maximum(
+                maximum,
+                torch.where(finite, chunk.abs(), -torch.inf).max(),
+            )
+        elif statistic == "abs_min":
+            minimum = torch.minimum(
+                minimum,
+                torch.where(finite, chunk.abs(), torch.inf).min(),
+            )
+
+    count_value = int(count.item())
+    if count_value == 0:
+        return torch.tensor(float("nan"))
+
+    denominator = count.to(dtype=torch.float64)
+    if statistic == "rms":
+        result = torch.sqrt(total_sq / denominator)
+    elif statistic == "abs_mean":
+        result = total_abs / denominator
+    elif statistic == "std":
+        if count_value == 1:
+            result = torch.zeros((), dtype=torch.float64, device=device)
+        else:
+            variance = total_sq / denominator - (total / denominator).square()
+            result = torch.sqrt(variance.clamp_min(0.0))
+    elif statistic == "abs_max":
+        result = maximum
+    elif statistic == "abs_min":
+        result = minimum
+    else:
+        raise ValueError(f"unsupported activation statistic: {statistic}")
+    return result.float().cpu()
 
 
 def _rms_summary(tensor: torch.Tensor) -> torch.Tensor:
@@ -197,14 +288,12 @@ def _rms_summary(tensor: torch.Tensor) -> torch.Tensor:
     statistic is governed by ``MEGATRON_RESIDUAL_LOG_STAT`` (default
     ``rms``).
     """
-    flat = tensor.detach().float().reshape(-1)
-    finite = flat[torch.isfinite(flat)]
-    if finite.numel() == 0:
-        return torch.tensor(float("nan"))
-    return _STAT_FN(finite).cpu()
+    return _streaming_finite_summary(tensor, _STAT_NAME)
 
 
-def _update_streaming_scalar(state: dict, counts: dict, chunk_name: str, key: str, value) -> None:
+def _update_streaming_scalar(
+    state: dict, counts: dict, chunk_name: str, key: str, value
+) -> None:
     """Update a low-memory scalar mean for one diagnostic key.
 
     Hooks fire once per microbatch. Keep only a running scalar average on CPU so
@@ -234,10 +323,12 @@ def _parse_tpe_module_name(module_name: str) -> Tuple[str, int | None, int] | No
         decoder.layers.3.mlp.experts.linear_fc1                       -> ("decoder", None, 3)
         mtp.layers.0.mtp_model_layer.layers.1.mlp.experts.linear_fc1  -> ("mtp", 0, 1)
     """
-    if m := re.fullmatch(r'decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc1', module_name):
+    if m := re.fullmatch(
+        r"decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc1", module_name
+    ):
         return "decoder", None, int(m.group(1))
     if m := re.fullmatch(
-        r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.mlp\.experts\.linear_fc1',
+        r"mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.mlp\.experts\.linear_fc1",
         module_name,
     ):
         return "mtp", int(m.group(1)), int(m.group(2))
@@ -261,13 +352,16 @@ def _register_hooks(model, module_types, hook_factory, *, name_filter=None):
         model_chunk_name = f"model_chunk{model_chunk_id}"
         unwrapped = unwrap_model(model_chunk)
         for module_name, module in unwrapped.named_modules():
-            if isinstance(module, module_types) and (name_filter is None or name_filter(module_name)):
+            if isinstance(module, module_types) and (
+                name_filter is None or name_filter(module_name)
+            ):
                 hook_fn = hook_factory(model_chunk_name, module_name)
                 if hook_fn is None:
                     continue
                 handle = module.register_forward_hook(hook_fn, with_kwargs=True)
                 handles.append(handle)
     return handles
+
 
 class ActivationLogger:
     """Captures and saves forward activations using forward hooks.
@@ -291,14 +385,18 @@ class ActivationLogger:
         # Tokens-per-expert state: per-microbatch token counts.  Decoder entries
         # are keyed by ``layer``; MTP entries by ``(mtp_idx, inner_layer)``.
         self._decoder_tpe_records: dict[int, list[list[int]]] = defaultdict(list)
-        self._mtp_tpe_records: dict[Tuple[int, int], list[list[int]]] = defaultdict(list)
+        self._mtp_tpe_records: dict[Tuple[int, int], list[list[int]]] = defaultdict(
+            list
+        )
         self._tpe_hooks: List[torch.utils.hooks.RemovableHook] = []
 
     # ------------------------------------------------------------------
     # Full activation hooks
     # ------------------------------------------------------------------
 
-    def _make_activation_hook(self, model_chunk_name: str, module_name: str) -> Callable:
+    def _make_activation_hook(
+        self, model_chunk_name: str, module_name: str
+    ) -> Callable:
         """Forward hook that captures all inputs, outputs and kwargs."""
         sd = self._activations_state_dict
         counts = self._activation_counts
@@ -309,16 +407,22 @@ class ActivationLogger:
                 if not isinstance(inp, torch.Tensor):
                     continue
                 key = f"{module_name}/input{idx}"
-                _update_streaming_scalar(sd, counts, model_chunk_name, key, _rms_summary(inp))
+                _update_streaming_scalar(
+                    sd, counts, model_chunk_name, key, _rms_summary(inp)
+                )
             output_tuple = output if isinstance(output, tuple) else (output,)
             for idx, output_value in enumerate(output_tuple):
                 for suffix, out in _iter_tensors(output_value, f"output{idx}"):
                     key = f"{module_name}/{suffix}"
-                    _update_streaming_scalar(sd, counts, model_chunk_name, key, _rms_summary(out))
+                    _update_streaming_scalar(
+                        sd, counts, model_chunk_name, key, _rms_summary(out)
+                    )
             for kwarg_key, kwarg_value in kwargs.items():
                 for suffix, tensor in _iter_tensors(kwarg_value, kwarg_key):
                     key = f"{module_name}/{suffix}"
-                    _update_streaming_scalar(sd, counts, model_chunk_name, key, _rms_summary(tensor))
+                    _update_streaming_scalar(
+                        sd, counts, model_chunk_name, key, _rms_summary(tensor)
+                    )
 
         return hook
 
@@ -340,8 +444,12 @@ class ActivationLogger:
     def save_activations(self, iteration: int):
         if not self._activations_state_dict:
             return
-        save_grads(self._save_dir, self._activations_state_dict, iteration, "activations")
-        self._maybe_log_wandb(self._activations_state_dict, iteration, "act")  # CHAWKINS-WANDB-PER-TENSOR
+        save_grads(
+            self._save_dir, self._activations_state_dict, iteration, "activations"
+        )
+        self._maybe_log_wandb(
+            self._activations_state_dict, iteration, "act"
+        )  # CHAWKINS-WANDB-PER-TENSOR
         self._activations_state_dict.clear()
         self._activation_counts.clear()
 
@@ -382,7 +490,9 @@ class ActivationLogger:
     # Tokens-per-expert hooks
     # ------------------------------------------------------------------
 
-    def _make_tpe_hook(self, _model_chunk_name: str, module_name: str) -> Callable | None:
+    def _make_tpe_hook(
+        self, _model_chunk_name: str, module_name: str
+    ) -> Callable | None:
         """Forward hook that captures only the non-Tensor ``input1`` (tokens_per_expert).
 
         Attaches to main decoder MoE layers
@@ -394,7 +504,8 @@ class ActivationLogger:
         if parsed is None:
             logger.warning(
                 "Cannot extract layer number from module name: %r — "
-                "skipping tokens-per-expert hook for this module", module_name
+                "skipping tokens-per-expert hook for this module",
+                module_name,
             )
             return None
         block, mtp_idx, layer = parsed
@@ -415,7 +526,9 @@ class ActivationLogger:
     def register_tpe_hooks(self, model):
         assert not self._tpe_hooks
         self._tpe_hooks = _register_hooks(
-            model, _GROUPED_LINEAR_TYPES, self._make_tpe_hook,
+            model,
+            _GROUPED_LINEAR_TYPES,
+            self._make_tpe_hook,
             name_filter=lambda name: name.endswith("linear_fc1"),
         )
 
@@ -443,20 +556,36 @@ class ActivationLogger:
 
         lines = []
         for layer, microbatches in sorted(self._decoder_tpe_records.items()):
-            lines.append(json.dumps({
-                "iter": iteration, "block": "decoder",
-                "layer": layer, "tpe": microbatches,
-            }) + "\n")
+            lines.append(
+                json.dumps(
+                    {
+                        "iter": iteration,
+                        "block": "decoder",
+                        "layer": layer,
+                        "tpe": microbatches,
+                    }
+                )
+                + "\n"
+            )
         for (mtp_idx, layer), microbatches in sorted(self._mtp_tpe_records.items()):
-            lines.append(json.dumps({
-                "iter": iteration, "block": "mtp",
-                "mtp_idx": mtp_idx, "layer": layer, "tpe": microbatches,
-            }) + "\n")
+            lines.append(
+                json.dumps(
+                    {
+                        "iter": iteration,
+                        "block": "mtp",
+                        "mtp_idx": mtp_idx,
+                        "layer": layer,
+                        "tpe": microbatches,
+                    }
+                )
+                + "\n"
+            )
 
         with open(filepath, "a") as f:
             f.writelines(lines)
         self._decoder_tpe_records.clear()
         self._mtp_tpe_records.clear()
+
 
 _LOGGER: ActivationLogger | None = None
 
@@ -475,6 +604,7 @@ def _require_logger() -> ActivationLogger:
 
 # -- Full activation logging -------------------------------------------
 
+
 def enable_activation_logging(model: torch.nn.Module, save_dir: str, args=None):
     _get_logger(save_dir).register_activation_hooks(model, args)
 
@@ -488,6 +618,7 @@ def save_activations(iteration: int):
 
 
 # -- Tokens-per-expert logging ----------------------------------------
+
 
 def enable_tokens_per_expert_logging(model: torch.nn.Module, save_dir: str):
     _get_logger(save_dir).register_tpe_hooks(model)
