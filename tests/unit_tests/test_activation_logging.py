@@ -64,6 +64,25 @@ def test_streaming_finite_summary_all_nonfinite_is_nan():
     assert torch.isnan(actual)
 
 
+def test_streaming_finite_summary_bounds_noncontiguous_copy():
+    tensor = torch.arange(24.0).reshape(4, 6).transpose(0, 1)
+    assert not tensor.is_contiguous()
+
+    actual = activation_logging._streaming_finite_summary(tensor, "rms", chunk_numel=3)
+    expected = tensor.square().mean().sqrt()
+
+    assert torch.isclose(actual, expected)
+
+
+def test_streaming_finite_summary_std_is_stable_for_large_offset():
+    tensor = torch.tensor([10_000_000.0, 10_000_001.0, 10_000_002.0])
+
+    actual = activation_logging._streaming_finite_summary(tensor, "std", chunk_numel=1)
+    expected = tensor.double().std(correction=0).float()
+
+    assert torch.isclose(actual, expected)
+
+
 @pytest.fixture()
 def logger(tmp_path):
     return ActivationLogger(save_dir=str(tmp_path))

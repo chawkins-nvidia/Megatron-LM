@@ -200,6 +200,32 @@ _STAT_NAME, _STAT_FN = _resolve_stat_fn()
 _SUMMARY_CHUNK_NUMEL = 16 * 1024 * 1024
 
 
+def _bounded_flat_chunks(tensor: torch.Tensor, chunk_numel: int):
+    """Yield flat views or copies whose size never exceeds ``chunk_numel``."""
+    detached = tensor.detach()
+    if detached.is_contiguous():
+        flat = detached.view(-1)
+        for start in range(0, flat.numel(), chunk_numel):
+            yield flat[start : start + chunk_numel]
+        return
+
+    def _split(block):
+        if block.numel() <= chunk_numel:
+            # A non-contiguous reshape may copy, but only after the block is
+            # bounded. This avoids a full-tensor copy for strided activations.
+            yield block.reshape(-1)
+            return
+
+        dim = next(index for index, size in enumerate(block.shape) if size > 1)
+        elements_per_index = block.numel() // block.shape[dim]
+        take = max(1, chunk_numel // elements_per_index)
+        for start in range(0, block.shape[dim], take):
+            child = block.narrow(dim, start, min(take, block.shape[dim] - start))
+            yield from _split(child)
+
+    yield from _split(detached)
+
+
 def _streaming_finite_summary(
     tensor: torch.Tensor,
     statistic: str,
@@ -214,27 +240,45 @@ def _streaming_finite_summary(
     """
     if chunk_numel < 1:
         raise ValueError("chunk_numel must be positive")
+    if statistic not in _STAT_FNS:
+        raise ValueError(f"unsupported activation statistic: {statistic}")
 
-    flat = tensor.detach().reshape(-1)
-    device = flat.device
+    device = tensor.device
     count = torch.zeros((), dtype=torch.int64, device=device)
-    total = torch.zeros((), dtype=torch.float64, device=device)
     total_abs = torch.zeros((), dtype=torch.float64, device=device)
     total_sq = torch.zeros((), dtype=torch.float64, device=device)
+    mean = torch.zeros((), dtype=torch.float64, device=device)
+    m2 = torch.zeros((), dtype=torch.float64, device=device)
     maximum = torch.full((), -torch.inf, dtype=torch.float32, device=device)
     minimum = torch.full((), torch.inf, dtype=torch.float32, device=device)
 
-    for start in range(0, flat.numel(), chunk_numel):
-        chunk = flat[start : start + chunk_numel].float()
+    for raw_chunk in _bounded_flat_chunks(tensor, chunk_numel):
+        chunk = raw_chunk.float()
         finite = torch.isfinite(chunk)
-        count += finite.sum(dtype=torch.int64)
-        safe = torch.where(finite, chunk, 0.0)
-
-        if statistic in {"rms", "std"}:
-            total_sq += (safe * safe).sum(dtype=torch.float64)
         if statistic == "std":
-            total += safe.sum(dtype=torch.float64)
+            values = chunk[finite]
+            chunk_count = values.numel()
+            if chunk_count == 0:
+                continue
+            chunk_variance, chunk_mean = torch.var_mean(values, correction=0)
+            old_count = count.to(dtype=torch.float64)
+            added_count = torch.tensor(chunk_count, dtype=torch.float64, device=device)
+            new_count = old_count + added_count
+            delta = chunk_mean.to(dtype=torch.float64) - mean
+            m2 += (
+                chunk_variance.to(dtype=torch.float64) * added_count
+                + delta.square() * old_count * added_count / new_count
+            )
+            mean += delta * added_count / new_count
+            count += chunk_count
+            continue
+
+        count += finite.sum(dtype=torch.int64)
+        if statistic == "rms":
+            safe = torch.where(finite, chunk, 0.0)
+            total_sq += (safe * safe).sum(dtype=torch.float64)
         elif statistic == "abs_mean":
+            safe = torch.where(finite, chunk, 0.0)
             total_abs += safe.abs().sum(dtype=torch.float64)
         elif statistic == "abs_max":
             maximum = torch.maximum(
@@ -257,17 +301,11 @@ def _streaming_finite_summary(
     elif statistic == "abs_mean":
         result = total_abs / denominator
     elif statistic == "std":
-        if count_value == 1:
-            result = torch.zeros((), dtype=torch.float64, device=device)
-        else:
-            variance = total_sq / denominator - (total / denominator).square()
-            result = torch.sqrt(variance.clamp_min(0.0))
+        result = torch.sqrt((m2 / denominator).clamp_min(0.0))
     elif statistic == "abs_max":
         result = maximum
     elif statistic == "abs_min":
         result = minimum
-    else:
-        raise ValueError(f"unsupported activation statistic: {statistic}")
     return result.float().cpu()
 
 
