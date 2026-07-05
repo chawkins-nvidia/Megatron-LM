@@ -1787,17 +1787,24 @@ def _is_exact_cpu_uint8_extra_state(value: Any) -> bool:
 
 
 def _uses_te_serialized_uint8_extra_state(module: torch.nn.Module, value: Any) -> bool:
-    """Admit only the inspected exact TE RMSNorm byte-serialization contract."""
+    """Admit only inspected exact TE byte-serialization contracts."""
 
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+    allowed_types: tuple[type, ...] = (
+        (TEDotProductAttention,) if isinstance(TEDotProductAttention, type) else ()
+    )
     try:
         from transformer_engine.pytorch import RMSNorm as TransformerEngineRMSNorm
     except (AttributeError, ImportError):
-        return False
-    if type(module) is not TransformerEngineRMSNorm:
+        TransformerEngineRMSNorm = None
+    if isinstance(TransformerEngineRMSNorm, type):
+        allowed_types += (TransformerEngineRMSNorm,)
+    if type(module) not in allowed_types:
         return False
     if not _is_exact_cpu_uint8_extra_state(value):
         raise TypeError(
-            "exact Transformer Engine RMSNorm extra state must be contiguous CPU uint8 bytes"
+            "exact Transformer Engine extra state must be contiguous CPU uint8 bytes"
         )
     return True
 

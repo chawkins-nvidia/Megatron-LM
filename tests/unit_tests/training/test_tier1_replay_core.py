@@ -64,6 +64,7 @@ from megatron.training.diagnostics.diagnostic_replay import (
     _ModelGraphFacts,
     _ReplayPlanFacts,
     _systematic_positions,
+    _uses_te_serialized_uint8_extra_state,
     _validate_dense_gpt_models,
     broadcast_replay_plan,
     build_distributed_source_plan,
@@ -700,6 +701,23 @@ def test_logger_and_cuda_rng_tracker_are_identity_guarded() -> None:
         tracker.get_states()["model-parallel-rng"],
         torch.tensor([1, 2, 3], dtype=torch.uint8),
     )
+
+
+def test_exact_te_attention_admits_fresh_cpu_uint8_extra_state(monkeypatch) -> None:
+    from megatron.core.extensions import transformer_engine
+
+    class _FakeTEDotProductAttention(torch.nn.Module):
+        pass
+
+    monkeypatch.setattr(
+        transformer_engine, "TEDotProductAttention", _FakeTEDotProductAttention
+    )
+    extra_state = torch.empty(0, dtype=torch.uint8)
+
+    assert _uses_te_serialized_uint8_extra_state(
+        _FakeTEDotProductAttention(), extra_state
+    )
+    assert not _uses_te_serialized_uint8_extra_state(torch.nn.Identity(), extra_state)
 
 
 def test_transformer_block_nullcontext_state_is_restored() -> None:
