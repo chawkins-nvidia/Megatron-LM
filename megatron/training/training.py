@@ -2061,9 +2061,13 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
 
-    # Construct the appropriate config_overrides object. This default handles many cases, but
-    #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(config=config)
+    # The serialized recipe and legacy standard overrides are mutually exclusive. Leave recipe
+    # parsing to get_megatron_optimizer so passing both APIs can be detected there.
+    config_overrides = (
+        None
+        if config.overrides_config is not None
+        else get_standard_config_overrides(config=config)
+    )
 
     return config, config_overrides
 
